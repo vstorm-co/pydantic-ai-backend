@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
 
@@ -390,7 +391,7 @@ def create_console_toolset(  # noqa: C901
         Args:
             path: Directory path to list. Defaults to current directory.
         """
-        entries = ctx.deps.backend.ls_info(path)
+        entries = await asyncio.to_thread(ctx.deps.backend.ls_info, path)
 
         if not entries:
             return f"Directory '{path}' is empty or does not exist"
@@ -426,7 +427,7 @@ def create_console_toolset(  # noqa: C901
             if image_support:
                 ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
                 if ext in IMAGE_EXTENSIONS:
-                    raw = ctx.deps.backend._read_bytes(path)
+                    raw = await asyncio.to_thread(ctx.deps.backend._read_bytes, path)
                     if not raw:
                         return f"Error: Image file '{path}' not found or empty"
                     if len(raw) > max_image_bytes:
@@ -441,7 +442,7 @@ def create_console_toolset(  # noqa: C901
 
             from pydantic_ai_backends.hashline import format_hashline_output
 
-            raw_bytes = ctx.deps.backend._read_bytes(path)
+            raw_bytes = await asyncio.to_thread(ctx.deps.backend._read_bytes, path)
             if not raw_bytes:
                 return f"Error: File '{path}' not found"
             text = raw_bytes.decode("utf-8", errors="replace")
@@ -466,7 +467,7 @@ def create_console_toolset(  # noqa: C901
             if image_support:
                 ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
                 if ext in IMAGE_EXTENSIONS:
-                    raw = ctx.deps.backend._read_bytes(path)
+                    raw = await asyncio.to_thread(ctx.deps.backend._read_bytes, path)
                     if not raw:
                         return f"Error: Image file '{path}' not found or empty"
                     if len(raw) > max_image_bytes:
@@ -478,7 +479,7 @@ def create_console_toolset(  # noqa: C901
                         )
                     media_type = IMAGE_MEDIA_TYPES.get(ext, "application/octet-stream")
                     return BinaryContent(data=raw, media_type=media_type)  # pyright: ignore[reportCallIssue]
-            return ctx.deps.backend.read(path, offset, limit)
+            return await asyncio.to_thread(ctx.deps.backend.read, path, offset, limit)
 
     # --- write_file tool ---
     @toolset.tool(
@@ -496,7 +497,7 @@ def create_console_toolset(  # noqa: C901
             path: Path to the file to write.
             content: Complete content to write to the file.
         """
-        result = ctx.deps.backend.write(path, content)
+        result = await asyncio.to_thread(ctx.deps.backend.write, path, content)
 
         if result.error:
             return f"Error: {result.error}"
@@ -536,7 +537,7 @@ of replacing it.
             from pydantic_ai_backends.hashline import apply_hashline_edit_with_summary
 
             # Read current file content
-            raw_bytes = ctx.deps.backend._read_bytes(path)
+            raw_bytes = await asyncio.to_thread(ctx.deps.backend._read_bytes, path)
             if not raw_bytes:
                 return f"Error: File '{path}' not found"
 
@@ -557,7 +558,7 @@ of replacing it.
                 return f"Error: {error}"
 
             # Write back
-            write_result = ctx.deps.backend.write(path, new_text)
+            write_result = await asyncio.to_thread(ctx.deps.backend.write, path, new_text)
             if write_result.error:
                 return f"Error: {write_result.error}"
 
@@ -586,7 +587,9 @@ including whitespace and indentation.
                 replace_all: If True, replace all occurrences. If False (default), \
 the old_string must appear exactly once in the file.
             """
-            result = ctx.deps.backend.edit(path, old_string, new_string, replace_all)
+            result = await asyncio.to_thread(
+                ctx.deps.backend.edit, path, old_string, new_string, replace_all
+            )
 
             if result.error:
                 return f"Error: {result.error}"
@@ -605,7 +608,7 @@ the old_string must appear exactly once in the file.
             pattern: Glob pattern to match.
             path: Base directory to search from. Defaults to current directory.
         """
-        entries = ctx.deps.backend.glob_info(pattern, path)
+        entries = await asyncio.to_thread(ctx.deps.backend.glob_info, pattern, path)
 
         if not entries:
             return f"No files matching '{pattern}' in {path}"
@@ -637,7 +640,9 @@ the old_string must appear exactly once in the file.
             output_mode: Output format — `"content"`, `"files_with_matches"`, or `"count"`.
             ignore_hidden: Whether to skip hidden files/directories.
         """
-        result = ctx.deps.backend.grep_raw(pattern, path, glob_pattern, ignore_hidden)
+        result = await asyncio.to_thread(
+            ctx.deps.backend.grep_raw, pattern, path, glob_pattern, ignore_hidden
+        )
 
         if isinstance(result, str):
             return result  # Error message
@@ -700,7 +705,7 @@ for long-running builds or test suites.
                 return "Error: Shell execution is disabled for this backend"
 
             try:
-                result = backend.execute(command, timeout)  # pyright: ignore[reportAttributeAccessIssue]
+                result = await asyncio.to_thread(backend.execute, command, timeout)  # pyright: ignore[reportAttributeAccessIssue]
             except RuntimeError as e:
                 return f"Error: {e}"
 
