@@ -37,6 +37,10 @@ docker = [
     "pypdf>=5.1.0",
     "chardet>=5.2.0",
 ]
+kubernetes = [
+    "kubernetes>=29.0.0",
+    "httpx>=0.28.0",
+]
 dev = [
     "pydantic-ai-slim>=1.74.0",
     "pytest>=9.0.0",
@@ -48,6 +52,8 @@ dev = [
     "mypy>=1.0.0",
     "pre-commit>=4.0.0",
     "build>=1.0.0",
+    "kubernetes>=29.0.0",
+    "httpx>=0.28.0",
 ]
 
 [project.urls]
@@ -93,8 +99,9 @@ testpaths = ["tests"]
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "docker: marks tests as requiring Docker (deselect with '-m \"not docker\"')",
+    "kubernetes: requires a running kind/k3d cluster (deselect with '-m \"not kubernetes\"')",
 ]
-addopts = "-m 'not docker'"
+addopts = "-m 'not docker and not kubernetes'"
 
 # Coverage configuration
 [tool.coverage.run]

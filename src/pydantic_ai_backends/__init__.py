@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     )
     from pydantic_ai_backends.backends.docker.runtimes import get_runtime
     from pydantic_ai_backends.backends.docker.session import SandboxFactory
+    from pydantic_ai_backends.backends.kubernetes import KubernetesPodSandbox
     from pydantic_ai_backends.capability import ConsoleCapability
     from pydantic_ai_backends.hashline import (
         apply_hashline_edit,
@@ -154,6 +155,8 @@ _LAZY_IMPORTS = {
     "DaytonaSandbox": "pydantic_ai_backends.backends.daytona",
     # Docker sandbox (requires docker extra)
     "DockerSandbox": "pydantic_ai_backends.backends.docker.sandbox",
+    # Kubernetes sandbox (requires kubernetes extra)
+    "KubernetesPodSandbox": "pydantic_ai_backends.backends.kubernetes",
     "BaseSandbox": "pydantic_ai_backends.backends.base",
     "SessionManager": "pydantic_ai_backends.backends.docker.session",
     "SandboxFactory": "pydantic_ai_backends.backends.docker.session",
@@ -246,6 +249,8 @@ __all__ = [
     "DockerSandbox",
     "SessionManager",
     "SandboxFactory",
+    # Kubernetes sandbox (optional - requires kubernetes extra)
+    "KubernetesPodSandbox",
     # Runtimes
     "BUILTIN_RUNTIMES",
     "get_runtime",

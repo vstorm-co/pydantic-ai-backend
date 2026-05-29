@@ -148,11 +148,13 @@ nav:
     - Permissions: concepts/permissions.md
     - Docker Sandbox: concepts/docker.md
     - Daytona Sandbox: concepts/daytona.md
+    - Kubernetes Sandbox: concepts/kubernetes.md
     - Console Toolset: concepts/console-toolset.md
   - Examples:
     - examples/index.md
     - Local Backend: examples/local-backend.md
     - Docker Sandbox: examples/docker-sandbox.md
+    - Kubernetes Sandbox: examples/kubernetes-sandbox.md
     - Multi-User App: examples/multi-user.md
     - CLI Agent: examples/cli-agent.md
   - API Reference:
@@ -162,6 +164,7 @@ nav:
     - Permissions: api/permissions.md
     - Docker: api/docker.md
     - Daytona: api/daytona.md
+    - Kubernetes: api/kubernetes.md
     - Toolsets: api/toolsets.md
     - Types: api/types.md
   - Changelog: changelog.md
