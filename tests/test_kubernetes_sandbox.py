@@ -8,6 +8,7 @@ deselected) can run against `kind` once we add a CI job for it.
 
 from __future__ import annotations
 
+import base64
 import sys
 import types
 from dataclasses import dataclass, field
@@ -455,3 +456,164 @@ def test_ls_info_maps_http_rows_to_file_info() -> None:
     assert [r["name"] for r in result] == ["a.txt", "d"]
     assert result[0]["is_dir"] is False
     assert result[1]["is_dir"] is True
+
+
+# ---------------------------------------------------------------------
+# File ops in mode="http": read, read_bytes, write, edit.
+
+
+def _started(**kwargs: Any) -> KubernetesPodSandbox:
+    sb = KubernetesPodSandbox("img:1", sandbox_id="fs", startup_timeout=2, **kwargs)
+    sb.start()
+    return sb
+
+
+def _fs_handler(files: dict[str, str]) -> Any:
+    """Route /read and /write against an in-memory file dict."""
+
+    def handler(path: str, body: dict[str, Any]) -> FakeHttpResponse:
+        if path == "/read":
+            target = body["path"]
+            if target not in files:
+                return FakeHttpResponse(status_code=404)
+            return FakeHttpResponse(status_code=200, json_data={"content": files[target]})
+        if path == "/write":
+            decoded = base64.b64decode(body["content_b64"]).decode("utf-8")
+            files[body["path"]] = decoded
+            return FakeHttpResponse(status_code=200, json_data={})
+        return FakeHttpResponse(status_code=200, json_data={})
+
+    return handler
+
+
+def test_read_returns_http_content() -> None:
+    sb = _started()
+    sb._http.handler = _fs_handler({"/a.txt": "hello"})
+    assert sb.read("/a.txt") == "hello"
+
+
+def test_read_returns_not_found_on_404() -> None:
+    sb = _started()
+    sb._http.handler = _fs_handler({})
+    assert sb.read("/missing") == "Error: File '/missing' not found"
+
+
+def test_read_returns_http_error_on_5xx() -> None:
+    sb = _started()
+    sb._http.handler = lambda _p, _j: FakeHttpResponse(status_code=500)
+    assert sb.read("/x") == "Error: HTTP 500"
+
+
+def test_read_returns_error_on_transport_exception() -> None:
+    sb = _started()
+
+    def boom(_p: str, _j: Any) -> Any:
+        raise RuntimeError("conn refused")
+
+    sb._http.handler = boom
+    assert sb.read("/x") == "Error: conn refused"
+
+
+def test_read_bytes_returns_content() -> None:
+    sb = _started()
+    sb._http.handler = _fs_handler({"/a.txt": "hello"})
+    assert sb.read_bytes("/a.txt") == b"hello"
+
+
+def test_read_bytes_returns_empty_on_http_error() -> None:
+    sb = _started()
+    sb._http.handler = _fs_handler({})  # /read → 404
+    assert sb.read_bytes("/missing") == b""
+
+
+def test_read_bytes_returns_empty_on_transport_exception() -> None:
+    sb = _started()
+
+    def boom(_p: str, _j: Any) -> Any:
+        raise RuntimeError("conn refused")
+
+    sb._http.handler = boom
+    assert sb.read_bytes("/x") == b""
+
+
+def test_write_returns_path_on_success() -> None:
+    sb = _started()
+    files: dict[str, str] = {}
+    sb._http.handler = _fs_handler(files)
+    result = sb.write("/a.txt", "payload")
+    assert result.path == "/a.txt"
+    assert result.error is None
+    assert files["/a.txt"] == "payload"
+
+
+def test_write_returns_error_on_http_failure() -> None:
+    sb = _started()
+    sb._http.handler = lambda _p, _j: FakeHttpResponse(status_code=500)
+    result = sb.write("/a.txt", "payload")
+    assert result.error is not None
+    assert "Error" in result.error
+
+
+def test_edit_replaces_single_occurrence() -> None:
+    sb = _started()
+    files = {"/f.txt": "alpha beta"}
+    sb._http.handler = _fs_handler(files)
+    result = sb.edit("/f.txt", "alpha", "gamma")
+    assert result.error is None
+    assert result.occurrences == 1
+    assert files["/f.txt"] == "gamma beta"
+
+
+def test_edit_string_not_found() -> None:
+    sb = _started()
+    sb._http.handler = _fs_handler({"/f.txt": "alpha beta"})
+    result = sb.edit("/f.txt", "zzz", "x")
+    assert result.error == "String not found in file"
+
+
+def test_edit_multiple_occurrences_requires_replace_all() -> None:
+    sb = _started()
+    sb._http.handler = _fs_handler({"/f.txt": "a a a"})
+    result = sb.edit("/f.txt", "a", "b")
+    assert result.error is not None
+    assert "found 3 times" in result.error
+
+
+def test_edit_replace_all_replaces_every_occurrence() -> None:
+    sb = _started()
+    files = {"/f.txt": "a a a"}
+    sb._http.handler = _fs_handler(files)
+    result = sb.edit("/f.txt", "a", "b", replace_all=True)
+    assert result.occurrences == 3
+    assert files["/f.txt"] == "b b b"
+
+
+def test_edit_file_not_found() -> None:
+    sb = _started()
+    sb._http.handler = _fs_handler({})  # /read → 404 → read_bytes b""
+    result = sb.edit("/missing", "a", "b")
+    assert result.error == "File '/missing' not found"
+
+
+def test_edit_surfaces_write_error() -> None:
+    sb = _started()
+
+    def handler(path: str, body: dict[str, Any]) -> FakeHttpResponse:
+        if path == "/read":
+            return FakeHttpResponse(status_code=200, json_data={"content": "alpha"})
+        return FakeHttpResponse(status_code=500)  # /write fails
+
+    sb._http.handler = handler
+    result = sb.edit("/f.txt", "alpha", "beta")
+    assert result.error is not None
+
+
+def test_edit_surfaces_read_bytes_error_sentinel(monkeypatch: pytest.MonkeyPatch) -> None:
+    # mode="api" delegates read_bytes to BaseSandbox, which returns a
+    # b"[Error: ...]" sentinel on a failed `cat`. edit() must surface it
+    # as the error instead of treating the text as file content.
+    sb = _started()
+    monkeypatch.setattr(sb, "read_bytes", lambda path: b"[Error: cat: missing: No such file]")
+    result = sb.edit("/missing", "a", "b")
+    assert result.error is not None
+    assert result.error.startswith("[Error:")

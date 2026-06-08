@@ -50,6 +50,15 @@ as-is** — `python:3.12-slim`, `node:20-bookworm`, your custom runtime
 image, anything. No HTTP server layer, no `SANDBOX_EXEC_TOKEN` env
 var, no port exposure. Same image, swap the sandbox class:
 
+!!! warning "Requires `/bin/sh` and `timeout`"
+    `mode="api"` runs every command as `timeout <n> sh -c <command>`, so
+    the image must ship `/bin/sh` **and** a `timeout` binary (GNU
+    coreutils or the BusyBox applet). Stock `python:*`, `node:*`,
+    `debian`, `ubuntu` and `alpine` all include it. A minimal or
+    `distroless` image with no shell will fail with `timeout: not found`
+    (surfaced as `ExecuteResponse(exit_code=1)`); use `mode="http"` with
+    a purpose-built image for those.
+
 ```python
 # Was: DockerSandbox(image="python:3.12-slim")
 sandbox = KubernetesPodSandbox(

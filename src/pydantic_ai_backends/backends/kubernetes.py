@@ -23,18 +23,15 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import copy
 import os
 import secrets
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 from pydantic_ai_backends.backends.base import BaseSandbox
 from pydantic_ai_backends.types import EditResult, ExecuteResponse, FileInfo, WriteResult
-
-if TYPE_CHECKING:
-    pass
-
 
 OUTPUT_CAP = 100_000
 DEFAULT_EXEC_TIMEOUT = 30 * 60  # 30 min, matches DaytonaSandbox
@@ -54,6 +51,12 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
             ``DockerSandbox``). Ignored if ``sandbox_id`` is set.
         mode: ``"http"`` (default) talks to an in-pod exec server on
             ``port``; ``"api"`` uses the K8s ``pods/exec`` subresource.
+            ``mode="api"`` shells out as ``timeout <n> sh -c <command>``,
+            so the image must provide ``/bin/sh`` **and** a ``timeout``
+            binary (GNU coreutils or the BusyBox applet). Stock images
+            such as ``python:*``, ``node:*``, ``debian``, ``ubuntu`` and
+            ``alpine`` all ship it; minimal/``distroless`` images without
+            a shell do not and will surface ``timeout: not found``.
         port: port the in-pod exec server listens on (mode="http" only).
         exec_token: shared secret sent in the ``X-Sandbox-Token`` header
             (mode="http" only). Auto-generated if not provided; written
@@ -275,7 +278,14 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
         # Errors: 0 occurrences → "String not found in file";
         #         >1 without replace_all → "String found N times. Use replace_all=True ..."
         self._last_activity = time.time()
-        content = self.read_bytes(path).decode("utf-8", errors="replace")
+        file_bytes = self.read_bytes(path)
+        # mode="api" delegates to BaseSandbox.read_bytes, which encodes a
+        # failed `cat` as a b"[Error: ...]" sentinel (not b""). Surface it
+        # rather than treating the error text as file content — matches
+        # DaytonaSandbox.edit().
+        if file_bytes.startswith(b"[Error:"):
+            return EditResult(error=file_bytes.decode("utf-8", errors="replace"))
+        content = file_bytes.decode("utf-8", errors="replace")
         if not content:
             return EditResult(error=f"File '{path}' not found")
 
@@ -325,6 +335,8 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
         from kubernetes.stream import stream  # WPS433: lazy
 
         # Wrap with timeout so a hung command can't hang us forever.
+        # Requires `timeout` (coreutils / BusyBox) and `/bin/sh` in the
+        # image; absent on distroless. See the class docstring (`mode`).
         wrapped = ["timeout", str(timeout_seconds), "sh", "-c", command]
         try:
             resp = stream(
@@ -469,7 +481,7 @@ def _build_pod_body(
         # with image / env / labels / ports filled in". Honour that
         # contract: the user's pod spec wins on everything except the
         # bits the sandbox client itself needs to talk to the pod.
-        body: dict[str, Any] = _deep_copy(override)
+        body: dict[str, Any] = copy.deepcopy(override)
         meta = body.setdefault("metadata", {})
         meta["name"] = name
         meta.setdefault("namespace", namespace)
@@ -586,11 +598,3 @@ def _to_file_info(row: dict[str, Any]) -> FileInfo:
         is_dir=bool(row.get("is_dir", False)),
         size=row.get("size"),
     )
-
-
-def _deep_copy(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {k: _deep_copy(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_deep_copy(v) for v in value]
-    return value
