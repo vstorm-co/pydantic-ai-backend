@@ -114,6 +114,34 @@ class TestLocalBackendFileOps:
         assert result.error is not None
         assert "not found" in result.error
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "line1\nline2\nline3\n",
+            "line1\r\nline2\r\nline3\r\n",
+            "line1\r\r\nline2\r\r\nline3\r\r\n",
+        ],
+    )
+    def test_write_does_not_double_carriage_returns(self, tmp_path: Path, content: str):
+        """Write must not accumulate \\r from text-mode translation (issue #51)."""
+        backend = LocalBackend(root_dir=tmp_path)
+
+        backend.write("file.py", content)
+        written = (tmp_path / "file.py").read_bytes()
+
+        assert b"\r\r" not in written
+        assert written.replace(b"\r\n", b"\n") == b"line1\nline2\nline3\n"
+
+    def test_edit_does_not_double_carriage_returns(self, tmp_path: Path):
+        """Edit must normalize line endings like write (issue #51)."""
+        backend = LocalBackend(root_dir=tmp_path)
+
+        backend.write("file.py", "alpha\nbeta\n")
+        backend.edit("file.py", "beta", "beta\r\ngamma")
+        written = (tmp_path / "file.py").read_bytes()
+
+        assert b"\r\r" not in written
+
     def test_ls_info(self, tmp_path: Path):
         """Test listing directory contents."""
         backend = LocalBackend(root_dir=tmp_path)

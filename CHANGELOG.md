@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`LocalBackend.write()` / `edit()` no longer double carriage returns on Windows** ([#51](https://github.com/vstorm-co/pydantic-ai-backend/issues/51)) (`src/pydantic_ai_backends/backends/local.py`). `Path.write_text()` opens in text mode, where only `\n` is translated to `os.linesep` on write while existing `\r` is left untouched — so content already containing `\r\n` (commonly emitted by LLMs) became `\r\r\n` on Windows, leaving files with blank lines between every line of code. Content is now normalized before writing so text mode re-adds clean, platform-native line endings.
+
 ## [0.2.12] - 2026-06-12
 
 ### Added

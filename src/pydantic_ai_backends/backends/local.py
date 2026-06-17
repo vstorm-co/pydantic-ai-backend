@@ -39,6 +39,17 @@ AskFallback = Literal["deny", "error"]
 MAX_EXECUTE_OUTPUT = 100_000
 
 
+def _normalize_newlines(content: str) -> str:
+    """Collapse carriage returns so text-mode writes don't double them.
+
+    ``Path.write_text`` opens in text mode, where only ``\\n`` is translated to
+    ``os.linesep`` on write while existing ``\\r`` is left untouched. Content
+    that already contains ``\\r\\n`` would become ``\\r\\r\\n`` on Windows.
+    Stripping ``\\r`` lets text mode re-add clean platform-native endings.
+    """
+    return content.replace("\r", "")
+
+
 class LocalBackend:
     """Local filesystem backend with optional shell execution.
 
@@ -366,7 +377,7 @@ class LocalBackend:
             if isinstance(content, bytes):  # pragma: no cover
                 full_path.write_bytes(content)
             else:
-                full_path.write_text(content, encoding="utf-8")
+                full_path.write_text(_normalize_newlines(content), encoding="utf-8")
 
             return WriteResult(path=str(full_path))
         except PermissionError:  # pragma: no cover
@@ -415,7 +426,7 @@ class LocalBackend:
             new_content = content.replace(old_string, new_string, 1)
 
         try:
-            full_path.write_text(new_content, encoding="utf-8")
+            full_path.write_text(_normalize_newlines(new_content), encoding="utf-8")
             return EditResult(path=str(full_path), occurrences=occurrences if replace_all else 1)
         except PermissionError:  # pragma: no cover
             return EditResult(error=f"Permission denied for '{path}'")
