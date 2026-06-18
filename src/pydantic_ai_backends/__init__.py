@@ -46,10 +46,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 # Core exports - always available
+from pydantic_ai_backends.adapter import AsyncBackendAdapter, AsyncSandboxAdapter, ensure_async
 from pydantic_ai_backends.backends.composite import CompositeBackend
 from pydantic_ai_backends.backends.local import LocalBackend
 from pydantic_ai_backends.backends.state import StateBackend
-from pydantic_ai_backends.protocol import BackendProtocol, SandboxProtocol
+from pydantic_ai_backends.protocol import (
+    AsyncBackendProtocol,
+    AsyncSandboxProtocol,
+    BackendProtocol,
+    SandboxProtocol,
+)
 from pydantic_ai_backends.types import (
     EditResult,
     ExecuteResponse,
@@ -200,6 +206,12 @@ __all__ = [
     # Protocols
     "BackendProtocol",
     "SandboxProtocol",
+    "AsyncBackendProtocol",
+    "AsyncSandboxProtocol",
+    # Adapters
+    "AsyncBackendAdapter",
+    "AsyncSandboxAdapter",
+    "ensure_async",
     # Types
     "FileData",
     "FileInfo",

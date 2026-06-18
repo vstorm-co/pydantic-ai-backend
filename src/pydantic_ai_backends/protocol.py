@@ -178,3 +178,35 @@ class SandboxProtocol(BackendProtocol, Protocol):
     def id(self) -> str:
         """Unique identifier for this sandbox instance."""
         ...
+
+
+@runtime_checkable
+class AsyncBackendProtocol(Protocol):
+    """Async protocol for file storage backends.
+
+    Sync backends can be adapted with :func:`pydantic_ai_backends.ensure_async`.
+    """
+
+    async def exists(self, path: str) -> bool: ...
+    async def ls_info(self, path: str) -> list[FileInfo]: ...
+    async def read_bytes(self, path: str) -> bytes: ...
+    async def read(self, path: str, offset: int = 0, limit: int = 2000) -> str: ...
+    async def write(self, path: str, content: str | bytes) -> WriteResult: ...
+    async def edit(
+        self, path: str, old_string: str, new_string: str, replace_all: bool = False
+    ) -> EditResult: ...
+    async def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]: ...
+    async def grep_raw(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        ignore_hidden: bool = True,
+    ) -> list[GrepMatch] | str: ...
+
+
+@runtime_checkable
+class AsyncSandboxProtocol(AsyncBackendProtocol, Protocol):
+    """Async protocol for sandbox backends that support command execution."""
+
+    async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse: ...

@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkabl
 from pydantic_ai import BinaryContent, RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
-from pydantic_ai_backends.protocol import BackendProtocol
+from pydantic_ai_backends.adapter import ensure_async
+from pydantic_ai_backends.protocol import AsyncBackendProtocol, BackendProtocol
 from pydantic_ai_backends.types import GrepMatch
 
 EditFormat = Literal["str_replace", "hashline"]
@@ -250,7 +251,7 @@ class ConsoleDeps(Protocol):
     """Protocol for dependencies that provide a backend."""
 
     @property
-    def backend(self) -> BackendProtocol:
+    def backend(self) -> BackendProtocol | AsyncBackendProtocol:
         """The backend for file operations."""
         ...
 
@@ -313,7 +314,7 @@ def _file_extension(path: str) -> str:
 
 
 async def _read_binary_within_limit(
-    backend: BackendProtocol,
+    backend: BackendProtocol | AsyncBackendProtocol,
     path: str,
     max_bytes: int,
     kind: str,
@@ -330,7 +331,7 @@ async def _read_binary_within_limit(
         The file bytes, or an error string when the file is missing/empty or
         exceeds ``max_bytes``.
     """
-    raw = await asyncio.to_thread(backend.read_bytes, path)
+    raw = await ensure_async(backend).read_bytes(path)
     if not raw:
         return f"Error: {kind} file '{path}' not found or empty"
     if len(raw) > max_bytes:
@@ -341,7 +342,7 @@ async def _read_binary_within_limit(
 
 
 async def _maybe_image_content(
-    backend: BackendProtocol,
+    backend: BackendProtocol | AsyncBackendProtocol,
     path: str,
     max_image_bytes: int,
 ) -> BinaryContent | str | None:
@@ -364,7 +365,7 @@ async def _maybe_image_content(
 
 
 async def _maybe_document_content(
-    backend: BackendProtocol,
+    backend: BackendProtocol | AsyncBackendProtocol,
     path: str,
     max_document_bytes: int,
 ) -> BinaryContent | str | None:
@@ -511,7 +512,8 @@ def create_console_toolset(  # noqa: C901
         Args:
             path: Directory path to list. Defaults to current directory.
         """
-        entries = await asyncio.to_thread(ctx.deps.backend.ls_info, path)
+        backend = ensure_async(ctx.deps.backend)
+        entries = await backend.ls_info(path)
 
         if not entries:
             return f"Directory '{path}' is empty or does not exist"
@@ -555,9 +557,10 @@ def create_console_toolset(  # noqa: C901
 
             from pydantic_ai_backends.hashline import format_hashline_output
 
-            if not await asyncio.to_thread(ctx.deps.backend.exists, path):
+            backend = ensure_async(ctx.deps.backend)
+            if not await backend.exists(path):
                 return f"Error: File '{path}' not found"
-            raw_bytes = await asyncio.to_thread(ctx.deps.backend.read_bytes, path)
+            raw_bytes = await backend.read_bytes(path)
             text = raw_bytes.decode("utf-8", errors="replace")
             return format_hashline_output(text, offset, limit)
 
@@ -585,7 +588,8 @@ def create_console_toolset(  # noqa: C901
                 document = await _maybe_document_content(ctx.deps.backend, path, max_document_bytes)
                 if document is not None:
                     return document
-            return await asyncio.to_thread(ctx.deps.backend.read, path, offset, limit)
+            backend = ensure_async(ctx.deps.backend)
+            return await backend.read(path, offset, limit)
 
     # --- write_file tool ---
     @toolset.tool(
@@ -603,7 +607,8 @@ def create_console_toolset(  # noqa: C901
             path: Path to the file to write.
             content: Complete content to write to the file.
         """
-        result = await asyncio.to_thread(ctx.deps.backend.write, path, content)
+        backend = ensure_async(ctx.deps.backend)
+        result = await backend.write(path, content)
 
         if result.error:
             return f"Error: {result.error}"
@@ -642,15 +647,16 @@ of replacing it.
             """
             from pydantic_ai_backends.hashline import apply_hashline_edit_with_summary
 
-            backend = ctx.deps.backend
-            per_path = _edit_locks.setdefault(backend, {})
+            raw_backend = ctx.deps.backend
+            backend = ensure_async(raw_backend)
+            per_path = _edit_locks.setdefault(raw_backend, {})
             if path not in per_path:
                 per_path[path] = asyncio.Lock()
             async with per_path[path]:
                 # Read current file content
-                if not await asyncio.to_thread(backend.exists, path):
+                if not await backend.exists(path):
                     return f"Error: File '{path}' not found"
-                raw_bytes = await asyncio.to_thread(backend.read_bytes, path)
+                raw_bytes = await backend.read_bytes(path)
 
                 text = raw_bytes.decode("utf-8", errors="replace")
 
@@ -669,7 +675,7 @@ of replacing it.
                     return f"Error: {error}"
 
                 # Write back
-                write_result = await asyncio.to_thread(backend.write, path, new_text)
+                write_result = await backend.write(path, new_text)
                 if write_result.error:
                     return f"Error: {write_result.error}"
 
@@ -698,9 +704,8 @@ including whitespace and indentation.
                 replace_all: If True, replace all occurrences. If False (default), \
 the old_string must appear exactly once in the file.
             """
-            result = await asyncio.to_thread(
-                ctx.deps.backend.edit, path, old_string, new_string, replace_all
-            )
+            backend = ensure_async(ctx.deps.backend)
+            result = await backend.edit(path, old_string, new_string, replace_all)
 
             if result.error:
                 return f"Error: {result.error}"
@@ -719,7 +724,8 @@ the old_string must appear exactly once in the file.
             pattern: Glob pattern to match.
             path: Base directory to search from. Defaults to current directory.
         """
-        entries = await asyncio.to_thread(ctx.deps.backend.glob_info, pattern, path)
+        backend = ensure_async(ctx.deps.backend)
+        entries = await backend.glob_info(pattern, path)
 
         if not entries:
             return f"No files matching '{pattern}' in {path}"
@@ -751,9 +757,8 @@ the old_string must appear exactly once in the file.
             output_mode: Output format — `"content"`, `"files_with_matches"`, or `"count"`.
             ignore_hidden: Whether to skip hidden files/directories.
         """
-        result = await asyncio.to_thread(
-            ctx.deps.backend.grep_raw, pattern, path, glob_pattern, ignore_hidden
-        )
+        backend = ensure_async(ctx.deps.backend)
+        result = await backend.grep_raw(pattern, path, glob_pattern, ignore_hidden)
 
         if isinstance(result, str):
             return result  # Error message
@@ -806,9 +811,10 @@ the old_string must appear exactly once in the file.
 for long-running builds or test suites.
             """
             backend = ctx.deps.backend
+            async_backend = ensure_async(backend)
 
             # Check if backend supports execute
-            if not hasattr(backend, "execute"):
+            if not hasattr(async_backend, "execute"):
                 return "Error: Backend does not support command execution"
 
             # Check if execute is enabled (for LocalBackend)
@@ -816,10 +822,7 @@ for long-running builds or test suites.
                 return "Error: Shell execution is disabled for this backend"
 
             try:
-                if hasattr(backend, "async_execute"):
-                    result = await backend.async_execute(command, timeout)  # pyright: ignore[reportAttributeAccessIssue]
-                else:
-                    result = await asyncio.to_thread(backend.execute, command, timeout)  # pyright: ignore[reportAttributeAccessIssue]
+                result = await async_backend.execute(command, timeout)  # pyright: ignore[reportAttributeAccessIssue]
             except RuntimeError as e:
                 return f"Error: {e}"
 
