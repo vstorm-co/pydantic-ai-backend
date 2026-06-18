@@ -75,6 +75,14 @@ class SandboxBackend(PublicReadBytesBackend):
         return ExecuteResponse(output="ok", exit_code=0)
 
 
+class AsyncExecuteSandboxBackend(SandboxBackend):
+    async def async_execute(
+        self, command: str, timeout: int | None = None
+    ) -> ExecuteResponse:
+        self.calls.append(("async_execute", (command, timeout)))
+        return ExecuteResponse(output="async ok", exit_code=0)
+
+
 class AsyncNativeBackend:
     async def exists(self, path: str) -> bool:
         return True
@@ -135,3 +143,15 @@ async def test_ensure_async_wraps_sandbox_backends_with_execute() -> None:
     assert isinstance(adapter, AsyncSandboxAdapter)
     assert await adapter.execute("echo ok", 5) == ExecuteResponse(output="ok", exit_code=0)
     assert backend.calls[-1] == ("execute", ("echo ok", 5))
+
+
+async def test_sandbox_adapter_prefers_async_execute_when_available() -> None:
+    backend = AsyncExecuteSandboxBackend()
+    adapter = ensure_async(backend)
+
+    assert isinstance(adapter, AsyncSandboxAdapter)
+    assert await adapter.execute("echo ok", 5) == ExecuteResponse(
+        output="async ok", exit_code=0
+    )
+    assert backend.calls[-1] == ("async_execute", ("echo ok", 5))
+    assert not any(call[0] == "execute" for call in backend.calls)

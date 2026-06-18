@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
@@ -77,6 +78,13 @@ class AsyncSandboxAdapter(AsyncBackendAdapter):
 
     async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
         sandbox = cast("SandboxProtocol", self._backend)
+        async_execute = getattr(sandbox, "async_execute", None)
+        if inspect.iscoroutinefunction(async_execute):
+            async_execute_fn = cast(
+                "Callable[[str, int | None], Awaitable[ExecuteResponse]]",
+                async_execute,
+            )
+            return await async_execute_fn(command, timeout)
         return await asyncio.to_thread(sandbox.execute, command, timeout)
 
 
