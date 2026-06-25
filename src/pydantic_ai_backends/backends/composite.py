@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from pydantic_ai_backends.protocol import BackendProtocol
+from pydantic_ai_backends.adapter import ensure_async
+from pydantic_ai_backends.protocol import AsyncBackendProtocol, BackendProtocol
 from pydantic_ai_backends.types import EditResult, FileInfo, GrepMatch, WriteResult
 
 
@@ -64,11 +65,7 @@ class CompositeBackend:
     @staticmethod
     def _normalize_path(path: str) -> str:
         """Normalize path to consistent format."""
-        if not path.startswith("/"):
-            path = "/" + path
-        if len(path) > 1 and path.endswith("/"):
-            path = path.rstrip("/")
-        return path
+        return _normalize_path(path)
 
     def _get_backend(self, path: str) -> BackendProtocol:
         """Get the appropriate backend for a path."""
@@ -182,3 +179,135 @@ class CompositeBackend:
             return all_results
 
         return self._get_backend(path).grep_raw(pattern, path, glob, ignore_hidden)
+
+
+def _normalize_path(path: str) -> str:
+    """Normalize path to consistent format."""
+    if not path.startswith("/"):
+        path = "/" + path
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+    return path
+
+
+class AsyncCompositeBackend:
+    """Async backend that routes operations to different backends by path prefix.
+
+    Accepts both sync and async sub-backends; sync backends are wrapped
+    via :func:`~pydantic_ai_backends.ensure_async` internally.
+
+    Example:
+        ```python
+        from pydantic_ai_backends import AsyncCompositeBackend, StateBackend
+
+        backend = AsyncCompositeBackend(
+            default=StateBackend(),
+            routes={"/scratch/": StateBackend()},
+        )
+        await backend.write("/scratch/tmp.txt", "data")
+        content = await backend.read("/scratch/tmp.txt")
+        ```
+    """
+
+    def __init__(
+        self,
+        default: BackendProtocol | AsyncBackendProtocol,
+        routes: dict[str, BackendProtocol | AsyncBackendProtocol] | None = None,
+    ):
+        self._default = ensure_async(default)
+        raw_routes = routes or {}
+        self._routes = {k: ensure_async(v) for k, v in raw_routes.items()}
+        self._sorted_prefixes = sorted(self._routes.keys(), key=len, reverse=True)
+
+    def _get_backend(self, path: str) -> AsyncBackendProtocol:
+        normalized = _normalize_path(path)
+        for prefix in self._sorted_prefixes:
+            normalized_prefix = _normalize_path(prefix)
+            if normalized == normalized_prefix or normalized.startswith(normalized_prefix + "/"):
+                return self._routes[prefix]
+        return self._default
+
+    async def exists(self, path: str) -> bool:
+        return await self._get_backend(path).exists(path)
+
+    async def ls_info(self, path: str) -> list[FileInfo]:
+        normalized = _normalize_path(path)
+
+        if normalized == "/":
+            all_entries: dict[str, FileInfo] = {}
+
+            for entry in await self._default.ls_info(normalized):
+                all_entries[entry["path"]] = entry
+
+            for prefix in self._routes:
+                parts = prefix.strip("/").split("/")
+                if parts[0]:
+                    dir_name = parts[0]
+                    dir_path = "/" + dir_name
+                    if dir_path not in all_entries:
+                        all_entries[dir_path] = FileInfo(
+                            name=dir_name,
+                            path=dir_path,
+                            is_dir=True,
+                            size=None,
+                        )
+
+            return sorted(all_entries.values(), key=lambda x: (not x["is_dir"], x["name"]))
+
+        backend = self._get_backend(normalized)
+        return await backend.ls_info(normalized)
+
+    async def read_bytes(self, path: str) -> bytes:
+        return await self._get_backend(path).read_bytes(path)
+
+    async def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
+        return await self._get_backend(path).read(path, offset, limit)
+
+    async def write(self, path: str, content: str | bytes) -> WriteResult:
+        return await self._get_backend(path).write(path, content)
+
+    async def edit(
+        self, path: str, old_string: str, new_string: str, replace_all: bool = False
+    ) -> EditResult:
+        return await self._get_backend(path).edit(path, old_string, new_string, replace_all)
+
+    async def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
+        if path == "/" or path == "":
+            all_results: list[FileInfo] = []
+
+            all_results.extend(await self._default.glob_info(pattern, path))
+
+            for prefix, backend in self._routes.items():
+                results = await backend.glob_info(pattern, prefix)
+                all_results.extend(results)
+
+            return sorted(all_results, key=lambda x: x["path"])
+
+        return await self._get_backend(path).glob_info(pattern, path)
+
+    async def grep_raw(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        ignore_hidden: bool = True,
+    ) -> list[GrepMatch] | str:
+        if path is None or path == "/" or path == "":
+            all_results: list[GrepMatch] = []
+
+            result = await self._default.grep_raw(pattern, path, glob, ignore_hidden)
+            if isinstance(result, list):
+                all_results.extend(result)
+            else:
+                return result
+
+            for prefix, backend in self._routes.items():
+                result = await backend.grep_raw(pattern, prefix, glob, ignore_hidden)
+                if isinstance(result, list):
+                    all_results.extend(result)
+                else:
+                    return result
+
+            return all_results
+
+        return await self._get_backend(path).grep_raw(pattern, path, glob, ignore_hidden)

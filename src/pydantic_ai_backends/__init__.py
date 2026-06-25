@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING
 
 # Core exports - always available
 from pydantic_ai_backends.adapter import AsyncBackendAdapter, AsyncSandboxAdapter, ensure_async
-from pydantic_ai_backends.backends.composite import CompositeBackend
+from pydantic_ai_backends.backends.composite import AsyncCompositeBackend, CompositeBackend
 from pydantic_ai_backends.backends.local import LocalBackend
 from pydantic_ai_backends.backends.state import StateBackend
 from pydantic_ai_backends.protocol import (
@@ -224,6 +224,7 @@ __all__ = [
     "StateBackend",
     "LocalBackend",
     "CompositeBackend",
+    "AsyncCompositeBackend",
     # Hashline editing
     "line_hash",
     "format_hashline_output",
