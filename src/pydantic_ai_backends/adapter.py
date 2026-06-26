@@ -14,6 +14,9 @@ if TYPE_CHECKING:
         SandboxProtocol,
     )
     from pydantic_ai_backends.types import (
+        BackgroundHandle,
+        BackgroundOutput,
+        BackgroundProcessInfo,
         EditResult,
         ExecuteResponse,
         FileInfo,
@@ -88,6 +91,34 @@ class AsyncSandboxAdapter(AsyncBackendAdapter):
         return await asyncio.to_thread(sandbox.execute, command, timeout)
 
 
+class AsyncBackgroundSandboxAdapter(AsyncSandboxAdapter):
+    """Wrap a sync :class:`BackgroundSandboxProtocol` with async methods.
+
+    The background registry ops (poll, drain a file by offset, killpg) are quick
+    and non-blocking, but they're bridged through `asyncio.to_thread` for
+    consistency with the rest of the adapter and to keep the event loop clean.
+    """
+
+    async def execute_background(self, command: str) -> BackgroundHandle:
+        return await asyncio.to_thread(self._bg().execute_background, command)
+
+    async def read_background(self, shell_id: str) -> BackgroundOutput:
+        return await asyncio.to_thread(self._bg().read_background, shell_id)
+
+    async def kill_background(self, shell_id: str) -> bool:
+        return await asyncio.to_thread(self._bg().kill_background, shell_id)
+
+    async def list_background(self) -> list[BackgroundProcessInfo]:
+        return await asyncio.to_thread(self._bg().list_background)
+
+    async def kill_all_background(self) -> None:
+        return await asyncio.to_thread(self._bg().kill_all_background)
+
+    def _bg(self) -> Any:
+        """The wrapped sync background sandbox (narrowed for the bridges above)."""
+        return self._backend
+
+
 def _is_async_backend(backend: Any) -> bool:
     return inspect.iscoroutinefunction(getattr(backend, "read_bytes", None))
 
@@ -98,6 +129,8 @@ def ensure_async(backend: BackendProtocol | AsyncBackendProtocol) -> AsyncBacken
         return backend
     if _is_async_backend(backend):
         return cast("AsyncBackendProtocol", backend)
+    if hasattr(backend, "execute_background"):
+        return AsyncBackgroundSandboxAdapter(cast("SandboxProtocol", backend))
     if hasattr(backend, "execute"):
         return AsyncSandboxAdapter(cast("SandboxProtocol", backend))
     return AsyncBackendAdapter(cast("BackendProtocol", backend))

@@ -46,17 +46,27 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 # Core exports - always available
-from pydantic_ai_backends.adapter import AsyncBackendAdapter, AsyncSandboxAdapter, ensure_async
+from pydantic_ai_backends.adapter import (
+    AsyncBackendAdapter,
+    AsyncBackgroundSandboxAdapter,
+    AsyncSandboxAdapter,
+    ensure_async,
+)
 from pydantic_ai_backends.backends.composite import CompositeBackend
 from pydantic_ai_backends.backends.local import LocalBackend
 from pydantic_ai_backends.backends.state import StateBackend
 from pydantic_ai_backends.protocol import (
     AsyncBackendProtocol,
+    AsyncBackgroundSandboxProtocol,
     AsyncSandboxProtocol,
     BackendProtocol,
+    BackgroundSandboxProtocol,
     SandboxProtocol,
 )
 from pydantic_ai_backends.types import (
+    BackgroundHandle,
+    BackgroundOutput,
+    BackgroundProcessInfo,
     EditResult,
     ExecuteResponse,
     FileData,
@@ -206,11 +216,14 @@ __all__ = [
     # Protocols
     "BackendProtocol",
     "SandboxProtocol",
+    "BackgroundSandboxProtocol",
     "AsyncBackendProtocol",
     "AsyncSandboxProtocol",
+    "AsyncBackgroundSandboxProtocol",
     # Adapters
     "AsyncBackendAdapter",
     "AsyncSandboxAdapter",
+    "AsyncBackgroundSandboxAdapter",
     "ensure_async",
     # Types
     "FileData",
@@ -218,6 +231,9 @@ __all__ = [
     "WriteResult",
     "EditResult",
     "ExecuteResponse",
+    "BackgroundHandle",
+    "BackgroundOutput",
+    "BackgroundProcessInfo",
     "GrepMatch",
     "RuntimeConfig",
     # Backends

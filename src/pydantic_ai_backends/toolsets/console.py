@@ -246,6 +246,32 @@ or `git add .` to avoid accidentally including .env, credentials, or binaries.
 verify the target path/object before executing."""
 
 
+RUN_IN_BACKGROUND_DESCRIPTION = """\
+Start a long-lived command in the background and return immediately with a \
+`shell_id`. Use this for processes that don't exit on their own — dev servers, \
+watchers, `uvicorn`/`npm run dev`, tailing logs.
+
+Do NOT use plain `execute` for servers: it blocks until the command finishes \
+and kills the process tree on timeout, so a server gets reaped.
+
+After starting: poll its output with `read_output(shell_id)`, probe it from a \
+separate `execute` call (e.g. `curl`), and stop it with `kill_shell(shell_id)` \
+when done. Don't write your own launcher scripts — use this tool."""
+
+READ_OUTPUT_DESCRIPTION = """\
+Read output produced by a background shell since your last read (stdout+stderr), \
+along with whether it's still running and its exit code if finished. Call \
+repeatedly to follow a server's startup logs."""
+
+KILL_SHELL_DESCRIPTION = """\
+Stop a background shell started with `run_in_background`. Always kill background \
+shells you no longer need (e.g. a dev server after you've verified it)."""
+
+LIST_SHELLS_DESCRIPTION = """\
+List the background shells started this session with their status \
+(running / exited) and command."""
+
+
 @runtime_checkable
 class ConsoleDeps(Protocol):
     """Protocol for dependencies that provide a backend."""
@@ -393,6 +419,7 @@ async def _maybe_document_content(
 def create_console_toolset(  # noqa: C901
     id: str | None = None,
     include_execute: bool = True,
+    include_background: bool = True,
     require_write_approval: bool = False,
     require_execute_approval: bool = True,
     default_ignore_hidden: bool = True,
@@ -834,6 +861,99 @@ for long-running builds or test suites.
                 return f"Command failed (exit code {result.exit_code}):\n{output}"
 
             return str(output)
+
+    if include_execute and include_background:
+
+        def _bg_backend(ctx: RunContext[ConsoleDeps]) -> Any | None:  # pragma: no cover
+            """Return the async background sandbox, or None if unsupported."""
+            async_backend = ensure_async(ctx.deps.backend)
+            if not hasattr(async_backend, "execute_background"):
+                return None
+            return async_backend
+
+        @toolset.tool(
+            description=_descs.get("run_in_background", RUN_IN_BACKGROUND_DESCRIPTION),
+            requires_approval=execute_approval,
+        )
+        async def run_in_background(  # pragma: no cover
+            ctx: RunContext[ConsoleDeps],
+            command: str,
+        ) -> str:
+            """Start a long-lived command in the background.
+
+            Args:
+                command: Shell command to run detached (e.g. a dev server).
+            """
+            bg = _bg_backend(ctx)
+            if bg is None:
+                return "Error: Backend does not support background processes"
+            try:
+                handle = await bg.execute_background(command)
+            except (RuntimeError, PermissionError) as e:
+                return f"Error: {e}"
+            return (
+                f"Started background shell {handle.shell_id} (pid {handle.pid}).\n"
+                f"Use read_output('{handle.shell_id}') to follow its output and "
+                f"kill_shell('{handle.shell_id}') to stop it."
+            )
+
+        @toolset.tool(description=_descs.get("read_output", READ_OUTPUT_DESCRIPTION))
+        async def read_output(  # pragma: no cover
+            ctx: RunContext[ConsoleDeps],
+            shell_id: str,
+        ) -> str:
+            """Read new output from a background shell.
+
+            Args:
+                shell_id: The id returned by run_in_background.
+            """
+            bg = _bg_backend(ctx)
+            if bg is None:
+                return "Error: Backend does not support background processes"
+            result = await bg.read_background(shell_id)
+            status = "running" if result.running else f"exited (code {result.exit_code})"
+            body = (result.stdout + result.stderr).strip()
+            if not body:
+                body = "(no new output)"
+            return f"[{result.shell_id}] {status}\n{body}"
+
+        @toolset.tool(
+            description=_descs.get("kill_shell", KILL_SHELL_DESCRIPTION),
+            requires_approval=execute_approval,
+        )
+        async def kill_shell(  # pragma: no cover
+            ctx: RunContext[ConsoleDeps],
+            shell_id: str,
+        ) -> str:
+            """Stop a background shell.
+
+            Args:
+                shell_id: The id returned by run_in_background.
+            """
+            bg = _bg_backend(ctx)
+            if bg is None:
+                return "Error: Backend does not support background processes"
+            killed = await bg.kill_background(shell_id)
+            if killed:
+                return f"Killed background shell {shell_id}."
+            return f"Background shell {shell_id} was already finished or unknown."
+
+        @toolset.tool(description=_descs.get("list_shells", LIST_SHELLS_DESCRIPTION))
+        async def list_shells(  # pragma: no cover
+            ctx: RunContext[ConsoleDeps],
+        ) -> str:
+            """List the background shells started this session."""
+            bg = _bg_backend(ctx)
+            if bg is None:
+                return "Error: Backend does not support background processes"
+            infos = await bg.list_background()
+            if not infos:
+                return "No background shells."
+            lines = [
+                f"{i.shell_id}  {'running' if i.running else f'exited({i.exit_code})'}  {i.command}"
+                for i in infos
+            ]
+            return "\n".join(lines)
 
     # Remove tools for denied operations (fixes issue #23)
     for tool_name in _denied_tools:

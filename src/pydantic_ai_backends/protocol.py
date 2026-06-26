@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from pydantic_ai_backends.types import (
+        BackgroundHandle,
+        BackgroundOutput,
+        BackgroundProcessInfo,
         EditResult,
         ExecuteResponse,
         FileInfo,
@@ -210,3 +213,49 @@ class AsyncSandboxProtocol(AsyncBackendProtocol, Protocol):
     """Async protocol for sandbox backends that support command execution."""
 
     async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse: ...
+
+
+@runtime_checkable
+class BackgroundSandboxProtocol(SandboxProtocol, Protocol):
+    """Optional sandbox extension for long-lived (background) processes.
+
+    A backend opts in by implementing these methods; consumers detect support
+    with ``isinstance(backend, BackgroundSandboxProtocol)``. Unlike `execute`
+    (which runs to completion and reaps the process tree), a background process
+    keeps running after the call returns — its output is drained incrementally
+    via `read_background` and it is stopped explicitly via `kill_background`.
+
+    Implementations MUST clean up all background processes in
+    `kill_all_background` (called on session teardown) so none are orphaned.
+    """
+
+    def execute_background(self, command: str) -> BackgroundHandle:
+        """Start `command` detached and return a handle immediately."""
+        ...
+
+    def read_background(self, shell_id: str) -> BackgroundOutput:
+        """Return output produced since the previous read, plus run status."""
+        ...
+
+    def kill_background(self, shell_id: str) -> bool:
+        """Stop a background process. Returns True if it was running."""
+        ...
+
+    def list_background(self) -> list[BackgroundProcessInfo]:
+        """Return status for every tracked background process."""
+        ...
+
+    def kill_all_background(self) -> None:
+        """Stop every background process and release its resources."""
+        ...
+
+
+@runtime_checkable
+class AsyncBackgroundSandboxProtocol(AsyncSandboxProtocol, Protocol):
+    """Async counterpart to :class:`BackgroundSandboxProtocol`."""
+
+    async def execute_background(self, command: str) -> BackgroundHandle: ...
+    async def read_background(self, shell_id: str) -> BackgroundOutput: ...
+    async def kill_background(self, shell_id: str) -> bool: ...
+    async def list_background(self) -> list[BackgroundProcessInfo]: ...
+    async def kill_all_background(self) -> None: ...
