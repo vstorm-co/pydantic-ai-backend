@@ -1,30 +1,42 @@
-<h1 align="center">File Storage & Sandbox Backends for Pydantic AI</h1>
+<p align="center">
+  <img src="assets/social-preview.png" alt="Pydantic AI Backend" width="100%">
+</p>
+
+<h1 align="center">Pydantic AI Backend</h1>
 
 <p align="center">
-  <em>Console Toolset, Docker Sandbox, and Permission System for AI Agents</em>
+  <b>Sandboxed execution & file tools for agents.</b><br>
+  A ready-made console toolset over State / Local / Docker / Daytona backends.
+</p>
+
+<p align="center">
+  <a href="https://vstorm-co.github.io/pydantic-ai-backend/">Docs</a> &middot;
+  <a href="https://pypi.org/project/pydantic-ai-backend/">PyPI</a> &middot;
+  <a href="#installation">Install</a> &middot;
+  <a href="#vstorm-oss-ecosystem">Ecosystem</a> &middot;
+  <a href="https://github.com/vstorm-co/pydantic-deepagents">Deep Agents</a>
 </p>
 
 <p align="center">
   <a href="https://pypi.org/project/pydantic-ai-backend/"><img src="https://img.shields.io/pypi/v/pydantic-ai-backend.svg" alt="PyPI version"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
+  <a href="https://pepy.tech/projects/pydantic-ai-backend"><img src="https://static.pepy.tech/badge/pydantic-ai-backend/month" alt="PyPI Downloads"></a>
+  <a href="https://github.com/vstorm-co/pydantic-ai-backend/stargazers"><img src="https://img.shields.io/github/stars/vstorm-co/pydantic-ai-backend?style=flat&logo=github&color=yellow" alt="GitHub Stars"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-blue?logo=python&logoColor=white" alt="Python 3.10+"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://coveralls.io/github/vstorm-co/pydantic-ai-backend?branch=main"><img src="https://coveralls.io/repos/github/vstorm-co/pydantic-ai-backend/badge.svg?branch=main" alt="Coverage Status"></a>
   <a href="https://github.com/vstorm-co/pydantic-ai-backend/actions/workflows/ci.yml"><img src="https://github.com/vstorm-co/pydantic-ai-backend/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/pydantic/pydantic-ai"><img src="https://img.shields.io/badge/Powered%20by-Pydantic%20AI-E92063?logo=pydantic&logoColor=white" alt="Pydantic AI"></a>
 </p>
 
 <p align="center">
-  <b>Console Toolset</b> — ls, read, write, edit, grep, execute
-  &nbsp;&bull;&nbsp;
-  <b>Docker Sandbox</b> — isolated code execution
-  &nbsp;&bull;&nbsp;
-  <b>Permission System</b> — fine-grained access control
+  <b>Console toolset</b> &nbsp;&bull;&nbsp; <b>State / Local / Docker / Daytona</b> &nbsp;&bull;&nbsp; <b>Permission system</b> &nbsp;&bull;&nbsp; <b>Session manager</b> &nbsp;&bull;&nbsp; <b>Image support</b>
 </p>
 
 ---
 
-**File Storage & Sandbox Backends** provides everything your [Pydantic AI](https://ai.pydantic.dev/) agent needs to work with files and execute code safely. Choose from in-memory, local filesystem, or Docker-isolated backends.
+> **Part of [Pydantic Deep Agents](https://github.com/vstorm-co/pydantic-deepagents)** — the open-source Claude Code alternative & Python agent framework. Use this library standalone, or get everything wired together in one `create_deep_agent()` call.
 
-> **Full framework?** Check out [Pydantic Deep Agents](https://github.com/vstorm-co/pydantic-deepagents) — complete agent framework with planning, filesystem, subagents, and skills.
+**Pydantic AI Backend** gives your [Pydantic AI](https://ai.pydantic.dev/) agent everything it needs to read, write, and run code safely — a ready-made console toolset over in-memory, local-filesystem, or Docker-isolated backends, with a fine-grained permission system.
 
 ## Use Cases
 
@@ -301,15 +313,22 @@ sandbox = await manager.get_or_create("user-123")
 | **Image Support** | Multimodal models can see images via BinaryContent |
 | **Pre-built Runtimes** | Python and Node.js environments ready to go |
 
-## Related Projects
+## Vstorm OSS Ecosystem
 
-| Package | Description |
-|---------|-------------|
-| [Pydantic Deep Agents](https://github.com/vstorm-co/pydantic-deepagents) | Full agent framework (uses this library) |
-| [pydantic-ai-todo](https://github.com/vstorm-co/pydantic-ai-todo) | Task planning toolset |
-| [subagents-pydantic-ai](https://github.com/vstorm-co/subagents-pydantic-ai) | Multi-agent orchestration |
-| [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) | Context management |
-| [pydantic-ai](https://github.com/pydantic/pydantic-ai) | The foundation — agent framework by Pydantic |
+This library is one piece of a broader open-source toolkit for production AI agents — all built on **[Pydantic AI](https://github.com/pydantic/pydantic-ai)**.
+
+| Project | Description | Stars |
+|---------|-------------|:-----:|
+| **[Pydantic Deep Agents](https://github.com/vstorm-co/pydantic-deepagents)** | The full agent framework **and** terminal assistant — bundles every library below into one `create_deep_agent()` call. | [![Stars](https://img.shields.io/github/stars/vstorm-co/pydantic-deepagents?style=flat&logo=github&color=yellow)](https://github.com/vstorm-co/pydantic-deepagents) |
+| 👉 **[pydantic-ai-backend](https://github.com/vstorm-co/pydantic-ai-backend)** | Sandboxed execution & file tools — State / Local / Docker / Daytona backends + console toolset. | [![Stars](https://img.shields.io/github/stars/vstorm-co/pydantic-ai-backend?style=flat&logo=github&color=yellow)](https://github.com/vstorm-co/pydantic-ai-backend) |
+| **[subagents-pydantic-ai](https://github.com/vstorm-co/subagents-pydantic-ai)** | Declarative multi-agent orchestration — sync / async / auto, with token tracking. | [![Stars](https://img.shields.io/github/stars/vstorm-co/subagents-pydantic-ai?style=flat&logo=github&color=yellow)](https://github.com/vstorm-co/subagents-pydantic-ai) |
+| **[summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai)** | Unlimited context for long-running agents — summarization or sliding window. | [![Stars](https://img.shields.io/github/stars/vstorm-co/summarization-pydantic-ai?style=flat&logo=github&color=yellow)](https://github.com/vstorm-co/summarization-pydantic-ai) |
+| **[pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields)** | Drop-in guardrails — cost caps, prompt-injection defense, PII & secret redaction, tool blocking. | [![Stars](https://img.shields.io/github/stars/vstorm-co/pydantic-ai-shields?style=flat&logo=github&color=yellow)](https://github.com/vstorm-co/pydantic-ai-shields) |
+| **[pydantic-ai-todo](https://github.com/vstorm-co/pydantic-ai-todo)** | Task planning with subtasks, dependencies, and cycle detection. | [![Stars](https://img.shields.io/github/stars/vstorm-co/pydantic-ai-todo?style=flat&logo=github&color=yellow)](https://github.com/vstorm-co/pydantic-ai-todo) |
+| **[full-stack-ai-agent-template](https://github.com/vstorm-co/full-stack-ai-agent-template)** | Zero to production AI app in 30 minutes — FastAPI + Next.js 15, RAG, 6 AI frameworks. | [![Stars](https://img.shields.io/github/stars/vstorm-co/full-stack-ai-agent-template?style=flat&logo=github&color=yellow)](https://github.com/vstorm-co/full-stack-ai-agent-template) |
+
+> **Want it all wired together?** [Pydantic Deep Agents](https://github.com/vstorm-co/pydantic-deepagents) ships every library above integrated — planning, filesystem, subagents, memory, context management, and guardrails — behind a single function call. Browse everything at [oss.vstorm.co](https://oss.vstorm.co).
+
 
 ## Contributing
 
@@ -320,6 +339,18 @@ make install
 make test  # 100% coverage required
 ```
 
+## Star History
+
+If this library saved you from wiring an agent harness by hand — **[give it a ⭐](https://github.com/vstorm-co/pydantic-ai-backend)**. It's the single biggest thing that helps the project grow.
+
+<p align="center">
+  <a href="https://www.star-history.com/#vstorm-co/pydantic-ai-backend&type=date">
+    <img src="https://api.star-history.com/svg?repos=vstorm-co/pydantic-ai-backend&type=date" alt="Star History" width="600">
+  </a>
+</p>
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE)
@@ -328,9 +359,9 @@ MIT — see [LICENSE](LICENSE)
 
 <div align="center">
 
-### Need help implementing this in your company?
+### Need help shipping AI agents in production?
 
-<p>We're <a href="https://vstorm.co"><b>Vstorm</b></a> — an Applied Agentic AI Engineering Consultancy<br>with 30+ production AI agent implementations.</p>
+<p>We're <a href="https://vstorm.co"><b>Vstorm</b></a> — an Applied Agentic AI Engineering Consultancy<br>with 30+ production agent implementations. <a href="https://github.com/vstorm-co/pydantic-deepagents"><b>Pydantic Deep Agents</b></a> is what we build them with.</p>
 
 <a href="https://vstorm.co/contact-us/">
   <img src="https://img.shields.io/badge/Talk%20to%20us%20%E2%86%92-0066FF?style=for-the-badge&logoColor=white" alt="Talk to us">
@@ -338,6 +369,6 @@ MIT — see [LICENSE](LICENSE)
 
 <br><br>
 
-Made with ❤️ by <a href="https://vstorm.co"><b>Vstorm</b></a>
+Made with **care** by <a href="https://vstorm.co"><b>Vstorm</b></a>
 
 </div>

@@ -1,4 +1,4 @@
-site_name: File Storage & Sandbox Backends for Pydantic AI
+site_name: Pydantic AI Backend
 site_description: Console Toolset, Docker Sandbox, and Permission System for AI Agents
 site_url: https://vstorm-co.github.io/pydantic-ai-backend/
 repo_url: https://github.com/vstorm-co/pydantic-ai-backend
@@ -25,7 +25,8 @@ theme:
   font:
     text: Inter
     code: JetBrains Mono
-  favicon: assets/favicon.png
+  logo: favicon.ico
+  favicon: favicon.ico
   icon:
     repo: fontawesome/brands/github
     admonition:
