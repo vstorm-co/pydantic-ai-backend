@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 from pydantic_ai import RunContext
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
@@ -206,3 +207,35 @@ class TestImageDownscale:
         out = await ts.tools["read_file"].function(_ctx(be), "big.png")
         assert isinstance(out, BinaryContent)
         assert max(_dims(out.data)) <= 1568
+
+
+class TestGrepIgnoreDirs:
+    def test_path_ignored_helper(self) -> None:
+        from pydantic_ai_backends.backends.local import _grep_path_ignored
+
+        assert _grep_path_ignored(("src", "node_modules", "x.js"), True) is True
+        assert _grep_path_ignored(("src", "app.py"), True) is False
+        assert _grep_path_ignored(("src", ".env"), True) is True  # hidden + ignore
+        assert _grep_path_ignored(("src", ".env"), False) is False  # ignore off → keep
+        assert _grep_path_ignored(("__pycache__", "x"), False) is False  # ignore off → keep
+        assert _grep_path_ignored(("__pycache__", "x"), True) is True  # junk skipped
+
+    def test_python_grep_skips_build_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import pydantic_ai_backends.backends.local as local_mod
+
+        # Force the Python fallback (pretend ripgrep isn't installed).
+        monkeypatch.setattr(local_mod.shutil, "which", lambda _: None)
+
+        be = LocalBackend(root_dir=tmp_path)
+        be.write("src/app.py", "needle here")
+        be.write("node_modules/pkg/index.js", "needle here too")
+        be.write("__pycache__/cached.py", "needle cached")
+
+        matches = be.grep_raw("needle")
+        assert isinstance(matches, list)
+        paths = [m["path"] for m in matches]
+        assert any("app.py" in p for p in paths)
+        assert not any("node_modules" in p for p in paths)
+        assert not any("__pycache__" in p for p in paths)

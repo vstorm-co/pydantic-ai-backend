@@ -53,6 +53,35 @@ MAX_READ_OUTPUT = 200_000
 #: ask for a specific range).
 DEFAULT_READ_LIMIT = 2000
 
+#: Directories the Python grep fallback skips by default. ripgrep already honors
+#: .gitignore; this gives the fallback comparable "don't search build junk"
+#: behavior so a grep without ripgrep doesn't drown in node_modules/caches.
+GREP_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        "dist",
+        "build",
+        ".eggs",
+    }
+)
+
+
+def _grep_path_ignored(parts: tuple[str, ...], ignore_hidden: bool) -> bool:
+    """True if a path should be skipped. With ``ignore_hidden`` (the default),
+    hidden and build/cache dirs are skipped; with ``ignore_hidden=False`` nothing
+    is skipped ("search everything", including node_modules/.venv)."""
+    if not ignore_hidden:
+        return False
+    return any(part in GREP_SKIP_DIRS or part.startswith(".") for part in parts)
+
 
 @dataclass
 class _BackgroundProcess:
@@ -640,8 +669,9 @@ class LocalBackend:
                 files = list(search_path.glob(glob_pattern))
             else:
                 files = list(search_path.rglob("*"))
-            if ignore_hidden:
-                files = [f for f in files if not any(part.startswith(".") for part in f.parts)]
+            # Skip build/cache dirs (and hidden, when asked) so the fallback
+            # doesn't trawl node_modules/__pycache__ the way ripgrep wouldn't.
+            files = [f for f in files if not _grep_path_ignored(f.parts, ignore_hidden)]
 
         for file_path in files:
             if not file_path.is_file():
