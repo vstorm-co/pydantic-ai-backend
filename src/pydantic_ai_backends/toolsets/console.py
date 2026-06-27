@@ -33,6 +33,11 @@ IMAGE_MEDIA_TYPES: dict[str, str] = {
 DEFAULT_MAX_IMAGE_BYTES: int = 50 * 1024 * 1024
 """Default maximum image file size (50MB)."""
 
+DEFAULT_MAX_IMAGE_DIMENSION: int = 1568
+"""Longest image edge (px) sent to the model. Larger images are downscaled to
+fit — this matches Anthropic's recommended image size and keeps big screenshots
+from wasting tokens. Requires Pillow (the `images` extra); a no-op without it."""
+
 DOCUMENT_EXTENSIONS: frozenset[str] = frozenset({"pdf"})
 """File extensions recognized as binary documents when document_support is enabled.
 
@@ -420,6 +425,33 @@ async def _read_binary_within_limit(
     return raw
 
 
+def _downscale_image(data: bytes, max_dim: int = DEFAULT_MAX_IMAGE_DIMENSION) -> bytes:
+    """Shrink an oversized image so it fits the model's image budget.
+
+    If Pillow is available and the image's longest edge exceeds ``max_dim``, the
+    image is resized (aspect preserved) and re-encoded. Returns the original
+    bytes unchanged when Pillow is missing, the image is already small enough, or
+    decoding fails — so it's always safe to call.
+    """
+    try:
+        import io
+
+        from PIL import Image
+    except ImportError:  # pragma: no cover - Pillow is an optional extra
+        return data
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            fmt = img.format or "PNG"
+            if max(img.size) <= max_dim:
+                return data
+            img.thumbnail((max_dim, max_dim))
+            buf = io.BytesIO()
+            img.save(buf, format=fmt)
+            return buf.getvalue()
+    except Exception:  # pragma: no cover - corrupt/unsupported image data
+        return data
+
+
 async def _maybe_image_content(
     backend: BackendProtocol | AsyncBackendProtocol,
     path: str,
@@ -439,6 +471,7 @@ async def _maybe_image_content(
     result = await _read_binary_within_limit(backend, path, max_image_bytes, "Image")
     if isinstance(result, str):
         return result
+    result = _downscale_image(result)
     media_type = IMAGE_MEDIA_TYPES.get(ext, "application/octet-stream")
     return BinaryContent(data=result, media_type=media_type)  # pyright: ignore[reportCallIssue]
 

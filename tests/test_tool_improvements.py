@@ -160,3 +160,49 @@ class TestEditStalenessIntegration:
 
     def teardown_method(self) -> None:
         _read_fingerprints.clear()
+
+
+def _png_bytes(w: int, h: int) -> bytes:
+    import io
+
+    from PIL import Image
+
+    img = Image.new("RGB", (w, h), (120, 60, 30))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _dims(data: bytes) -> tuple[int, int]:
+    import io
+
+    from PIL import Image
+
+    with Image.open(io.BytesIO(data)) as img:
+        return img.size
+
+
+class TestImageDownscale:
+    def test_small_image_unchanged(self) -> None:
+        from pydantic_ai_backends.toolsets.console import _downscale_image
+
+        data = _png_bytes(100, 80)
+        assert _downscale_image(data, max_dim=1568) == data
+
+    def test_large_image_downscaled(self) -> None:
+        from pydantic_ai_backends.toolsets.console import _downscale_image
+
+        data = _png_bytes(3000, 2000)
+        out = _downscale_image(data, max_dim=1568)
+        assert max(_dims(out)) <= 1568
+        assert out != data
+
+    async def test_read_file_tool_downscales(self, tmp_path: Path) -> None:
+        from pydantic_ai.messages import BinaryContent
+
+        be = LocalBackend(root_dir=tmp_path)
+        (tmp_path / "big.png").write_bytes(_png_bytes(4000, 2500))
+        ts = create_console_toolset(image_support=True)
+        out = await ts.tools["read_file"].function(_ctx(be), "big.png")
+        assert isinstance(out, BinaryContent)
+        assert max(_dims(out.data)) <= 1568

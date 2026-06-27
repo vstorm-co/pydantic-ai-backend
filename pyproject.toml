@@ -29,6 +29,9 @@ dependencies = [
 console = [
     "pydantic-ai-slim>=1.74.0",
 ]
+images = [
+    "pillow>=10.0.0",
+]
 daytona = [
     "daytona-sdk>=0.9.0",
 ]
@@ -54,6 +57,7 @@ dev = [
     "build>=1.0.0",
     "kubernetes>=29.0.0",
     "httpx>=0.28.0",
+    "pillow>=10.0.0",
 ]
 
 [project.urls]
