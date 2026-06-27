@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import weakref
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
@@ -31,6 +32,11 @@ IMAGE_MEDIA_TYPES: dict[str, str] = {
 
 DEFAULT_MAX_IMAGE_BYTES: int = 50 * 1024 * 1024
 """Default maximum image file size (50MB)."""
+
+DEFAULT_MAX_IMAGE_DIMENSION: int = 1568
+"""Longest image edge (px) sent to the model. Larger images are downscaled to
+fit — this matches Anthropic's recommended image size and keeps big screenshots
+from wasting tokens. Requires Pillow (the `images` extra); a no-op without it."""
 
 DOCUMENT_EXTENSIONS: frozenset[str] = frozenset({"pdf"})
 """File extensions recognized as binary documents when document_support is enabled.
@@ -246,6 +252,32 @@ or `git add .` to avoid accidentally including .env, credentials, or binaries.
 verify the target path/object before executing."""
 
 
+RUN_IN_BACKGROUND_DESCRIPTION = """\
+Start a long-lived command in the background and return immediately with a \
+`shell_id`. Use this for processes that don't exit on their own — dev servers, \
+watchers, `uvicorn`/`npm run dev`, tailing logs.
+
+Do NOT use plain `execute` for servers: it blocks until the command finishes \
+and kills the process tree on timeout, so a server gets reaped.
+
+After starting: poll its output with `read_output(shell_id)`, probe it from a \
+separate `execute` call (e.g. `curl`), and stop it with `kill_shell(shell_id)` \
+when done. Don't write your own launcher scripts — use this tool."""
+
+READ_OUTPUT_DESCRIPTION = """\
+Read output produced by a background shell since your last read (stdout+stderr), \
+along with whether it's still running and its exit code if finished. Call \
+repeatedly to follow a server's startup logs."""
+
+KILL_SHELL_DESCRIPTION = """\
+Stop a background shell started with `run_in_background`. Always kill background \
+shells you no longer need (e.g. a dev server after you've verified it)."""
+
+LIST_SHELLS_DESCRIPTION = """\
+List the background shells started this session with their status \
+(running / exited) and command."""
+
+
 @runtime_checkable
 class ConsoleDeps(Protocol):
     """Protocol for dependencies that provide a backend."""
@@ -307,6 +339,58 @@ def _is_denied_by_ruleset(
 
 _edit_locks: weakref.WeakKeyDictionary[Any, dict[str, asyncio.Lock]] = weakref.WeakKeyDictionary()
 
+# Per-backend record of the content fingerprint the agent last saw for each path
+# (set on read_file / write_file). Powers the edit staleness guard: editing a
+# file that has changed on disk since it was read is refused so the agent
+# re-reads first. Files never read through the tools are left alone.
+_read_fingerprints: weakref.WeakKeyDictionary[Any, dict[str, str]] = weakref.WeakKeyDictionary()
+
+
+def _fingerprint(data: bytes) -> str:
+    """Stable content fingerprint used to detect changes between read and edit."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _record_read(backend: Any, path: str, data: bytes) -> None:
+    """Remember the content the agent just saw at `path` (read or write)."""
+    _read_fingerprints.setdefault(backend, {})[path] = _fingerprint(data)
+
+
+async def _edit_staleness_error(
+    backend_async: AsyncBackendProtocol, raw_backend: Any, path: str
+) -> str | None:
+    """Return an error if `path` changed since it was last read, else None.
+
+    Only files previously seen through the tools are guarded — an edit to a file
+    that was never read proceeds (the edit's own match check still applies). When
+    a guarded file's on-disk content no longer matches what the agent read, the
+    edit is refused so the agent re-reads the current contents first.
+    """
+    recorded = _read_fingerprints.get(raw_backend, {}).get(path)
+    if recorded is None:
+        return None
+    try:
+        current = await backend_async.read_bytes(path)
+    except Exception:  # pragma: no cover - defensive; the edit itself will report
+        return None
+    if _fingerprint(current) != recorded:
+        return (
+            f"Error: '{path}' changed since you last read it. Read it again "
+            "before editing so your change applies to the current contents."
+        )
+    return None
+
+
+async def _record_path_read(  # pragma: no cover - glue, exercised via the file tools
+    backend_async: AsyncBackendProtocol, raw_backend: Any, path: str
+) -> None:
+    """Read `path`'s bytes and record their fingerprint (best-effort)."""
+    try:
+        data = await backend_async.read_bytes(path)
+    except Exception:
+        return
+    _record_read(raw_backend, path, data)
+
 
 def _file_extension(path: str) -> str:
     """Return the lowercase file extension (without the dot), or "" if none."""
@@ -341,6 +425,33 @@ async def _read_binary_within_limit(
     return raw
 
 
+def _downscale_image(data: bytes, max_dim: int = DEFAULT_MAX_IMAGE_DIMENSION) -> bytes:
+    """Shrink an oversized image so it fits the model's image budget.
+
+    If Pillow is available and the image's longest edge exceeds ``max_dim``, the
+    image is resized (aspect preserved) and re-encoded. Returns the original
+    bytes unchanged when Pillow is missing, the image is already small enough, or
+    decoding fails — so it's always safe to call.
+    """
+    try:
+        import io
+
+        from PIL import Image
+    except ImportError:  # pragma: no cover - Pillow is an optional extra
+        return data
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            fmt = img.format or "PNG"
+            if max(img.size) <= max_dim:
+                return data
+            img.thumbnail((max_dim, max_dim))
+            buf = io.BytesIO()
+            img.save(buf, format=fmt)
+            return buf.getvalue()
+    except Exception:  # pragma: no cover - corrupt/unsupported image data
+        return data
+
+
 async def _maybe_image_content(
     backend: BackendProtocol | AsyncBackendProtocol,
     path: str,
@@ -360,6 +471,7 @@ async def _maybe_image_content(
     result = await _read_binary_within_limit(backend, path, max_image_bytes, "Image")
     if isinstance(result, str):
         return result
+    result = _downscale_image(result)
     media_type = IMAGE_MEDIA_TYPES.get(ext, "application/octet-stream")
     return BinaryContent(data=result, media_type=media_type)  # pyright: ignore[reportCallIssue]
 
@@ -393,6 +505,7 @@ async def _maybe_document_content(
 def create_console_toolset(  # noqa: C901
     id: str | None = None,
     include_execute: bool = True,
+    include_background: bool = True,
     require_write_approval: bool = False,
     require_execute_approval: bool = True,
     default_ignore_hidden: bool = True,
@@ -562,6 +675,7 @@ def create_console_toolset(  # noqa: C901
                 return f"Error: File '{path}' not found"
             raw_bytes = await backend.read_bytes(path)
             text = raw_bytes.decode("utf-8", errors="replace")
+            _record_read(ctx.deps.backend, path, raw_bytes)
             return format_hashline_output(text, offset, limit)
 
     else:
@@ -589,7 +703,10 @@ def create_console_toolset(  # noqa: C901
                 if document is not None:
                     return document
             backend = ensure_async(ctx.deps.backend)
-            return await backend.read(path, offset, limit)
+            result = await backend.read(path, offset, limit)
+            if not result.startswith("Error"):
+                await _record_path_read(backend, ctx.deps.backend, path)
+            return result
 
     # --- write_file tool ---
     @toolset.tool(
@@ -613,6 +730,9 @@ def create_console_toolset(  # noqa: C901
         if result.error:
             return f"Error: {result.error}"
 
+        # The agent now knows this file's content — record it so an immediate
+        # edit isn't blocked as stale.
+        _record_read(ctx.deps.backend, path, content.encode("utf-8"))
         lines = len(content.splitlines())
         return f"Wrote {lines} lines to {result.path}"
 
@@ -704,12 +824,21 @@ including whitespace and indentation.
                 replace_all: If True, replace all occurrences. If False (default), \
 the old_string must appear exactly once in the file.
             """
-            backend = ensure_async(ctx.deps.backend)
+            raw_backend = ctx.deps.backend
+            backend = ensure_async(raw_backend)
+
+            stale = await _edit_staleness_error(backend, raw_backend, path)
+            if stale is not None:
+                return stale
+
             result = await backend.edit(path, old_string, new_string, replace_all)
 
             if result.error:
                 return f"Error: {result.error}"
 
+            # The agent's view is now the post-edit content — record it so a
+            # follow-up edit isn't wrongly flagged as stale.
+            await _record_path_read(backend, raw_backend, path)
             return f"Edited {result.path}: replaced {result.occurrences} occurrence(s)"
 
     @toolset.tool(description=_descs.get("glob", GLOB_DESCRIPTION))
@@ -834,6 +963,99 @@ for long-running builds or test suites.
                 return f"Command failed (exit code {result.exit_code}):\n{output}"
 
             return str(output)
+
+    if include_execute and include_background:
+
+        def _bg_backend(ctx: RunContext[ConsoleDeps]) -> Any | None:  # pragma: no cover
+            """Return the async background sandbox, or None if unsupported."""
+            async_backend = ensure_async(ctx.deps.backend)
+            if not hasattr(async_backend, "execute_background"):
+                return None
+            return async_backend
+
+        @toolset.tool(
+            description=_descs.get("run_in_background", RUN_IN_BACKGROUND_DESCRIPTION),
+            requires_approval=execute_approval,
+        )
+        async def run_in_background(  # pragma: no cover
+            ctx: RunContext[ConsoleDeps],
+            command: str,
+        ) -> str:
+            """Start a long-lived command in the background.
+
+            Args:
+                command: Shell command to run detached (e.g. a dev server).
+            """
+            bg = _bg_backend(ctx)
+            if bg is None:
+                return "Error: Backend does not support background processes"
+            try:
+                handle = await bg.execute_background(command)
+            except (RuntimeError, PermissionError) as e:
+                return f"Error: {e}"
+            return (
+                f"Started background shell {handle.shell_id} (pid {handle.pid}).\n"
+                f"Use read_output('{handle.shell_id}') to follow its output and "
+                f"kill_shell('{handle.shell_id}') to stop it."
+            )
+
+        @toolset.tool(description=_descs.get("read_output", READ_OUTPUT_DESCRIPTION))
+        async def read_output(  # pragma: no cover
+            ctx: RunContext[ConsoleDeps],
+            shell_id: str,
+        ) -> str:
+            """Read new output from a background shell.
+
+            Args:
+                shell_id: The id returned by run_in_background.
+            """
+            bg = _bg_backend(ctx)
+            if bg is None:
+                return "Error: Backend does not support background processes"
+            result = await bg.read_background(shell_id)
+            status = "running" if result.running else f"exited (code {result.exit_code})"
+            body = (result.stdout + result.stderr).strip()
+            if not body:
+                body = "(no new output)"
+            return f"[{result.shell_id}] {status}\n{body}"
+
+        @toolset.tool(
+            description=_descs.get("kill_shell", KILL_SHELL_DESCRIPTION),
+            requires_approval=execute_approval,
+        )
+        async def kill_shell(  # pragma: no cover
+            ctx: RunContext[ConsoleDeps],
+            shell_id: str,
+        ) -> str:
+            """Stop a background shell.
+
+            Args:
+                shell_id: The id returned by run_in_background.
+            """
+            bg = _bg_backend(ctx)
+            if bg is None:
+                return "Error: Backend does not support background processes"
+            killed = await bg.kill_background(shell_id)
+            if killed:
+                return f"Killed background shell {shell_id}."
+            return f"Background shell {shell_id} was already finished or unknown."
+
+        @toolset.tool(description=_descs.get("list_shells", LIST_SHELLS_DESCRIPTION))
+        async def list_shells(  # pragma: no cover
+            ctx: RunContext[ConsoleDeps],
+        ) -> str:
+            """List the background shells started this session."""
+            bg = _bg_backend(ctx)
+            if bg is None:
+                return "Error: Backend does not support background processes"
+            infos = await bg.list_background()
+            if not infos:
+                return "No background shells."
+            lines = [
+                f"{i.shell_id}  {'running' if i.running else f'exited({i.exit_code})'}  {i.command}"
+                for i in infos
+            ]
+            return "\n".join(lines)
 
     # Remove tools for denied operations (fixes issue #23)
     for tool_name in _denied_tools:

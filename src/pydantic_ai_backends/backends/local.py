@@ -10,12 +10,17 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from pydantic_ai_backends.types import (
+    BackgroundHandle,
+    BackgroundOutput,
+    BackgroundProcessInfo,
     EditResult,
     ExecuteResponse,
     FileInfo,
@@ -37,6 +42,62 @@ AskCallback = Callable[["PermissionOperation", str, str], Awaitable[bool]]
 AskFallback = Literal["deny", "error"]
 
 MAX_EXECUTE_OUTPUT = 100_000
+
+#: Char ceiling for a single `read` result. A default read (no explicit
+#: offset/limit) that exceeds this is truncated to a page; an *explicit*
+#: offset/limit that still exceeds it errors, so the agent narrows its request
+#: instead of flooding the context.
+MAX_READ_OUTPUT = 200_000
+#: The default `limit` for `read` — used to tell an explicit request apart from
+#: the default one (the tool always forwards this value when the caller didn't
+#: ask for a specific range).
+DEFAULT_READ_LIMIT = 2000
+
+#: Directories the Python grep fallback skips by default. ripgrep already honors
+#: .gitignore; this gives the fallback comparable "don't search build junk"
+#: behavior so a grep without ripgrep doesn't drown in node_modules/caches.
+GREP_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        "dist",
+        "build",
+        ".eggs",
+    }
+)
+
+
+def _grep_path_ignored(parts: tuple[str, ...], ignore_hidden: bool) -> bool:
+    """True if a path should be skipped. With ``ignore_hidden`` (the default),
+    hidden and build/cache dirs are skipped; with ``ignore_hidden=False`` nothing
+    is skipped ("search everything", including node_modules/.venv)."""
+    if not ignore_hidden:
+        return False
+    return any(part in GREP_SKIP_DIRS or part.startswith(".") for part in parts)
+
+
+@dataclass
+class _BackgroundProcess:
+    """A long-lived process tracked by :class:`LocalBackend`.
+
+    stdout/stderr are streamed to files so output can be drained incrementally
+    (by byte offset) without blocking on a pipe.
+    """
+
+    shell_id: str
+    command: str
+    popen: subprocess.Popen[bytes]
+    stdout_path: Path
+    stderr_path: Path
+    stdout_pos: int = field(default=0)
+    stderr_pos: int = field(default=0)
 
 
 def _normalize_newlines(content: str) -> str:
@@ -108,6 +169,11 @@ class LocalBackend:
         self._ask_callback = ask_callback
         self._ask_fallback = ask_fallback
         self._permission_checker: PermissionChecker | None = None
+
+        # Background (long-lived) process registry — see execute_background().
+        self._bg: dict[str, _BackgroundProcess] = {}
+        self._bg_counter = 0
+        self._bg_dir: Path | None = None
 
         # Initialize permission checker if ruleset provided
         if permissions is not None:
@@ -357,6 +423,25 @@ class LocalBackend:
         if end < total_lines:
             result += f"\n\n... ({total_lines - end} more lines)"
 
+        # Guard against a single read flooding the context. A request is
+        # "explicit" when the caller asked for a specific range; in that case an
+        # over-large result errors so the agent narrows it. A default read just
+        # truncates to a page, so a plain `read_file(path)` never hard-fails.
+        if len(result) > MAX_READ_OUTPUT:
+            explicit = offset != 0 or limit != DEFAULT_READ_LIMIT
+            if explicit:
+                return (
+                    f"Error: The requested range is too large to return "
+                    f"({len(result):,} chars, limit {MAX_READ_OUTPUT:,}). "
+                    "Read a smaller slice with a lower `limit`, or use `grep` "
+                    "to locate the part you need."
+                )
+            result = (
+                result[:MAX_READ_OUTPUT]
+                + f"\n\n... (truncated at {MAX_READ_OUTPUT:,} chars — pass a smaller "
+                "`limit`/`offset` or use `grep` to read the rest)"
+            )
+
         return result
 
     def write(self, path: str, content: str | bytes) -> WriteResult:
@@ -443,19 +528,28 @@ class LocalBackend:
         if not base_path.exists():  # pragma: no cover
             return []
 
-        results: list[FileInfo] = []
+        # Collect (mtime, path, FileInfo) so results order by recency —
+        # most-recently-modified first, which is usually what an agent wants
+        # (matches ripgrep/Claude Code glob ordering). Path is the tie-break for
+        # a stable order when mtimes collide.
+        collected: list[tuple[float, str, FileInfo]] = []
 
         try:
             for match in base_path.glob(pattern):  # pragma: no branch
                 if match.is_file():
                     try:
                         self._validate_path(str(match))
-                        results.append(
-                            FileInfo(
-                                name=match.name,
-                                path=str(match),
-                                is_dir=False,
-                                size=match.stat().st_size,
+                        stat = match.stat()
+                        collected.append(
+                            (
+                                stat.st_mtime,
+                                str(match),
+                                FileInfo(
+                                    name=match.name,
+                                    path=str(match),
+                                    is_dir=False,
+                                    size=stat.st_size,
+                                ),
                             )
                         )
                     except PermissionError:  # pragma: no cover
@@ -463,7 +557,8 @@ class LocalBackend:
         except (PermissionError, OSError):  # pragma: no cover
             pass
 
-        return sorted(results, key=lambda x: x["path"])
+        collected.sort(key=lambda item: (-item[0], item[1]))
+        return [info for _mtime, _path, info in collected]
 
     def grep_raw(
         self,
@@ -574,8 +669,9 @@ class LocalBackend:
                 files = list(search_path.glob(glob_pattern))
             else:
                 files = list(search_path.rglob("*"))
-            if ignore_hidden:
-                files = [f for f in files if not any(part.startswith(".") for part in f.parts)]
+            # Skip build/cache dirs (and hidden, when asked) so the fallback
+            # doesn't trawl node_modules/__pycache__ the way ripgrep wouldn't.
+            files = [f for f in files if not _grep_path_ignored(f.parts, ignore_hidden)]
 
         for file_path in files:
             if not file_path.is_file():
@@ -745,3 +841,136 @@ class LocalBackend:
             return
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
+
+    # ── Background (long-lived) processes ────────────────────────────
+
+    @staticmethod
+    def _kill_popen_tree(popen: subprocess.Popen[bytes]) -> None:
+        """Kill a background `Popen` and (on Unix) its whole process group."""
+        if popen.poll() is not None:
+            return
+        if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
+            with contextlib.suppress(ProcessLookupError):
+                popen.kill()
+            return
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(os.getpgid(popen.pid), signal.SIGKILL)
+
+    def execute_background(self, command: str) -> BackgroundHandle:
+        """Start `command` as a detached, long-lived process.
+
+        Returns immediately with a handle. The process keeps running after this
+        call (it is NOT reaped like `execute`); drain its output with
+        `read_background` and stop it with `kill_background`.
+        """
+        if not self._enable_execute:
+            raise RuntimeError(
+                "Shell execution is disabled for this backend. "
+                "Initialize with enable_execute=True to enable."
+            )
+        perm_error = self._check_permission_sync("execute", command)
+        if perm_error:
+            raise PermissionError(perm_error)
+
+        if self._bg_dir is None:
+            self._bg_dir = Path(tempfile.mkdtemp(prefix="pad_bg_"))
+        self._bg_counter += 1
+        shell_id = f"bg_{self._bg_counter}"
+        stdout_path = self._bg_dir / f"{shell_id}.out"
+        stderr_path = self._bg_dir / f"{shell_id}.err"
+
+        # The child writes straight to these files; the parent's handles can be
+        # closed right after spawn (the child keeps its own dup'd descriptors).
+        with open(stdout_path, "wb") as out_fh, open(stderr_path, "wb") as err_fh:
+            popen = subprocess.Popen(
+                self._shell_cmd(command),
+                cwd=self._root,
+                stdout=out_fh,
+                stderr=err_fh,
+                stdin=subprocess.DEVNULL,
+                start_new_session=(sys.platform != "win32"),
+            )
+        self._bg[shell_id] = _BackgroundProcess(
+            shell_id=shell_id,
+            command=command,
+            popen=popen,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+        return BackgroundHandle(shell_id=shell_id, pid=popen.pid, command=command)
+
+    @staticmethod
+    def _drain(path: Path, pos: int) -> tuple[str, int]:
+        """Read new bytes from `path` starting at `pos`; return (text, new_pos)."""
+        try:
+            with open(path, "rb") as f:
+                f.seek(pos)
+                data = f.read()
+        except OSError:  # pragma: no cover - file removed mid-read
+            return "", pos
+        return data.decode("utf-8", errors="replace"), pos + len(data)
+
+    def read_background(self, shell_id: str) -> BackgroundOutput:
+        """Return output produced since the previous read, plus run status."""
+        proc = self._bg.get(shell_id)
+        if proc is None:
+            return BackgroundOutput(
+                shell_id=shell_id,
+                stdout="",
+                stderr=f"No such background shell: {shell_id}",
+                running=False,
+                exit_code=None,
+            )
+        exit_code = proc.popen.poll()
+        out, proc.stdout_pos = self._drain(proc.stdout_path, proc.stdout_pos)
+        err, proc.stderr_pos = self._drain(proc.stderr_path, proc.stderr_pos)
+        return BackgroundOutput(
+            shell_id=shell_id,
+            stdout=out,
+            stderr=err,
+            running=exit_code is None,
+            exit_code=exit_code,
+        )
+
+    def kill_background(self, shell_id: str) -> bool:
+        """Stop a background process. Returns True if it was still running."""
+        proc = self._bg.get(shell_id)
+        if proc is None:
+            return False
+        was_running = proc.popen.poll() is None
+        self._kill_popen_tree(proc.popen)
+        with contextlib.suppress(Exception):
+            proc.popen.wait(timeout=2)
+        return was_running
+
+    def list_background(self) -> list[BackgroundProcessInfo]:
+        """Return status for every tracked background process."""
+        infos: list[BackgroundProcessInfo] = []
+        for proc in self._bg.values():
+            exit_code = proc.popen.poll()
+            infos.append(
+                BackgroundProcessInfo(
+                    shell_id=proc.shell_id,
+                    command=proc.command,
+                    pid=proc.popen.pid,
+                    running=exit_code is None,
+                    exit_code=exit_code,
+                )
+            )
+        return infos
+
+    def kill_all_background(self) -> None:
+        """Stop every background process and remove its on-disk output."""
+        for proc in list(self._bg.values()):
+            self._kill_popen_tree(proc.popen)
+            with contextlib.suppress(Exception):
+                proc.popen.wait(timeout=2)
+        self._bg.clear()
+        if self._bg_dir is not None:
+            shutil.rmtree(self._bg_dir, ignore_errors=True)
+            self._bg_dir = None
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort GC cleanup
+        with contextlib.suppress(Exception):
+            if self._bg:
+                self.kill_all_background()

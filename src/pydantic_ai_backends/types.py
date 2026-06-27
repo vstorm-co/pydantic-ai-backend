@@ -51,6 +51,41 @@ class ExecuteResponse:
     truncated: bool = False
 
 
+@dataclass
+class BackgroundHandle:
+    """Handle to a started background (long-lived) process."""
+
+    shell_id: str
+    pid: int
+    command: str
+
+
+@dataclass
+class BackgroundOutput:
+    """Incremental output + status of a background process.
+
+    `stdout`/`stderr` hold only what is new since the previous `read_background`
+    call for this shell (a growing log is drained in chunks, not re-sent whole).
+    """
+
+    shell_id: str
+    stdout: str
+    stderr: str
+    running: bool
+    exit_code: int | None = None
+
+
+@dataclass
+class BackgroundProcessInfo:
+    """Status of one background process, for listing active shells."""
+
+    shell_id: str
+    command: str
+    pid: int
+    running: bool
+    exit_code: int | None = None
+
+
 class GrepMatch(TypedDict):
     """A single grep match result."""
 
