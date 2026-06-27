@@ -43,6 +43,16 @@ AskFallback = Literal["deny", "error"]
 
 MAX_EXECUTE_OUTPUT = 100_000
 
+#: Char ceiling for a single `read` result. A default read (no explicit
+#: offset/limit) that exceeds this is truncated to a page; an *explicit*
+#: offset/limit that still exceeds it errors, so the agent narrows its request
+#: instead of flooding the context.
+MAX_READ_OUTPUT = 200_000
+#: The default `limit` for `read` — used to tell an explicit request apart from
+#: the default one (the tool always forwards this value when the caller didn't
+#: ask for a specific range).
+DEFAULT_READ_LIMIT = 2000
+
 
 @dataclass
 class _BackgroundProcess:
@@ -384,6 +394,25 @@ class LocalBackend:
         if end < total_lines:
             result += f"\n\n... ({total_lines - end} more lines)"
 
+        # Guard against a single read flooding the context. A request is
+        # "explicit" when the caller asked for a specific range; in that case an
+        # over-large result errors so the agent narrows it. A default read just
+        # truncates to a page, so a plain `read_file(path)` never hard-fails.
+        if len(result) > MAX_READ_OUTPUT:
+            explicit = offset != 0 or limit != DEFAULT_READ_LIMIT
+            if explicit:
+                return (
+                    f"Error: The requested range is too large to return "
+                    f"({len(result):,} chars, limit {MAX_READ_OUTPUT:,}). "
+                    "Read a smaller slice with a lower `limit`, or use `grep` "
+                    "to locate the part you need."
+                )
+            result = (
+                result[:MAX_READ_OUTPUT]
+                + f"\n\n... (truncated at {MAX_READ_OUTPUT:,} chars — pass a smaller "
+                "`limit`/`offset` or use `grep` to read the rest)"
+            )
+
         return result
 
     def write(self, path: str, content: str | bytes) -> WriteResult:
@@ -470,19 +499,28 @@ class LocalBackend:
         if not base_path.exists():  # pragma: no cover
             return []
 
-        results: list[FileInfo] = []
+        # Collect (mtime, path, FileInfo) so results order by recency —
+        # most-recently-modified first, which is usually what an agent wants
+        # (matches ripgrep/Claude Code glob ordering). Path is the tie-break for
+        # a stable order when mtimes collide.
+        collected: list[tuple[float, str, FileInfo]] = []
 
         try:
             for match in base_path.glob(pattern):  # pragma: no branch
                 if match.is_file():
                     try:
                         self._validate_path(str(match))
-                        results.append(
-                            FileInfo(
-                                name=match.name,
-                                path=str(match),
-                                is_dir=False,
-                                size=match.stat().st_size,
+                        stat = match.stat()
+                        collected.append(
+                            (
+                                stat.st_mtime,
+                                str(match),
+                                FileInfo(
+                                    name=match.name,
+                                    path=str(match),
+                                    is_dir=False,
+                                    size=stat.st_size,
+                                ),
                             )
                         )
                     except PermissionError:  # pragma: no cover
@@ -490,7 +528,8 @@ class LocalBackend:
         except (PermissionError, OSError):  # pragma: no cover
             pass
 
-        return sorted(results, key=lambda x: x["path"])
+        collected.sort(key=lambda item: (-item[0], item[1]))
+        return [info for _mtime, _path, info in collected]
 
     def grep_raw(
         self,
