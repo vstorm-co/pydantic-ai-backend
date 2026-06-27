@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Background (long-lived) process support for `LocalBackend`** (`src/pydantic_ai_backends/backends/local.py`, `src/pydantic_ai_backends/protocol.py`, `src/pydantic_ai_backends/types.py`). Lets dev servers, watchers, and other long-running commands outlive a single `execute()` call (which kills its whole process tree on timeout):
+  - `LocalBackend.execute_background()` / `read_background()` / `kill_background()` / `list_background()` / `kill_all_background()` — spawn a detached process (`start_new_session=True`), spool stdout/stderr to temp files, drain incrementally by byte offset, and tear down whole process groups with `killpg`.
+  - New runtime-checkable `BackgroundSandboxProtocol` and `AsyncBackgroundSandboxProtocol` (extending the existing sandbox protocols, which are left untouched), plus `AsyncBackgroundSandboxAdapter` and `ensure_async()` routing to it.
+  - New console tools `run_in_background` / `read_output` / `kill_shell` / `list_shells`, gated behind `include_background` (default `True`) and `include_execute`.
+  - New `BackgroundHandle` / `BackgroundOutput` / `BackgroundProcessInfo` dataclasses, exported from the package root.
+- **Image downscaling on read** (`src/pydantic_ai_backends/toolsets/console.py`; optional `images` extra). `read_file` resizes images whose longest edge exceeds 1568px (aspect preserved, re-encoded) before returning `BinaryContent`, so large screenshots don't waste tokens or exceed provider image limits. Pillow-optional — a graceful no-op when Pillow is absent or the image is already small.
+
+### Changed
+
+- **`read` output ceiling** (`src/pydantic_ai_backends/backends/local.py`). A single `read` is bounded at 200k chars: a default read over the cap is truncated to a page with a notice, while an *explicit* `offset`/`limit` that still overflows returns an error so the agent narrows its request instead of flooding context.
+- **`glob_info` orders results by modification time (newest first)** with a path tie-break, instead of alphabetically by path — usually what an agent wants.
+- **`edit_file` staleness guard** (`src/pydantic_ai_backends/toolsets/console.py`). `read_file`/`write_file` record a content fingerprint; `edit_file` refuses with a "read it again" error when a previously-read file changed on disk since it was read. Files never read through the tools are unaffected, and the fingerprint is re-recorded after a successful edit so consecutive edits work. (`hashline_edit` keeps its own per-line hash check.)
+- **Python `grep` fallback skips build/cache directories** (`node_modules`, `__pycache__`, `dist`, `build`, `.venv`, caches, …) when `ignore_hidden` is on (the default); `ignore_hidden=False` searches everything. ripgrep mode already honors `.gitignore`.
+
 ## [0.2.14] - 2026-06-22
 
 ### Added
