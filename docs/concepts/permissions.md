@@ -372,6 +372,49 @@ backend = LocalBackend(
 # 2. Does the permission ruleset allow this operation?
 ```
 
+### How each operation applies the rules
+
+- **`read` / `read_bytes`** — full "read" semantics: `deny` blocks, `ask`
+  follows the callback / `ask_fallback`. `read_bytes` returns `b""` on a
+  denied path (its documented "empty bytes on failure" contract).
+- **`write` / `edit`** — full "write" / "edit" semantics.
+- **`ls_info` / `glob_info`** — hide entries (and whole listings) with an
+  explicit `deny` rule for the "ls" / "glob" operation. Because a listing
+  can't prompt for approval, `ask` is treated as visible here — only `deny`
+  hides.
+- **`grep_raw`** — an explicit "grep" `deny` on the search path errors the
+  search; individual files denied for "grep" **or for "read"** never
+  contribute matches, so read-protected content can't leak through search
+  results.
+- **`execute`** — see below.
+
+### Shell execution and permission rules
+
+Execute rules pattern-match the **command string**, not file paths — a rule
+like `PermissionRule(pattern="rm *", action="deny")` blocks `rm` commands,
+but a read deny on `**/restricted/**` says nothing about `cat restricted/x`.
+
+As defense-in-depth, `LocalBackend` also resolves path-looking tokens in the
+command and denies it when one hits a "read" or "write" deny rule, so the
+straightforward bypass (`cat restricted/secret.txt`) is caught.
+
+**This guard is a speed bump, not a security boundary.** A shell can always
+reach a file in ways command-string inspection cannot see (subshells,
+`python -c`, encodings, …). If you need enforced path isolation *and* shell
+access, run commands in a sandboxed backend such as `DockerSandbox` (mount
+only what the agent may touch), or set the execute default to `"deny"` or
+`"ask"`:
+
+```python
+ruleset = PermissionRuleset(
+    read=OperationPermissions(
+        default="allow",
+        rules=[PermissionRule(pattern="**/restricted/**", action="deny")],
+    ),
+    execute=OperationPermissions(default="deny"),  # shell can't bypass file rules
+)
+```
+
 ## Integration with Console Toolset
 
 Pass permissions to the toolset:

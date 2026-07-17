@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -264,6 +265,84 @@ class LocalBackend:
         # ask_fallback == "error"
         raise PermissionAskError(operation, target, "Approval required but no callback")
 
+    def _is_denied_sync(self, operation: PermissionOperation, target: str) -> bool:
+        """True when the ruleset explicitly resolves to "deny" for this target.
+
+        Used by listing/search operations (`ls`, `glob`, `grep`) where a sync
+        "ask" cannot be answered: those operations only hide explicitly denied
+        targets and treat "ask" as visible, so a ruleset whose global default
+        is "ask" doesn't blank out every listing.
+        """
+        if self._permission_checker is None:
+            return False
+        return self._permission_checker.check_sync(operation, target) == "deny"
+
+    def _grep_file_hidden(self, path: str) -> bool:
+        """True when a file must not contribute grep matches.
+
+        A file is hidden from grep when it is explicitly denied for "grep",
+        or denied for "read" — grep returns file content, so a read deny
+        must also stop content from leaking through search results.
+        """
+        return self._is_denied_sync("grep", path) or self._is_denied_sync("read", path)
+
+    def _command_path_targets(self, command: str) -> set[str]:
+        """Best-effort extraction of filesystem paths referenced by a command.
+
+        Tokenizes the command, expands `~`, and resolves each token (and the
+        value side of `--flag=value` tokens) against the backend root — the
+        cwd commands actually run in. Non-path tokens resolve to harmless
+        paths that simply won't match any deny rule.
+        """
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            # Unbalanced quotes etc. — fall back to whitespace splitting so a
+            # malformed command can't dodge the guard entirely.
+            tokens = [token.strip("\"'") for token in command.split()]
+
+        candidates: set[str] = set()
+        for token in tokens:
+            candidates.add(token)
+            if "=" in token:
+                candidates.add(token.split("=", 1)[1])
+
+        targets: set[str] = set()
+        for candidate in candidates:
+            if not candidate:
+                continue
+            expanded = os.path.expanduser(candidate)
+            p = Path(expanded)
+            resolved = p.resolve() if p.is_absolute() else (self._root / expanded).resolve()
+            targets.add(str(resolved))
+        return targets
+
+    def _check_execute_permission_sync(self, command: str) -> str | None:
+        """Check a command against execute rules plus a best-effort path guard.
+
+        After the command-pattern check, path-looking tokens in the command are
+        resolved and denied when one hits a "read" or "write" deny rule, so the
+        straightforward bypass (`cat restricted/secret.txt`) is caught. This is
+        defense-in-depth, not a security boundary — a shell can always reach a
+        file in ways command-string inspection cannot see. For enforced
+        isolation use a sandboxed backend (e.g. `DockerSandbox`).
+        """
+        perm_error = self._check_permission_sync("execute", command)
+        if perm_error:
+            return perm_error
+        if self._permission_checker is None:
+            return None
+
+        guarded_ops: tuple[PermissionOperation, ...] = ("read", "write")
+        for target in sorted(self._command_path_targets(command)):
+            for op in guarded_ops:
+                if self._is_denied_sync(op, target):
+                    return (
+                        f"Permission denied: command references '{target}', "
+                        f"which is denied for {op}"
+                    )
+        return None
+
     def _validate_path(self, path: str) -> Path:
         """Validate and resolve path within allowed directories.
 
@@ -324,10 +403,17 @@ class LocalBackend:
             return False
 
     def ls_info(self, path: str) -> list[FileInfo]:
-        """List files and directories at the given path."""
+        """List files and directories at the given path.
+
+        Entries (and the path itself) with an explicit "ls" deny rule are
+        omitted; "ask" is treated as visible (listings can't prompt).
+        """
         try:
             full_path = self._validate_path(path)
         except PermissionError:  # pragma: no cover
+            return []
+
+        if self._is_denied_sync("ls", str(full_path)):
             return []
 
         if not full_path.exists():  # pragma: no cover
@@ -349,6 +435,8 @@ class LocalBackend:
                 try:
                     # Validate each entry is within allowed dirs
                     self._validate_path(str(entry))
+                    if self._is_denied_sync("ls", str(entry)):
+                        continue
                     results.append(
                         FileInfo(
                             name=entry.name,
@@ -364,11 +452,20 @@ class LocalBackend:
 
         return sorted(results, key=lambda x: (not x["is_dir"], x["name"]))
 
-    def read_bytes(self, path: str) -> bytes:  # pragma: no cover
-        """Read raw bytes from a file."""
+    def read_bytes(self, path: str) -> bytes:
+        """Read raw bytes from a file.
+
+        Applies the same "read" permission rules as `read` — a denied path
+        returns `b""`, matching the documented "empty bytes on failure"
+        contract (an "ask" that can't be answered follows `ask_fallback`,
+        exactly like `read`).
+        """
         try:
             full_path = self._validate_path(path)
         except PermissionError:
+            return b""
+
+        if self._check_permission_sync("read", str(full_path)) is not None:
             return b""
 
         if not full_path.exists() or not full_path.is_file():
@@ -376,7 +473,7 @@ class LocalBackend:
 
         try:
             return full_path.read_bytes()
-        except (PermissionError, OSError):
+        except (PermissionError, OSError):  # pragma: no cover
             return b""
 
     def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
@@ -519,10 +616,17 @@ class LocalBackend:
             return EditResult(error=str(e))
 
     def glob_info(self, pattern: str, path: str = ".") -> list[FileInfo]:
-        """Find files matching a glob pattern."""
+        """Find files matching a glob pattern.
+
+        Matches (and the base path itself) with an explicit "glob" deny rule
+        are omitted; "ask" is treated as visible (listings can't prompt).
+        """
         try:
             base_path = self._validate_path(path)
         except PermissionError:  # pragma: no cover
+            return []
+
+        if self._is_denied_sync("glob", str(base_path)):
             return []
 
         if not base_path.exists():  # pragma: no cover
@@ -539,6 +643,8 @@ class LocalBackend:
                 if match.is_file():
                     try:
                         self._validate_path(str(match))
+                        if self._is_denied_sync("glob", str(match)):
+                            continue
                         stat = match.stat()
                         collected.append(
                             (
@@ -570,6 +676,10 @@ class LocalBackend:
         """Search for pattern in files.
 
         Uses ripgrep if available, falls back to Python regex.
+
+        Files denied for "grep" — or for "read", since matches leak file
+        content — never contribute results; an explicit "grep" deny on the
+        search path errors the whole search.
         """
         search_path = path or str(self._root)
 
@@ -577,6 +687,9 @@ class LocalBackend:
             validated_path = self._validate_path(search_path)
         except PermissionError as e:  # pragma: no cover
             return str(e)
+
+        if self._is_denied_sync("grep", str(validated_path)):
+            return f"Error: Permission denied for grep on '{search_path}'"
 
         # Try ripgrep first when searching directories for better performance
         use_ripgrep = shutil.which("rg") is not None and not validated_path.is_file()
@@ -632,6 +745,8 @@ class LocalBackend:
                     base_path = search_path.parent if search_path.is_file() else search_path
                     full_path = (base_path / file_path).resolve()
                     self._validate_path(str(full_path))
+                    if self._grep_file_hidden(str(full_path)):
+                        continue
                     results.append(
                         GrepMatch(
                             path=str(full_path),
@@ -682,6 +797,9 @@ class LocalBackend:
             except PermissionError:
                 continue
 
+            if self._grep_file_hidden(str(file_path)):
+                continue
+
             try:
                 with open(file_path, encoding="utf-8", errors="replace") as f:
                     for i, line in enumerate(f):
@@ -718,7 +836,7 @@ class LocalBackend:
             )
 
         # Check permissions
-        perm_error = self._check_permission_sync("execute", command)
+        perm_error = self._check_execute_permission_sync(command)
         if perm_error:
             return ExecuteResponse(
                 output=f"Error: {perm_error}",
@@ -776,7 +894,7 @@ class LocalBackend:
                 "Initialize with enable_execute=True to enable."
             )
 
-        perm_error = self._check_permission_sync("execute", command)
+        perm_error = self._check_execute_permission_sync(command)
         if perm_error:
             return ExecuteResponse(output=f"Error: {perm_error}", exit_code=1, truncated=False)
 
@@ -868,7 +986,7 @@ class LocalBackend:
                 "Shell execution is disabled for this backend. "
                 "Initialize with enable_execute=True to enable."
             )
-        perm_error = self._check_permission_sync("execute", command)
+        perm_error = self._check_execute_permission_sync(command)
         if perm_error:
             raise PermissionError(perm_error)
 

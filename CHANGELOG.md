@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Permission rules are now enforced on every content-returning path of `LocalBackend`** (closes [#62](https://github.com/vstorm-co/pydantic-ai-backend/issues/62)) (`src/pydantic_ai_backends/backends/local.py`). Previously only `read`/`write`/`edit` and the execute command-pattern check consulted the ruleset, so a `deny` rule like `**/restricted/**` could be bypassed:
+  - `read_bytes` now applies the same "read" rules as `read` (a denied path returns `b""`) — this also closes the leak through the console toolset's `read_file` on images/documents, which reads via `read_bytes`.
+  - `grep_raw` no longer returns matches from files denied for "grep" **or "read"** (grep leaks content, so read denies must apply), and an explicit "grep" deny on the search path errors the search.
+  - `ls_info` / `glob_info` hide entries and matches with an explicit "ls" / "glob" deny. Listings can't prompt, so "ask" is treated as visible — a ruleset whose global default is "ask" keeps listing as before.
+  - `execute` / `async_execute` / `execute_background` gain a best-effort path guard: path-looking tokens in the command are resolved against the backend root and denied when they hit a "read"/"write" deny rule, catching the straightforward `cat restricted/secret.txt` bypass. Documented explicitly as defense-in-depth, not a security boundary — use `DockerSandbox` (or an execute default of "deny"/"ask") for enforced isolation. The permissions docs gained a section spelling out these semantics.
+
 ## [0.2.15] - 2026-06-27
 
 ### Added
