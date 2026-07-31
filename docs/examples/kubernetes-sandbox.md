@@ -37,18 +37,20 @@ app = FastAPI()
 
 
 @app.get("/health")
-async def health(): return {"ready": True}
+async def health():
+    return {"ready": True}
 
 
 @app.post("/exec", dependencies=[Depends(auth)])
 async def exec_(req: dict):
     proc = await asyncio.create_subprocess_exec(
-        "/bin/sh", "-c", req["command"],
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        "/bin/sh",
+        "-c",
+        req["command"],
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
     )
-    out, _ = await asyncio.wait_for(
-        proc.communicate(), timeout=req.get("timeout_seconds", 300)
-    )
+    out, _ = await asyncio.wait_for(proc.communicate(), timeout=req.get("timeout_seconds", 300))
     return {
         "output": out[:OUTPUT_CAP].decode("utf-8", errors="replace"),
         "exit_code": proc.returncode,
@@ -168,7 +170,7 @@ contract collapses to "has a shell", so any image you'd hand to
 from pydantic_ai_backends import KubernetesPodSandbox
 
 sandbox = KubernetesPodSandbox(
-    image="python:3.12-slim",   # same image you'd use with DockerSandbox
+    image="python:3.12-slim",  # same image you'd use with DockerSandbox
     namespace="agents",
     sandbox_id="demo-2",
     mode="api",

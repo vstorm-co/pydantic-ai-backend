@@ -104,7 +104,7 @@ ruleset = create_ruleset(
     allow_read=True,
     allow_write=True,
     allow_execute=False,  # Will require approval
-    deny_secrets=True,     # Block access to sensitive files
+    deny_secrets=True,  # Block access to sensitive files
 )
 ```
 
@@ -121,7 +121,6 @@ from pydantic_ai_backends.permissions import (
 
 custom_permissions = PermissionRuleset(
     default="deny",  # Global default for unconfigured operations
-
     read=OperationPermissions(
         default="allow",
         rules=[
@@ -138,7 +137,6 @@ custom_permissions = PermissionRuleset(
             ),
         ],
     ),
-
     write=OperationPermissions(
         default="ask",
         rules=[
@@ -148,7 +146,6 @@ custom_permissions = PermissionRuleset(
             PermissionRule(pattern="**/*.md", action="allow"),
         ],
     ),
-
     execute=OperationPermissions(
         default="deny",
         rules=[
@@ -161,7 +158,6 @@ custom_permissions = PermissionRuleset(
             PermissionRule(pattern="pytest *", action="allow"),
         ],
     ),
-
     # Allow all search operations
     glob=OperationPermissions(default="allow"),
     grep=OperationPermissions(default="allow"),
@@ -218,11 +214,12 @@ For interactive CLI applications, prompt the user directly:
 ```python
 async def cli_approval(
     operation: str,  # "read", "write", "edit", "execute", etc.
-    target: str,     # Path or command
-    reason: str,     # Why approval is needed
+    target: str,  # Path or command
+    reason: str,  # Why approval is needed
 ) -> bool:
     response = input(f"Allow {operation} on '{target}'? [y/N] ")
     return response.lower() == "y"
+
 
 backend = LocalBackend(
     root_dir="/workspace",
@@ -240,6 +237,7 @@ import asyncio
 
 # In-memory store for pending approvals
 pending_approvals: dict[str, asyncio.Future[bool]] = {}
+
 
 async def web_approval(operation: str, target: str, reason: str) -> bool:
     """Send approval request to frontend via WebSocket, wait for response."""
@@ -268,11 +266,11 @@ import logging
 
 logger = logging.getLogger("permissions")
 
-async def auto_approve_with_logging(
-    operation: str, target: str, reason: str
-) -> bool:
+
+async def auto_approve_with_logging(operation: str, target: str, reason: str) -> bool:
     logger.info(f"Auto-approved: {operation} on '{target}' ({reason})")
     return True
+
 
 backend = LocalBackend(
     root_dir="/workspace",
@@ -287,9 +285,7 @@ Implement logic that auto-approves some operations and denies others:
 
 ```python
 # Auto-approve writes to temp directories, deny everything else
-async def conditional_approval(
-    operation: str, target: str, reason: str
-) -> bool:
+async def conditional_approval(operation: str, target: str, reason: str) -> bool:
     if operation == "write" and target.startswith("/temp/"):
         return True
     if operation == "execute" and target.startswith("python "):
@@ -333,8 +329,10 @@ For programmatic use outside of backends, use `PermissionChecker` with explicit 
 ```python
 from pydantic_ai_backends.permissions import PermissionChecker, DEFAULT_RULESET
 
+
 async def my_callback(op: str, target: str, reason: str) -> bool:
     return input(f"Allow {op} on {target}? ").lower() == "y"
+
 
 checker = PermissionChecker(
     ruleset=DEFAULT_RULESET,
@@ -364,7 +362,7 @@ Permissions are checked after `allowed_directories`:
 backend = LocalBackend(
     root_dir="/workspace",
     allowed_directories=["/workspace", "/data"],  # Checked first
-    permissions=DEFAULT_RULESET,                   # Checked second
+    permissions=DEFAULT_RULESET,  # Checked second
 )
 
 # Path must pass BOTH checks:

@@ -35,14 +35,20 @@ from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_backends.permissions import READONLY_RULESET, PERMISSIVE_RULESET
 
 # Read-only — write/edit/execute tools hidden from model entirely
-agent = Agent("openai:gpt-4.1", capabilities=[
-    ConsoleCapability(permissions=READONLY_RULESET),
-])
+agent = Agent(
+    "openai:gpt-4.1",
+    capabilities=[
+        ConsoleCapability(permissions=READONLY_RULESET),
+    ],
+)
 
 # Permissive — everything allowed except secrets
-agent = Agent("openai:gpt-4.1", capabilities=[
-    ConsoleCapability(permissions=PERMISSIVE_RULESET),
-])
+agent = Agent(
+    "openai:gpt-4.1",
+    capabilities=[
+        ConsoleCapability(permissions=PERMISSIVE_RULESET),
+    ],
+)
 ```
 
 ## How Permissions Work
@@ -111,9 +117,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import ConsoleCapability, LocalBackend
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 agent = Agent("openai:gpt-4.1", deps_type=Deps, capabilities=[ConsoleCapability()])
 

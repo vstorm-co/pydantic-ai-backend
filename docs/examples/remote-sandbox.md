@@ -109,7 +109,7 @@ def sandbox_for(session_id: str, tenant: str) -> RemoteSandbox:
         SERVICE_URL,
         token=SERVICE_TOKEN,
         session_id=session_id,
-        tenant=tenant,          # capacity label; grants nothing
+        tenant=tenant,  # capacity label; grants nothing
         runtime="python",
         reuse=True,
     )
@@ -142,7 +142,7 @@ isolation can go wrong. Two rules:
    is also what stops an id from traversing a workspace path.
 
 ```python
-session_id = f"{tenant_id.hex[:8]}-{conversation_id.hex}"   # 41 chars
+session_id = f"{tenant_id.hex[:8]}-{conversation_id.hex}"  # 41 chars
 ```
 
 The tenant prefix here is for reading the dashboard, not for isolation — that
@@ -167,6 +167,7 @@ SCOPE_KEYS = {
     "user": lambda ctx: ctx.user_id,
     "agent": lambda ctx: ctx.agent_id,
 }
+
 
 def session_id_for(scope: str, ctx) -> str:
     return f"{ctx.tenant_id.hex[:8]}-{SCOPE_KEYS[scope](ctx).hex}"
@@ -206,7 +207,7 @@ archive = WorkspaceArchive(SERVICE_URL, token=SERVICE_TOKEN)
 
 @router.get("/conversations/{conversation_id}/files")
 async def list_files(conversation_id: str, user=CurrentUser) -> list[dict]:
-    await authorize(user, conversation_id)          # your rules, not sandboxd's
+    await authorize(user, conversation_id)  # your rules, not sandboxd's
     try:
         return list(archive.ls(session_id_for("conversation", conversation_id)))
     except WorkspaceArchiveError as e:
@@ -257,8 +258,8 @@ token.
 ## Cleaning up
 
 ```python
-sandbox.stop()              # end the turn, keep the files for the next one
-sandbox.stop(purge=True)    # the conversation is gone: drop container and files
+sandbox.stop()  # end the turn, keep the files for the next one
+sandbox.stop(purge=True)  # the conversation is gone: drop container and files
 ```
 
 A plain `stop()` is best-effort by design: `sandboxd` reaps idle sessions on its

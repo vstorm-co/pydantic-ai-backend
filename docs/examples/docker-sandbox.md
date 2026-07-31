@@ -15,9 +15,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import DockerSandbox, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: DockerSandbox
+
 
 # Create sandbox with data science packages
 sandbox = DockerSandbox(runtime="python-datascience")
@@ -46,13 +48,13 @@ Build a code interpreter for data analysis:
 ```python
 from dataclasses import dataclass
 from pydantic_ai import Agent
-from pydantic_ai_backends import (
-    DockerSandbox, create_console_toolset, get_console_system_prompt
-)
+from pydantic_ai_backends import DockerSandbox, create_console_toolset, get_console_system_prompt
+
 
 @dataclass
 class Deps:
     backend: DockerSandbox
+
 
 sandbox = DockerSandbox(runtime="python-datascience")
 
@@ -128,9 +130,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import DockerSandbox, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: DockerSandbox
+
 
 # Mount host directory for persistence
 sandbox = DockerSandbox(

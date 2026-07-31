@@ -15,9 +15,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import DockerSandbox, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: DockerSandbox
+
 
 # Create sandbox with pre-configured runtime
 sandbox = DockerSandbox(runtime="python-datascience")
@@ -89,16 +91,19 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import SessionManager, DockerSandbox, create_console_toolset
 
+
 @dataclass
 class UserDeps:
     backend: DockerSandbox
     user_id: str
+
 
 # Create session manager
 manager = SessionManager(
     default_runtime="python-datascience",
     workspace_root="/app/workspaces",  # Persistent storage per user
 )
+
 
 async def handle_user_request(user_id: str, message: str):
     # Get or create sandbox for this user
@@ -114,6 +119,7 @@ async def handle_user_request(user_id: str, message: str):
         deps=UserDeps(backend=sandbox, user_id=user_id),
     )
     return result.output
+
 
 # Each user's code runs in isolated container
 # User A cannot see User B's files
@@ -178,8 +184,10 @@ backend (Daytona, custom implementations, etc.):
 ```python
 from pydantic_ai_backends import SessionManager, DaytonaSandbox
 
+
 def daytona_factory(session_id: str) -> DaytonaSandbox:
     return DaytonaSandbox(sandbox_id=session_id)
+
 
 manager = SessionManager(sandbox_factory=daytona_factory)
 sandbox = await manager.get_or_create("user-123")

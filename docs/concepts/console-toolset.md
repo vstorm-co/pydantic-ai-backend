@@ -14,9 +14,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 # Create toolset
 toolset = create_console_toolset()
@@ -109,7 +111,7 @@ toolset = create_console_toolset(permissions=READONLY_RULESET)
 # Custom permissions
 custom = PermissionRuleset(
     write=OperationPermissions(default="allow"),  # No approval needed
-    execute=OperationPermissions(default="ask"),   # Requires approval
+    execute=OperationPermissions(default="ask"),  # Requires approval
 )
 toolset = create_console_toolset(permissions=custom)
 ```
@@ -163,9 +165,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 # Enable image support for multimodal model
 toolset = create_console_toolset(image_support=True)
@@ -234,16 +238,17 @@ Your dependencies class must have a `backend` property:
 ```python
 from pydantic_ai_backends import BackendProtocol
 
+
 class ConsoleDeps(Protocol):
     @property
-    def backend(self) -> BackendProtocol:
-        ...
+    def backend(self) -> BackendProtocol: ...
 ```
 
 Any class with a `backend` attribute works:
 
 ```python
 from dataclasses import dataclass
+
 
 @dataclass
 class MyDeps:

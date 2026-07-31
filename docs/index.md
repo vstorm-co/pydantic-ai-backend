@@ -64,9 +64,12 @@ from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_backends.permissions import READONLY_RULESET
 
 # Read-only agent — write/edit/execute tools hidden from model
-agent = Agent("openai:gpt-4.1", capabilities=[
-    ConsoleCapability(permissions=READONLY_RULESET),
-])
+agent = Agent(
+    "openai:gpt-4.1",
+    capabilities=[
+        ConsoleCapability(permissions=READONLY_RULESET),
+    ],
+)
 ```
 
 ### Alternative: Toolset API
@@ -76,9 +79,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 agent = Agent("openai:gpt-4.1", deps_type=Deps, toolsets=[create_console_toolset()])
 ```

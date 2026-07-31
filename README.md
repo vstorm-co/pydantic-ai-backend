@@ -109,9 +109,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 agent = Agent(
     "openai:gpt-4.1",
@@ -224,12 +226,12 @@ from pydantic_ai_backends.remote.server import SandboxdConfig, create_app
 app = create_app(
     SandboxdConfig(
         token="a-long-random-secret",
-        runtimes={"python": "python:3.12-slim"},   # allowlist; a request sends an alias
+        runtimes={"python": "python:3.12-slim"},  # allowlist; a request sends an alias
         mem_limit="1g",
         cpus=2.0,
-        network_mode="none",                       # sandboxes get no network by default
-        max_sessions=20,                           # beyond this: 429, not unbounded containers
-        workspace_root="/workspaces",              # files survive idle reaping
+        network_mode="none",  # sandboxes get no network by default
+        max_sessions=20,  # beyond this: 429, not unbounded containers
+        workspace_root="/workspaces",  # files survive idle reaping
     )
 )
 ```
@@ -422,8 +424,10 @@ Use any sandbox backend (Daytona, custom, etc.):
 ```python
 from pydantic_ai_backends import SessionManager, DaytonaSandbox
 
+
 def daytona_factory(session_id: str) -> DaytonaSandbox:
     return DaytonaSandbox(sandbox_id=session_id)
+
 
 manager = SessionManager(sandbox_factory=daytona_factory)
 sandbox = await manager.get_or_create("user-123")

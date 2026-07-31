@@ -132,15 +132,15 @@ finally:
 
 ```python
 sandbox = KubernetesPodSandbox(image="...", namespace="agents")
-sandbox.start()                       # creates the pod, waits for Ready
-sandbox.is_alive()                    # True once Running + Ready
+sandbox.start()  # creates the pod, waits for Ready
+sandbox.is_alive()  # True once Running + Ready
 
-result = sandbox.execute("ls /")       # ExecuteResponse
+result = sandbox.execute("ls /")  # ExecuteResponse
 content = sandbox.read("/etc/hostname")
 sandbox.write("/workspace/note.md", "...")
 sandbox.edit("/workspace/note.md", "draft", "v1")
 
-sandbox.stop()                        # deletes the pod, idempotent
+sandbox.stop()  # deletes the pod, idempotent
 ```
 
 ## Error Handling
@@ -187,11 +187,13 @@ sandbox = KubernetesPodSandbox(
         "spec": {
             "serviceAccountName": "agent-sandbox",
             "runtimeClassName": "gvisor",
-            "containers": [{
-                "name": "sandbox",
-                "image": "ghcr.io/your-org/agent-sandbox:1.4",
-                # the constructor merges env + image + ports
-            }],
+            "containers": [
+                {
+                    "name": "sandbox",
+                    "image": "ghcr.io/your-org/agent-sandbox:1.4",
+                    # the constructor merges env + image + ports
+                }
+            ],
         },
     },
 )

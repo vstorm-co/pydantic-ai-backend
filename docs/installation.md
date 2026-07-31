@@ -139,9 +139,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 backend = LocalBackend(root_dir=".", enable_execute=False)
 toolset = create_console_toolset(include_execute=False)

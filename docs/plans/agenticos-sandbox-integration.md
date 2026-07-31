@@ -67,8 +67,8 @@ is the same as choosing who shares files with whom.
 class SandboxConfig(BaseModel):
     backend: Literal["state", "daytona", "docker"] = "state"
     session_scope: Literal["run", "conversation", "user", "agent"] = "run"
-    runtime: str | None = None          # alias from the sandboxd allowlist; the
-                                        # ceilings behind it are the operator's
+    runtime: str | None = None  # alias from the sandboxd allowlist; the
+    # ceilings behind it are the operator's
     include_execute: bool = True
 ```
 
@@ -133,7 +133,7 @@ SCOPE_KEYS = {
     "agent": lambda ctx: ctx.agent_id,
 }
 
-session_id = f"{organization_id.hex[:8]}-{SCOPE_KEYS[scope](ctx).hex}"   # 41 chars
+session_id = f"{organization_id.hex[:8]}-{SCOPE_KEYS[scope](ctx).hex}"  # 41 chars
 ```
 
 **The organization prefix is for readability in the dashboard, not for
@@ -347,7 +347,7 @@ Alongside the existing `LITEPARSE_OCR_SERVER_URL`, which is the same shape of
 thing — an external sidecar this deployment may or may not run:
 
 ```python
-SANDBOXD_URL: str = ""          # empty disables the docker backend
+SANDBOXD_URL: str = ""  # empty disables the docker backend
 SANDBOXD_TOKEN: str = ""
 ```
 

@@ -111,12 +111,10 @@ SandboxdConfig(
     runtimes={
         # A ready-made image: starts as fast as a pull.
         "python": SandboxRuntime(image="python:3.12-slim", mem_limit="1g", cpus=1.0),
-
         # A built runtime: the first session installs the packages into an image,
         # later ones hit the cache. Worth it when per-session installs would
         # dominate.
         "datascience": SandboxRuntime(runtime="python-datascience", mem_limit="4g", cpus=2.0),
-
         # The one runtime allowed to reach the network, deliberately.
         "scraping": SandboxRuntime(runtime="python-scraping", network_mode="bridge"),
     },
@@ -233,10 +231,10 @@ Four settings, and on a 4 GB box each one is worth more than it sounds.
 SandboxdConfig(
     token=token,
     runtimes=SUGGESTED_RUNTIMES,
-    prewarm=True,            # build and pull the allowlist at startup, not on a request
-    persist_containers=True, # a reaped session restarts instead of rebuilding
-    tmpfs_size="64m",        # scratch writes stay in RAM, off the overlay
-    cpu_shares=1024,         # weight rather than a hard cap, so idle cores get used
+    prewarm=True,  # build and pull the allowlist at startup, not on a request
+    persist_containers=True,  # a reaped session restarts instead of rebuilding
+    tmpfs_size="64m",  # scratch writes stay in RAM, off the overlay
+    cpu_shares=1024,  # weight rather than a hard cap, so idle cores get used
     cpus=None,
 )
 ```
@@ -322,8 +320,8 @@ expects: **files are kept for ever, builds are reclaimable.**
 SandboxdConfig(
     workspace_root="/var/lib/sandboxd",
     persist_containers=True,
-    workspace_ttl=None,          # the default: the agent's files are the work
-    container_ttl=30 * 86400,    # its installs are rebuildable, so reclaim them
+    workspace_ttl=None,  # the default: the agent's files are the work
+    container_ttl=30 * 86400,  # its installs are rebuildable, so reclaim them
 )
 ```
 
@@ -346,8 +344,8 @@ why it is off by default.
 ### Ending a session for good
 
 ```python
-sandbox.stop()              # ends the turn, keeps the files for the next one
-sandbox.stop(purge=True)    # discards the container and the workspace
+sandbox.stop()  # ends the turn, keeps the files for the next one
+sandbox.stop(purge=True)  # discards the container and the workspace
 ```
 
 Purge when the thing the session belonged to is gone — a deleted conversation, a
@@ -369,8 +367,8 @@ idle for at least that long is closed to make room:
 ```python
 SandboxdConfig(
     token=token,
-    max_sessions=100,          # live sandboxes — the working set
-    evict_idle_after=120,      # idle two minutes? your slot can be reused
+    max_sessions=100,  # live sandboxes — the working set
+    evict_idle_after=120,  # idle two minutes? your slot can be reused
     workspace_root="/var/lib/sandboxd",
     persist_containers=True,
 )
@@ -417,11 +415,11 @@ first operation, which means a container starts only when the model actually
 reaches for a file or a command:
 
 ```python
-sandbox = RemoteSandbox(url, token=token, session_id=session_id)   # no HTTP yet
+sandbox = RemoteSandbox(url, token=token, session_id=session_id)  # no HTTP yet
 agent = Agent("openai:gpt-4.1", capabilities=[ConsoleCapability(backend=sandbox)])
 
-result = agent.run_sync("What is 2 + 2?")   # answered without any container
-result = agent.run_sync("Write hello.py")   # this is what opens one
+result = agent.run_sync("What is 2 + 2?")  # answered without any container
+result = agent.run_sync("Write hello.py")  # this is what opens one
 ```
 
 That matters most for an agent that *may* need a sandbox: granting the capability

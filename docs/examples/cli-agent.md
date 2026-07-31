@@ -22,9 +22,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import LocalBackend, create_console_toolset, get_console_system_prompt
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 # Create backend and toolset
 backend = LocalBackend(root_dir=".", enable_execute=True)
@@ -40,6 +42,7 @@ agent = Agent(
 )
 agent = agent.with_toolset(toolset)
 
+
 async def main():
     deps = Deps(backend=backend)
 
@@ -53,6 +56,7 @@ async def main():
 
         result = await agent.run(user_input, deps=deps)
         print(f"\nAgent: {result.output}\n")
+
 
 asyncio.run(main())
 ```

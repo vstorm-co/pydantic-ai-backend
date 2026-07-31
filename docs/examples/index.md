@@ -35,9 +35,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 backend = LocalBackend(root_dir=".")
 toolset = create_console_toolset()
@@ -58,9 +60,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import DockerSandbox, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: DockerSandbox
+
 
 sandbox = DockerSandbox(runtime="python-datascience")
 
@@ -84,14 +88,17 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import SessionManager, DockerSandbox, create_console_toolset
 
+
 @dataclass
 class UserDeps:
     backend: DockerSandbox
     user_id: str
 
+
 manager = SessionManager(workspace_root="/app/workspaces")
 toolset = create_console_toolset()
 agent = Agent("openai:gpt-4o", deps_type=UserDeps).with_toolset(toolset)
+
 
 async def handle_request(user_id: str, message: str):
     sandbox = await manager.get_or_create(user_id)
@@ -107,9 +114,11 @@ from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
 from pydantic_ai_backends import StateBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: StateBackend
+
 
 def test_agent_file_operations():
     backend = StateBackend()

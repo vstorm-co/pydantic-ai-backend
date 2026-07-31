@@ -61,6 +61,7 @@ from pydantic_ai_backends import SessionManager, DockerSandbox, create_console_t
 # Session manager
 session_manager: SessionManager | None = None
 
+
 @asynccontextmanager
 async def lifespan(app):
     global session_manager
@@ -72,7 +73,9 @@ async def lifespan(app):
     # Cleanup on shutdown: stop the cleanup loop and all containers
     await session_manager.shutdown()
 
+
 app = FastAPI(lifespan=lifespan)
+
 
 # Agent setup
 @dataclass
@@ -80,16 +83,20 @@ class UserDeps:
     backend: DockerSandbox
     user_id: str
 
+
 toolset = create_console_toolset()
 agent = Agent("openai:gpt-4o", deps_type=UserDeps).with_toolset(toolset)
+
 
 # Request models
 class ChatRequest(BaseModel):
     message: str
 
+
 class ChatResponse(BaseModel):
     response: str
     session_id: str
+
 
 # Endpoints
 @app.post("/sessions/{session_id}/chat")
@@ -103,12 +110,14 @@ async def chat(session_id: str, request: ChatRequest):
 
     return ChatResponse(response=result.output, session_id=session_id)
 
+
 @app.delete("/sessions/{session_id}")
 async def end_session(session_id: str):
     released = await session_manager.release(session_id)
     if not released:
         raise HTTPException(404, "Session not found")
     return {"message": "Session ended"}
+
 
 @app.get("/sessions/{session_id}/files")
 async def list_files(session_id: str, path: str = "/workspace"):
@@ -123,6 +132,7 @@ async def list_files(session_id: str, path: str = "/workspace"):
 ```python
 import httpx
 
+
 async def main():
     async with httpx.AsyncClient(base_url="http://localhost:8000") as client:
         # Pick a session id (e.g. the user id). The sandbox is created
@@ -132,7 +142,7 @@ async def main():
         # Chat with AI
         r = await client.post(
             f"/sessions/{session_id}/chat",
-            json={"message": "Create a hello world script and run it"}
+            json={"message": "Create a hello world script and run it"},
         )
         print(r.json()["response"])
 
@@ -159,6 +169,7 @@ from pydantic_ai_backends import SessionManager
 
 session_manager: SessionManager | None = None
 
+
 @asynccontextmanager
 async def lifespan(app):
     global session_manager
@@ -176,6 +187,7 @@ async def lifespan(app):
     # Graceful shutdown: stop cleanup loop and all containers
     stopped = await session_manager.shutdown()
     print(f"Stopped {stopped} sessions on shutdown")
+
 
 app = FastAPI(lifespan=lifespan)
 ```
@@ -225,6 +237,7 @@ async def list_sessions():
         "count": session_manager.session_count,
         "session_ids": list(session_manager.sessions.keys()),
     }
+
 
 @app.get("/admin/sessions/{session_id}")
 async def check_session(session_id: str):
