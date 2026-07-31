@@ -47,6 +47,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import time
 import uuid
 from collections import Counter, deque
@@ -258,12 +259,32 @@ SandboxdConfig(token=..., runtimes=SUGGESTED_RUNTIMES, default_runtime="python")
 
 _UNAUTHORIZED = "Invalid or missing sandbox token"
 
+
+def _token_matches(supplied: str, expected: str) -> bool:
+    """Compare two tokens in constant time, whatever bytes the header carried.
+
+    Header values reach a handler latin-1 decoded, so a client is free to send a
+    byte over 127 — and `secrets.compare_digest` refuses a `str` that is not
+    ASCII outright rather than returning `False`. Comparing the encoded forms
+    keeps a malformed token a 401 instead of an unauthenticated 500.
+    """
+    return secrets.compare_digest(
+        supplied.encode("utf-8", "surrogateescape"), expected.encode("utf-8")
+    )
+
+
 _CONTAINER_PREFIX = "sandboxd-"
 """Name prefix every persisted sandbox container carries, so a sweep can find
 them without a record of its own — after a restart, Docker is the only source."""
 
 _UI_FILE = Path(__file__).parent / "ui" / "index.html"
 """The bundled dashboard — one self-contained file, no build step, no CDN."""
+
+
+@functools.cache
+def _ui_html() -> str:
+    """The dashboard's markup, read from disk once rather than per request."""
+    return _UI_FILE.read_text(encoding="utf-8")
 
 
 @dataclass(slots=True)
@@ -475,6 +496,20 @@ class _Session:
 
 
 @dataclass(slots=True)
+class _Pending:
+    """An id claimed for a session, from the request that claimed it onwards.
+
+    Outlives the open itself: `_new_sandbox` reads the runtime again every time a
+    dead container is healed, so this lives as long as the session does. Which is
+    what makes it usable as the reservation too — an id present here is either
+    open or being opened, and either way it is taken.
+    """
+
+    runtime: SandboxRuntime
+    tenant: str | None
+
+
+@dataclass(slots=True)
 class _Outcome:
     """Mutable result slot filled in by an operation being observed."""
 
@@ -619,9 +654,17 @@ def sweep_workspaces(config: SandboxdConfig, keep: Iterable[str], now: float) ->
     live = set(keep)
     swept: list[str] = []
     for entry in sorted(root.iterdir()):
-        if not entry.is_dir() or entry.name in live:
+        if entry.name in live:
             continue
-        if now - entry.stat().st_mtime <= config.workspace_ttl:
+        try:
+            # One stat rather than `is_dir()` followed by `stat()`. The two leave
+            # a window for a concurrent purge to delete the directory between
+            # them — both run on the same worker pool — and the second call would
+            # then raise and abort the whole pass over one vanished entry.
+            info = entry.stat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or now - info.st_mtime <= config.workspace_ttl:
             continue
         shutil.rmtree(entry, ignore_errors=True)
         swept.append(entry.name)
@@ -681,6 +724,13 @@ def _default_prewarm(config: SandboxdConfig) -> Callable[[], None]:
     return warm
 
 
+def _default_docker_client() -> Any:
+    """The Docker client the container sweep talks to, imported on demand."""
+    from pydantic_ai_backends.backends.docker._client import docker_client
+
+    return docker_client()
+
+
 def _usage_of(sandbox: Any) -> wire.SessionUsage | None:
     """Sample a sandbox's usage, when it can report any."""
     sampler = getattr(sandbox, "resource_usage", None)
@@ -705,12 +755,14 @@ class _Service:
         config: SandboxdConfig,
         build_sandbox: SandboxBuilder,
         prewarm: Callable[[], None] | None = None,
+        docker_client: Callable[[], Any] | None = None,
     ) -> None:
         self.config = config
         self._build_sandbox = build_sandbox
         self._prewarm = prewarm
+        self._docker_client = docker_client
         self._sessions: dict[str, _Session] = {}
-        self._pending_runtime: dict[str, SandboxRuntime] = {}
+        self._pending: dict[str, _Pending] = {}
         self._executor: ThreadPoolExecutor | None = None
         self._sweep_task: asyncio.Task[None] | None = None
         self._prewarm_task: asyncio.Task[None] | None = None
@@ -735,18 +787,21 @@ class _Service:
         sandbox under it.
         """
         self._sessions.pop(session_id, None)
-        self._pending_runtime.pop(session_id, None)
+        self._pending.pop(session_id, None)
         self._usage_cache.pop(session_id, None)
         self._inflight.pop(session_id, None)
 
     def _new_sandbox(self, session_id: str) -> Any:
-        return self._build_sandbox(session_id, self._pending_runtime[session_id])
+        return self._build_sandbox(session_id, self._pending[session_id].runtime)
 
     def startup(self) -> None:
         """Create the worker pool and begin reaping idle sessions and workspaces."""
         self._executor = ThreadPoolExecutor(
             max_workers=self.config.max_workers, thread_name_prefix="sandboxd"
         )
+        # Starting and stopping a sandbox blocks for seconds; the manager runs
+        # both on this pool rather than on the loop every request shares.
+        self.manager.executor = self._executor
         self.manager.start_cleanup_loop(interval=self.config.cleanup_interval)
         if self.config.workspace_ttl is not None or self.config.container_ttl is not None:
             self._sweep_task = asyncio.create_task(self._sweep_loop())
@@ -768,7 +823,7 @@ class _Service:
             _logger.exception("Prewarming the runtime allowlist failed")
 
     async def _sweep_loop(self) -> None:
-        """Delete unused workspaces periodically.
+        """Reclaim unused workspaces and stopped containers periodically.
 
         Separate from the manager's idle reaping because it outlives it: a
         workspace is swept long after the session that wrote it stopped
@@ -777,13 +832,23 @@ class _Service:
         while True:
             await asyncio.sleep(self.config.cleanup_interval)
             try:
-                # Synchronous, so cancellation can only land on the sleep above.
-                swept = sweep_workspaces(self.config, self.manager.sessions, time.time())
+                await self._in_thread(self._sweep_once)
             except Exception:
-                _logger.exception("Workspace sweep failed; retrying next interval")
-            else:
-                if swept:
-                    _logger.info("Swept %d unused workspace(s)", len(swept))
+                _logger.exception("Sweep failed; retrying next interval")
+
+    def _sweep_once(self) -> None:
+        """One reclaim pass, off the event loop.
+
+        Both halves block — deleting a directory tree and asking the daemon to
+        list and remove containers — and neither is urgent enough to hold the
+        loop for.
+        """
+        now = time.time()
+        swept = sweep_workspaces(self.config, self.manager.sessions, now)
+        if swept:
+            _logger.info("Swept %d unused workspace(s)", len(swept))
+        if self._docker_client is not None:
+            sweep_containers(self.config, self._docker_client(), now)
 
     async def shutdown(self) -> None:
         """Stop every sandbox and release the worker pool."""
@@ -794,7 +859,7 @@ class _Service:
         self._prewarm_task = None
         await self.manager.shutdown()
         self._sessions.clear()
-        self._pending_runtime.clear()
+        self._pending.clear()
         self._usage_cache.clear()
         if self._executor is not None:
             self._executor.shutdown(wait=True)
@@ -806,7 +871,7 @@ class _Service:
         Raises:
             HTTPException: 401 when the token is absent or wrong.
         """
-        if token is None or not secrets.compare_digest(token, self.config.token):
+        if token is None or not _token_matches(token, self.config.token):
             raise HTTPException(status_code=401, detail=_UNAUTHORIZED)
 
     def check_session_token(self, session_id: str, token: str | None) -> None:
@@ -824,7 +889,7 @@ class _Service:
             raise HTTPException(status_code=401, detail=_UNAUTHORIZED)
         record = self._sessions.get(session_id)
         candidates = [self.config.token] if record is None else [self.config.token, record.token]
-        if not any(secrets.compare_digest(token, candidate) for candidate in candidates):
+        if not any(_token_matches(token, candidate) for candidate in candidates):
             raise HTTPException(status_code=401, detail=_UNAUTHORIZED)
         if record is None:
             raise HTTPException(status_code=404, detail=f"No such session: {session_id}")
@@ -876,8 +941,16 @@ class _Service:
 
         Takes an already-taken `usage` sample rather than fetching one: sampling
         is slow enough that the caller has to decide when and how many at a time.
+
+        Raises:
+            HTTPException: 404 when the session was reaped while this view was
+                being built. The record is looked up again rather than trusted
+                from the authorization check, because a usage sample is a
+                second-long await and the idle reaper runs on its own timer.
         """
-        record = self._sessions[session_id]
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"No such session: {session_id}")
         now = time.time()
         last_activity = getattr(sandbox, "last_activity", now)
         return wire.SessionInfo(
@@ -1034,21 +1107,36 @@ class _Service:
             if session_id in self._sessions
         ]
         described = await asyncio.gather(
-            *(self.described(session_id, sandbox, usage) for session_id, sandbox in live)
+            *(self._described_or_gone(session_id, sandbox, usage) for session_id, sandbox in live)
         )
         return wire.SessionList(
-            sessions=list(described),
+            sessions=[row for row in described if row is not None],
             limit=self.config.max_sessions,
             tenant_limit=self.config.max_sessions_per_tenant,
         )
+
+    async def _described_or_gone(
+        self, session_id: str, sandbox: Any, usage: bool
+    ) -> wire.SessionInfo | None:
+        """Describe one session for a listing, or `None` if it has just gone.
+
+        A listing samples every sandbox, each sample is a daemon round trip, and
+        the idle reaper runs while that happens — so one session disappearing
+        mid-listing must drop a row rather than fail the operator's whole view.
+        """
+        try:
+            return await self.described(session_id, sandbox, usage)
+        except HTTPException:
+            return None
 
     async def open_session(self, body: wire.CreateSessionRequest) -> wire.SessionCreated:
         """Open a session and mint a token scoped to it.
 
         Raises:
             HTTPException: 400 for a runtime outside the allowlist, 409 when the
-                id is taken, 429 at capacity — the service's or the tenant's —
-                and 502 when the sandbox won't start.
+                id is already open or already being opened, 429 at capacity —
+                the service's or the tenant's — and 502 when the sandbox won't
+                start.
         """
         try:
             alias, runtime = self.config.resolve_runtime(body.runtime)
@@ -1067,18 +1155,26 @@ class _Service:
             if not body.reuse:
                 raise HTTPException(status_code=409, detail=f"Session exists: {session_id}")
             return self._attach(session_id, open_already, body.runtime)
+        if session_id in self._pending:
+            raise HTTPException(status_code=409, detail=f"Session is opening: {session_id}")
 
-        self._reject_tenant_at_capacity(body.tenant)
-        await self.make_room()
-
-        self._pending_runtime[session_id] = runtime
+        # Claimed before the first await. Starting a sandbox suspends, so without
+        # this two requests naming one id both get past the check above, both are
+        # handed the same sandbox, and the second overwrites the first's record —
+        # which silently invalidates the token the first caller is holding.
+        self._pending[session_id] = _Pending(runtime=runtime, tenant=body.tenant)
         try:
+            self._reject_tenant_at_capacity(body.tenant, session_id)
+            await self.make_room()
             sandbox = await self.manager.get_or_create(session_id)
+        except HTTPException:
+            self._pending.pop(session_id, None)
+            raise
         except SessionLimitExceeded as exc:
-            self._pending_runtime.pop(session_id, None)
+            self._pending.pop(session_id, None)
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         except Exception as exc:
-            self._pending_runtime.pop(session_id, None)
+            self._pending.pop(session_id, None)
             raise HTTPException(status_code=502, detail=f"Could not start sandbox: {exc}") from exc
 
         self._sessions[session_id] = _Session(
@@ -1132,13 +1228,20 @@ class _Service:
         _logger.info("Evicted idle session %s to make room", victim)
         return victim
 
-    def _reject_tenant_at_capacity(self, tenant: str | None) -> None:
+    def _reject_tenant_at_capacity(self, tenant: str | None, opening: str) -> None:
         """Refuse a new session once its tenant holds its share of the pool.
 
-        Counted over the service's own records rather than the manager's, so a
+        Counted over the service's own reservations rather than the manager's
+        sessions, which covers two ways a tenant would otherwise slip past: a
         session whose sandbox has died but has not been reaped yet still counts
-        against its tenant — otherwise a tenant could exceed the ceiling by
-        letting containers die.
+        against it, and so does an open still in flight — without that, a burst
+        of concurrent requests all pass a check none of them has registered
+        against yet.
+
+        Args:
+            tenant: Label the new session is being opened for.
+            opening: Id this call is opening, whose own reservation is already in
+                place and so must not be counted against its own ceiling.
 
         Raises:
             HTTPException: 429 when the tenant is already at its ceiling.
@@ -1147,7 +1250,11 @@ class _Service:
         if ceiling is None or tenant is None:
             return
 
-        held = sum(1 for record in self._sessions.values() if record.tenant == tenant)
+        held = sum(
+            1
+            for session_id, pending in self._pending.items()
+            if pending.tenant == tenant and session_id != opening
+        )
         if held >= ceiling:
             raise HTTPException(
                 status_code=429,
@@ -1198,14 +1305,18 @@ class _Service:
         """
         sandbox = self.manager.sessions.get(session_id)
         if purge and sandbox is not None:
-            _remove_sandbox(sandbox)
+            # Discarding a container and deleting a directory tree both block,
+            # and a purge is the slowest close there is.
+            await self._in_thread(functools.partial(_remove_sandbox, sandbox))
 
         await self.manager.release(session_id)
 
         if purge:
             session_dir = _session_dir(self.config, session_id)
             if session_dir is not None:
-                shutil.rmtree(session_dir, ignore_errors=True)
+                await self._in_thread(
+                    functools.partial(shutil.rmtree, session_dir, ignore_errors=True)
+                )
 
     def workspace_of(self, session_id: str) -> Path:
         """The host directory holding a session's files.
@@ -1259,6 +1370,10 @@ class _Service:
         )
         return wire.ReadResponse(content=content)
 
+    async def _in_thread(self, call: Callable[[], Any]) -> Any:
+        """Run one blocking call on the service's worker pool."""
+        return await asyncio.get_running_loop().run_in_executor(self._executor, call)
+
     async def _off_loop(self, fn: Callable[..., Any], *args: Any) -> Any:
         """Run a blocking filesystem call on the service's worker pool.
 
@@ -1266,9 +1381,8 @@ class _Service:
             HTTPException: 400 for a refused path or unreadable content, 404 for
                 a missing one — mapped here so both archive routes agree.
         """
-        loop = asyncio.get_running_loop()
         try:
-            return await loop.run_in_executor(self._executor, functools.partial(fn, *args))
+            return await self._in_thread(functools.partial(fn, *args))
         except WorkspacePathError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
@@ -1329,7 +1443,7 @@ def _register_session_routes(app: FastAPI, service: _Service) -> None:
         @app.get("/ui", response_class=HTMLResponse, include_in_schema=False)
         async def dashboard() -> HTMLResponse:
             """Serve the bundled single-file dashboard."""
-            return HTMLResponse(_UI_FILE.read_text(encoding="utf-8"))
+            return HTMLResponse(_ui_html())
 
     @app.get("/healthz", response_model=wire.ServiceHealth)
     async def healthz() -> wire.ServiceHealth:
@@ -1572,12 +1686,14 @@ def create_app(
     Returns:
         A configured `FastAPI` application.
     """
-    # Prewarming only makes sense for the builder that knows what an image is;
-    # an injected builder may have nothing to pull.
+    # Prewarming and the container sweep only make sense for the builder that
+    # knows what an image is; an injected builder may have nothing to pull and no
+    # daemon to ask.
     service = _Service(
         config,
         sandbox_builder or _default_builder(config),
         prewarm=None if sandbox_builder else _default_prewarm(config),
+        docker_client=None if sandbox_builder else _default_docker_client,
     )
 
     @asynccontextmanager
@@ -1606,8 +1722,6 @@ def run() -> None:  # pragma: no cover - thin CLI wrapper around uvicorn
     Reads `SANDBOXD_TOKEN` (required), `SANDBOXD_RUNTIMES` (comma-separated
     `alias=image` pairs), `SANDBOXD_HOST` and `SANDBOXD_PORT`.
     """
-    import os
-
     import uvicorn
 
     token = os.environ.get("SANDBOXD_TOKEN", "")
@@ -1615,7 +1729,17 @@ def run() -> None:  # pragma: no cover - thin CLI wrapper around uvicorn
         raise SystemExit("SANDBOXD_TOKEN is required")
 
     raw_runtimes = os.environ.get("SANDBOXD_RUNTIMES", "python=python:3.12-slim")
-    runtimes = dict(pair.split("=", 1) for pair in raw_runtimes.split(",") if pair)
+    runtimes: dict[str, str] = {}
+    for pair in raw_runtimes.split(","):
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise SystemExit(
+                f"SANDBOXD_RUNTIMES entry {pair!r} is not 'alias=image'. "
+                "Example: SANDBOXD_RUNTIMES=python=python:3.12-slim,node=node:20-slim"
+            )
+        alias, image = pair.split("=", 1)
+        runtimes[alias] = image
     uvicorn.run(
         create_app(
             SandboxdConfig(token=token, runtimes=runtimes, default_runtime=next(iter(runtimes)))

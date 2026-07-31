@@ -12,13 +12,16 @@ import asyncio
 import base64
 import os
 import sys
+import threading
 import time
 import types
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from pydantic_ai_backends import StateBackend
@@ -68,6 +71,9 @@ class FakeSandbox:
         self.usage_calls = 0
         self.sample_delay = 0.0
         self.start_error: Exception | None = None
+        # Lets a test hold an open inside `start()`, which is where a real one
+        # spends its seconds pulling an image.
+        self.start_gate: threading.Event | None = None
 
     # lifecycle -----------------------------------------------------------
     @property
@@ -75,6 +81,8 @@ class FakeSandbox:
         return self._id
 
     def start(self) -> None:
+        if self.start_gate is not None:
+            assert self.start_gate.wait(timeout=5), "start gate was never released"
         if self.start_error is not None:
             raise self.start_error
         self.started += 1
@@ -147,6 +155,7 @@ class Harness:
     def __init__(self, **config_kwargs: Any) -> None:
         self.built: dict[str, FakeSandbox] = {}
         self.next_start_error: Exception | None = None
+        self.next_start_gate: threading.Event | None = None
         config = SandboxdConfig(
             token=SERVICE_TOKEN,
             runtimes={"python": "python:3.12-slim", "node": "node:20-slim"},
@@ -162,6 +171,7 @@ class Harness:
         _session_volumes(self.config, session_id)
         sandbox = FakeSandbox(session_id, runtime)
         sandbox.start_error = self.next_start_error
+        sandbox.start_gate = self.next_start_gate
         self.built[session_id] = sandbox
         return sandbox
 
@@ -182,6 +192,21 @@ def client(harness: Harness):
 
 def _service_headers() -> dict[str, str]:
     return {wire.TOKEN_HEADER: SERVICE_TOKEN}
+
+
+async def _wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+    """Wait for something a worker thread will make true.
+
+    `asyncio.sleep(0)` only reschedules on the event loop, which is enough for
+    work that stays there and not enough for work handed to a thread pool — the
+    thread needs real time to be given a turn.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.005)
+    return predicate()
 
 
 def _open_session(client: TestClient, **body: Any) -> tuple[str, str]:
@@ -1516,6 +1541,28 @@ class TestWorkspaceSweep:
 
         assert (tmp_path / "s1").stat().st_mtime > 0
 
+    def test_a_workspace_deleted_mid_pass_does_not_abort_the_sweep(self, tmp_path, monkeypatch):
+        """A purge runs on the same worker pool, so it can land between calls."""
+        from pydantic_ai_backends.remote.server import sweep_workspaces
+
+        for name in ("aged", "vanishing"):
+            (tmp_path / name / "workspace").mkdir(parents=True)
+            os.utime(tmp_path / name, (0, 0))
+
+        real_stat = Path.stat
+
+        def stat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+            if self.name == "vanishing":
+                raise FileNotFoundError(2, "No such file or directory", str(self))
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+
+        swept = sweep_workspaces(self._config(tmp_path, workspace_ttl=1), [], 1_800_000_000.0)
+
+        assert swept == ["aged"]
+        assert not (tmp_path / "aged").exists()
+
 
 class TestSweepLoop:
     """The background pass that reclaims workspaces."""
@@ -1533,21 +1580,28 @@ class TestSweepLoop:
         assert harness.app.state.service._sweep_task is None
         assert task.cancelled() or task.cancelling()
 
-    async def test_a_pass_deletes_what_the_sweep_finds(self, tmp_path):
+    async def test_a_pass_deletes_what_the_sweep_finds(self, tmp_path, monkeypatch):
+        from pydantic_ai_backends.remote import server as server_mod
+
         harness = Harness(workspace_root=str(tmp_path), workspace_ttl=1, cleanup_interval=0)
         service = harness.app.state.service
         aged = tmp_path / "old"
         (aged / "workspace").mkdir(parents=True)
         os.utime(aged, (0, 0))
 
+        passes: list[int] = []
+        real_sweep = server_mod.sweep_workspaces
+
+        def counted(*args: Any) -> list[str]:
+            passes.append(1)
+            return real_sweep(*args)
+
+        monkeypatch.setattr(server_mod, "sweep_workspaces", counted)
+
         task = asyncio.create_task(service._sweep_loop())
-        for _ in range(100):
-            await asyncio.sleep(0)
-            if not aged.exists():
-                break
-        # A few more turns, so a pass that finds nothing also runs.
-        for _ in range(5):
-            await asyncio.sleep(0)
+        # Two passes: the one that finds the aged workspace, and one after that
+        # finds nothing left to delete.
+        assert await _wait_until(lambda: len(passes) >= 2)
         task.cancel()
 
         assert not aged.exists()
@@ -1571,14 +1625,11 @@ class TestSweepLoop:
 
         with caplog.at_level("ERROR"):
             task = asyncio.create_task(service._sweep_loop())
-            for _ in range(100):
-                await asyncio.sleep(0)
-                if len(calls) >= 2:
-                    break
+            assert await _wait_until(lambda: len(calls) >= 2)
             task.cancel()
 
         assert len(calls) >= 2
-        assert "Workspace sweep failed" in caplog.text
+        assert "Sweep failed" in caplog.text
 
 
 class TestLazySessions:
@@ -2769,3 +2820,393 @@ class TestContainerSweep:
         )
         with harness.client():
             assert harness.app.state.service._sweep_task is not None
+
+
+class _Proxy:
+    """A gateway in front of the service that answers 200 with the wrong body.
+
+    Models the realistic misconfiguration: an auth proxy or captive portal
+    intercepting the request and returning its own HTML page with a success
+    status. `json()` raising is what httpx does with such a body.
+    """
+
+    def __init__(self, payload: Any = None) -> None:
+        self._payload = payload
+
+    def _answer(self) -> Any:
+        payload = self._payload
+
+        class Response:
+            status_code = 200
+
+            @staticmethod
+            def json() -> Any:
+                if payload is None:
+                    raise ValueError("Expecting value: line 1 column 1 (char 0)")
+                return payload
+
+        return Response()
+
+    def post(self, *args: Any, **kwargs: Any) -> Any:
+        return self._answer()
+
+    def get(self, *args: Any, **kwargs: Any) -> Any:
+        return self._answer()
+
+    def delete(self, *args: Any, **kwargs: Any) -> Any:
+        return self._answer()
+
+
+class TestMalformedSuccessResponses:
+    """A 200 carrying something else is a failed operation, not an exception."""
+
+    def test_start_explains_a_body_that_is_not_a_session(self):
+        remote = RemoteSandbox(client=_Proxy())  # type: ignore[arg-type]
+
+        with pytest.raises(RuntimeError, match="not a\n?\\s*session"):
+            remote.start()
+
+    def test_operations_degrade_rather_than_raise(self, client: TestClient):
+        """Raising here would end the agent run that made the tool call."""
+        remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="proxied", client=client)
+        remote.start()
+        remote._http = _Proxy()  # type: ignore[assignment]
+
+        assert remote.execute("echo hi").exit_code == 1
+        assert remote.read("/f.txt").startswith("Error:")
+        assert remote.read_bytes("/f.txt") == b""
+        assert remote.write("/f.txt", "x").error is not None
+        assert remote.edit("/f.txt", "a", "b").error is not None
+        assert remote.exists("/f.txt") is False
+        assert remote.grep_raw("x").startswith("Error:")
+        assert remote.is_alive() is False
+        assert remote.resource_usage() is None
+
+    def test_a_listing_body_that_is_not_entries_yields_no_rows(self, client: TestClient):
+        remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="badrows", client=client)
+        remote.start()
+        remote._http = _Proxy(payload={"detail": "not a listing"})  # type: ignore[assignment]
+
+        assert remote.ls_info("/") == []
+        assert remote.glob_info("*.py") == []
+
+
+class TestMalformedTokens:
+    """A token the comparison cannot even look at must be a 401, not a 500."""
+
+    def test_a_non_ascii_service_token_is_rejected(self, client: TestClient):
+        """Header values arrive latin-1 decoded, so a client can send byte 0xE9."""
+        response = client.get("/sessions", headers={b"x-sandbox-token": b"\xe9"})
+
+        assert response.status_code == 401
+
+    def test_a_non_ascii_session_token_is_rejected(self, client: TestClient):
+        _open_session(client, session_id="guarded")
+
+        response = client.post(
+            "/sessions/guarded/exists",
+            json={"path": "/f.txt"},
+            headers={b"x-sandbox-token": b"\xe9"},
+        )
+
+        assert response.status_code == 401
+
+    def test_matching_tokens_still_compare_equal(self):
+        from pydantic_ai_backends.remote.server import _token_matches
+
+        assert _token_matches(SERVICE_TOKEN, SERVICE_TOKEN) is True
+        assert _token_matches(SERVICE_TOKEN, "other") is False
+
+
+class TestSessionsThatVanishMidRequest:
+    """Sampling usage is a second-long await, and the reaper runs on a timer."""
+
+    async def test_inspecting_a_session_reaped_mid_sample_is_a_404(self):
+        harness = Harness()
+        with harness.client() as client:
+            _open_session(client, session_id="vanishing")
+            sandbox = harness.built["vanishing"]
+            sandbox.usage = SandboxUsage(memory_bytes=1)
+            sandbox.sample_delay = 0.05
+            service = harness.app.state.service
+
+            describing = asyncio.create_task(service.described("vanishing", sandbox, usage=True))
+            await asyncio.sleep(0.01)
+            await service.manager.release("vanishing")
+
+            with pytest.raises(HTTPException) as caught:
+                await describing
+
+        assert caught.value.status_code == 404
+
+    async def test_a_listing_drops_the_vanished_row_and_keeps_the_rest(self):
+        """One reaped session must not fail the operator's whole view."""
+        harness = Harness()
+        with harness.client() as client:
+            _open_session(client, session_id="staying")
+            _open_session(client, session_id="going")
+            service = harness.app.state.service
+            for sandbox in harness.built.values():
+                sandbox.usage = SandboxUsage(memory_bytes=1)
+                sandbox.sample_delay = 0.05
+
+            listing = asyncio.create_task(service.listing(usage=True))
+            await asyncio.sleep(0.01)
+            await service.manager.release("going")
+            result = await listing
+
+        assert [row.session_id for row in result.sessions] == ["staying"]
+
+
+class TestConcurrentOpens:
+    """Starting a sandbox suspends, so two requests can reach one id at once."""
+
+    async def test_one_caller_wins_the_id_and_the_other_is_told(self):
+        """The second request arrives while the id is claimed but not registered."""
+        harness = Harness()
+        harness.next_start_gate = threading.Event()
+        with harness.client():
+            service = harness.app.state.service
+            body = wire.CreateSessionRequest(session_id="contested")
+
+            # Parked inside `start()`, which is exactly the window the
+            # reservation exists for — and the one an image pull makes wide.
+            first = asyncio.create_task(service.open_session(body))
+            assert await _wait_until(lambda: "contested" in service._pending)
+
+            with pytest.raises(HTTPException) as caught:
+                await service.open_session(body)
+
+            harness.next_start_gate.set()
+            created = await first
+
+            # The winner's token must still work: the loser overwriting the
+            # record would have invalidated it without telling anybody.
+            service.check_session_token("contested", created.token)
+
+        assert caught.value.status_code == 409
+        assert "opening" in caught.value.detail
+
+    async def test_a_failed_open_releases_the_id(self):
+        """A reservation that outlived its request would wedge the id for good."""
+        harness = Harness()
+        harness.next_start_error = RuntimeError("no daemon")
+        with harness.client():
+            service = harness.app.state.service
+
+            with pytest.raises(HTTPException) as caught:
+                await service.open_session(wire.CreateSessionRequest(session_id="doomed"))
+            assert caught.value.status_code == 502
+
+            harness.next_start_error = None
+            created = await service.open_session(wire.CreateSessionRequest(session_id="doomed"))
+
+        assert created.session.session_id == "doomed"
+
+    async def test_a_tenant_ceiling_counts_opens_still_in_flight(self):
+        """Counting only registered sessions let a burst walk straight past it."""
+        harness = Harness(max_sessions_per_tenant=1)
+        harness.next_start_gate = threading.Event()
+        with harness.client():
+            service = harness.app.state.service
+
+            first = asyncio.create_task(
+                service.open_session(wire.CreateSessionRequest(session_id="a", tenant="acme"))
+            )
+            assert await _wait_until(lambda: "a" in service._pending)
+
+            with pytest.raises(HTTPException) as caught:
+                await service.open_session(wire.CreateSessionRequest(session_id="b", tenant="acme"))
+
+            harness.next_start_gate.set()
+            await first
+
+        assert caught.value.status_code == 429
+        assert "acme" in caught.value.detail
+
+
+class TestContainerSweepIsWired:
+    """A `container_ttl` nothing acts on is worse than one that is absent."""
+
+    async def test_the_sweep_loop_removes_a_stale_stopped_container(self, tmp_path):
+        from pydantic_ai_backends.remote import server as server_mod
+
+        stale = _FakeContainer("sandboxd-stale", "2020-01-01T00:00:00Z")
+        docker = _FakeDocker([stale])
+        config = SandboxdConfig(
+            token=SERVICE_TOKEN,
+            runtimes={"python": "python:3.12-slim"},
+            workspace_root=str(tmp_path),
+            persist_containers=True,
+            container_ttl=1,
+            cleanup_interval=0,
+            prewarm=False,
+        )
+        service = server_mod._Service(
+            config,
+            lambda session_id, runtime: FakeSandbox(session_id, runtime),
+            docker_client=lambda: docker,
+        )
+        service.startup()
+        try:
+            assert await _wait_until(lambda: stale.removed)
+        finally:
+            await service.shutdown()
+
+        assert stale.removed is True
+
+    async def test_an_injected_builder_is_not_asked_for_a_daemon(self, tmp_path):
+        """A service embedding another sandbox type has no Docker to sweep."""
+        harness = Harness(workspace_root=str(tmp_path), persist_containers=True, container_ttl=1)
+        with harness.client():
+            service = harness.app.state.service
+            assert service._docker_client is None
+            service._sweep_once()  # must not reach for a daemon
+
+    def test_the_default_client_factory_defers_its_import(self, monkeypatch):
+        from pydantic_ai_backends.backends.docker import _client as client_mod
+        from pydantic_ai_backends.remote import server as server_mod
+
+        monkeypatch.setattr(client_mod, "docker_client", lambda: "the-daemon")
+
+        assert server_mod._default_docker_client() == "the-daemon"
+
+
+class TestReadRequestBounds:
+    """A slice request that cannot mean anything is refused at the edge."""
+
+    @pytest.mark.parametrize("field,value", [("offset", -1), ("limit", 0), ("limit", -5)])
+    def test_nonsense_slices_are_rejected(self, field: str, value: int):
+        with pytest.raises(ValueError):
+            wire.ReadRequest(path="/f.txt", **{field: value})
+
+    def test_a_negative_offset_is_refused_by_the_route(self, client: TestClient):
+        _open_session(client, session_id="slicing")
+
+        response = client.post(
+            "/sessions/slicing/read",
+            json={"path": "/f.txt", "offset": -1},
+            headers=_service_headers(),
+        )
+
+        assert response.status_code == 422
+
+
+class TestDanglingSymlinks:
+    """A link to nothing is a listing entry we skip, not a failed listing."""
+
+    @pytest.fixture
+    def stored(self, tmp_path):
+        harness = Harness(workspace_root=str(tmp_path))
+        workspace = tmp_path / "linky" / "workspace"
+        workspace.mkdir(parents=True)
+        (workspace / "real.txt").write_text("kept\n")
+        # `ln -s missing.txt report.md` inside the container. The target stays
+        # inside the workspace, so containment passes and only the stat fails.
+        (workspace / "report.md").symlink_to("missing.txt")
+        return harness, workspace
+
+    def test_one_broken_link_does_not_fail_the_whole_directory(self, stored):
+        harness, _ = stored
+        with harness.client() as client:
+            response = client.post(
+                "/workspaces/linky/ls", json={"path": "."}, headers=_service_headers()
+            )
+
+            assert response.status_code == 200, response.text
+            rows = [wire.FileEntry.model_validate(row) for row in response.json()]
+            assert [row.name for row in rows] == ["real.txt"]
+
+    def test_a_broken_link_inside_a_subdirectory_is_skipped_too(self, stored):
+        harness, workspace = stored
+        nested = workspace / "src"
+        nested.mkdir()
+        (nested / "app.py").write_text("print('hi')\n")
+        (nested / "gone.py").symlink_to("nowhere.py")
+
+        with harness.client() as client:
+            response = client.post(
+                "/workspaces/linky/ls", json={"path": "src"}, headers=_service_headers()
+            )
+
+            assert response.status_code == 200, response.text
+            rows = [wire.FileEntry.model_validate(row) for row in response.json()]
+            assert [row.name for row in rows] == ["app.py"]
+
+
+class TestReuseAfterStop:
+    """A stopped sandbox behaves like `DockerSandbox`: usable again."""
+
+    def test_an_owned_client_is_rebuilt_on_the_next_start(self):
+        """Otherwise stop() poisoned the object and every later call lied."""
+        remote = RemoteSandbox("http://localhost:9/", token="t")
+        first = remote._http
+
+        remote.stop()
+        assert first.is_closed
+
+        # Port 9 refuses, so reaching the transport at all is the evidence. Left
+        # unrebuilt, httpx raises "Cannot send a request, as the client has been
+        # closed" instead — the silent lie this fixes.
+        with pytest.raises(RuntimeError) as caught:
+            remote.start()
+
+        assert "Could not reach" in str(caught.value)
+        assert "has been closed" not in str(caught.value)
+        assert remote._http is not first
+        assert remote._http.is_closed is False
+        remote.stop()
+
+    def test_a_supplied_client_is_left_alone(self, client: TestClient):
+        """The caller owns it, so stop() must not close it — nor reopen a session."""
+        remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="borrowed", client=client)
+        remote.start()
+
+        remote.stop()
+
+        assert remote._owns_client is False
+        # Still usable, because the client was never closed.
+        remote.start()
+        assert remote.exists("/nope.txt") is False
+        remote.stop()
+
+    def test_a_second_session_can_be_opened_after_stopping(self, harness: Harness):
+        with harness.client() as running:
+            remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="cycled", client=running)
+            remote.start()
+            remote.write("first.txt", "one")
+            first_sandbox = harness.built["cycled"]
+            remote.stop()
+
+            remote.start()
+            # A genuinely new sandbox, and none of the first one's files.
+            assert harness.built["cycled"] is not first_sandbox
+            assert remote.exists("/workspace/first.txt") is False
+
+        assert first_sandbox.stopped == 1
+
+
+class TestDashboardIsReadOnce:
+    """The bundled page is an asset, not something to re-read per request."""
+
+    def test_the_markup_is_cached_across_requests(self, monkeypatch):
+        from pydantic_ai_backends.remote import server as server_mod
+
+        server_mod._ui_html.cache_clear()
+        reads: list[int] = []
+        real_read_text = Path.read_text
+
+        def counting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self.name == "index.html":
+                reads.append(1)
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", counting_read_text)
+
+        harness = Harness(ui_enabled=True)
+        with harness.client() as client:
+            assert client.get("/ui").status_code == 200
+            assert client.get("/ui").status_code == 200
+            assert client.get("/ui").status_code == 200
+
+        assert reads == [1]

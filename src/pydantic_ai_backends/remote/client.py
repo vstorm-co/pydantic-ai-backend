@@ -11,7 +11,9 @@ import base64
 import contextlib
 import threading
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
+
+from pydantic import BaseModel
 
 from pydantic_ai_backends._optional import load
 from pydantic_ai_backends.backends.base import BaseSandbox
@@ -34,6 +36,25 @@ gives up before the command it is waiting for."""
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 """Request timeout for operations that carry no timeout of their own."""
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+
+def _parse(response: Any, model: type[_ModelT]) -> _ModelT | None:
+    """Validate a response body, or `None` when there is not a usable one.
+
+    Covers both halves of the same outcome. :meth:`RemoteSandbox._post` already
+    returns `None` for a transport error or an error status, and a `200` carrying
+    something that is not this model — an HTML page from a proxy in front of the
+    service, most often — is no more usable than no answer at all. Either way the
+    operation failed, and a failed operation is returned here, never raised.
+    """
+    if response is None:
+        return None
+    try:
+        return model.model_validate(response.json())
+    except Exception:
+        return None
 
 
 class RemoteSandbox(BaseSandbox):
@@ -102,9 +123,12 @@ class RemoteSandbox(BaseSandbox):
         super().__init__(session_id or f"remote-{uuid.uuid4().hex[:12]}")
         self._service_token = token
         self._session_token = token
-        self._runtime = runtime
-        self._tenant = tenant
-        self._reuse = reuse
+        # Built here rather than in `start()` so an id or tenant the service
+        # would reject fails at construction, where the caller is looking, and
+        # not out of whichever tool call happens to open the session.
+        self._create_request = wire.CreateSessionRequest(
+            session_id=self._id, runtime=runtime, tenant=tenant, reuse=reuse
+        )
         self._timeout = timeout
         self._started = False
         # Operations run on a thread pool, so two of them can arrive at an
@@ -113,16 +137,21 @@ class RemoteSandbox(BaseSandbox):
         self._open_lock = threading.Lock()
         self.touch()
 
+        self._service_url = service_url.rstrip("/")
         if client is not None:
             self._http = client
             self._owns_client = False
         else:
-            httpx_module = load("httpx", purpose="RemoteSandbox")
-            self._http = httpx_module.Client(
-                base_url=service_url.rstrip("/"),
-                timeout=httpx_module.Timeout(timeout),
-            )
+            self._http = self._new_client()
             self._owns_client = True
+
+    def _new_client(self) -> Any:
+        """Build the HTTP client this sandbox owns."""
+        httpx_module = load("httpx", purpose="RemoteSandbox")
+        return httpx_module.Client(
+            base_url=self._service_url,
+            timeout=httpx_module.Timeout(self._timeout),
+        )
 
     @property
     def session_id(self) -> str:
@@ -183,6 +212,9 @@ class RemoteSandbox(BaseSandbox):
         attaches to it rather than failing — which is what makes a sandbox
         outlive the run that created it.
 
+        Usable again after :meth:`stop`, which opens a fresh session — the same
+        way `DockerSandbox` starts a new container after being stopped.
+
         Raises:
             RuntimeError: If the service refuses to open a session. Unlike the
                 file operations this does raise, because a caller that cannot
@@ -191,16 +223,17 @@ class RemoteSandbox(BaseSandbox):
         if self._started:
             return
 
-        body = wire.CreateSessionRequest(
-            session_id=self._id,
-            runtime=self._runtime,
-            tenant=self._tenant,
-            reuse=self._reuse,
-        )
+        if self._owns_client and self._http.is_closed:
+            # `stop()` closed the client it owned. Rebuilt rather than left
+            # broken, so a stopped sandbox behaves like `DockerSandbox` — usable
+            # again — instead of silently reporting the service as unreachable
+            # for the rest of its life.
+            self._http = self._new_client()
+
         try:
             response = self._http.post(
                 "/sessions",
-                json=body.model_dump(mode="json"),
+                json=self._create_request.model_dump(mode="json"),
                 headers={wire.TOKEN_HEADER: self._service_token},
                 timeout=self._timeout,
             )
@@ -213,7 +246,12 @@ class RemoteSandbox(BaseSandbox):
                 f"(HTTP {response.status_code}): {response.text}"
             )
 
-        created = wire.SessionCreated.model_validate(response.json())
+        created = _parse(response, wire.SessionCreated)
+        if created is None:
+            raise RuntimeError(
+                "Sandbox service answered the open with something that is not a "
+                "session. Is the URL pointing at sandboxd rather than a proxy?"
+            )
         self._id = created.session.session_id
         self._session_token = created.token
         self._started = True
@@ -228,9 +266,8 @@ class RemoteSandbox(BaseSandbox):
             )
         except Exception:
             return False
-        if response.status_code >= 400:
-            return False
-        return wire.SessionInfo.model_validate(response.json()).alive
+        info = _parse(response if response.status_code < 400 else None, wire.SessionInfo)
+        return info is not None and info.alive
 
     def resource_usage(self) -> SandboxUsage | None:
         """Sample the remote sandbox's resource usage."""
@@ -243,9 +280,8 @@ class RemoteSandbox(BaseSandbox):
             )
         except Exception:
             return None
-        if response.status_code >= 400:
-            return None
-        usage = wire.SessionInfo.model_validate(response.json()).usage
+        info = _parse(response if response.status_code < 400 else None, wire.SessionInfo)
+        usage = info.usage if info is not None else None
         if usage is None:
             return None
         return SandboxUsage(
@@ -287,9 +323,9 @@ class RemoteSandbox(BaseSandbox):
             timeout + TRANSPORT_SLACK_SECONDS if timeout is not None else self._timeout
         )
         response = self._post(self._url("exec"), body.model_dump(mode="json"), transport_timeout)
-        if response is None:
+        parsed = _parse(response, wire.ExecResponse)
+        if parsed is None:
             return ExecuteResponse(output="Error: sandbox service unavailable", exit_code=1)
-        parsed = wire.ExecResponse.model_validate(response.json())
         return ExecuteResponse(
             output=parsed.output,
             exit_code=parsed.exit_code,
@@ -300,19 +336,20 @@ class RemoteSandbox(BaseSandbox):
         """Read a slice of a text file."""
         body = wire.ReadRequest(path=path, offset=offset, limit=limit)
         response = self._post(self._url("read"), body.model_dump(mode="json"))
-        if response is None:
+        parsed = _parse(response, wire.ReadResponse)
+        if parsed is None:
             return f"Error: could not read '{path}'"
-        return wire.ReadResponse.model_validate(response.json()).content
+        return parsed.content
 
     def read_bytes(self, path: str) -> bytes:
         """Read a whole file as bytes, or `b""` when unreadable."""
         body = wire.ReadBytesRequest(path=path)
         response = self._post(self._url("read_bytes"), body.model_dump(mode="json"))
-        if response is None:
+        parsed = _parse(response, wire.ReadBytesResponse)
+        if parsed is None:
             return b""
-        encoded = wire.ReadBytesResponse.model_validate(response.json()).content_b64
         try:
-            return base64.b64decode(encoded, validate=True)
+            return base64.b64decode(parsed.content_b64, validate=True)
         except Exception:
             return b""
 
@@ -321,9 +358,9 @@ class RemoteSandbox(BaseSandbox):
         raw = content if isinstance(content, bytes) else content.encode("utf-8")
         body = wire.WriteRequest(path=path, content_b64=base64.b64encode(raw).decode("ascii"))
         response = self._post(self._url("write"), body.model_dump(mode="json"))
-        if response is None:
+        parsed = _parse(response, wire.WriteResponse)
+        if parsed is None:
             return WriteResult(error=f"Error: could not write '{path}'")
-        parsed = wire.WriteResponse.model_validate(response.json())
         return WriteResult(path=parsed.path, error=parsed.error)
 
     def edit(
@@ -337,18 +374,17 @@ class RemoteSandbox(BaseSandbox):
             replace_all=replace_all,
         )
         response = self._post(self._url("edit"), body.model_dump(mode="json"))
-        if response is None:
+        parsed = _parse(response, wire.EditResponse)
+        if parsed is None:
             return EditResult(error=f"Error: could not edit '{path}'")
-        parsed = wire.EditResponse.model_validate(response.json())
         return EditResult(path=parsed.path, error=parsed.error, occurrences=parsed.occurrences)
 
     def exists(self, path: str) -> bool:
         """Whether the path is a regular file."""
         body = wire.ExistsRequest(path=path)
         response = self._post(self._url("exists"), body.model_dump(mode="json"))
-        if response is None:
-            return False
-        return wire.ExistsResponse.model_validate(response.json()).exists
+        parsed = _parse(response, wire.ExistsResponse)
+        return parsed is not None and parsed.exists
 
     def ls_info(self, path: str) -> list[FileInfo]:
         """List one directory, or `[]` when it cannot be listed."""
@@ -372,9 +408,9 @@ class RemoteSandbox(BaseSandbox):
         """Search file contents, returning matches or an error string."""
         body = wire.GrepRequest(pattern=pattern, path=path, glob=glob, ignore_hidden=ignore_hidden)
         response = self._post(self._url("grep"), body.model_dump(mode="json"))
-        if response is None:
+        parsed = _parse(response, wire.GrepResponse)
+        if parsed is None:
             return f"Error: could not search for {pattern!r}"
-        parsed = wire.GrepResponse.model_validate(response.json())
         if parsed.error is not None:
             return parsed.error
         return [
@@ -386,7 +422,10 @@ def _to_file_infos(response: Any) -> list[FileInfo]:
     """Parse a listing response into `FileInfo` rows, tolerating failure."""
     if response is None:
         return []
-    entries = [wire.FileEntry.model_validate(row) for row in response.json()]
+    try:
+        entries = [wire.FileEntry.model_validate(row) for row in response.json()]
+    except Exception:
+        return []
     return [FileInfo(name=e.name, path=e.path, is_dir=e.is_dir, size=e.size) for e in entries]
 
 

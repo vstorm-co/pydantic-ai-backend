@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -786,3 +788,126 @@ class TestLegacyActivityTracking:
 
         assert await manager.get_or_create("user-1") is sandbox
         assert not hasattr(sandbox, "_last_activity")
+
+
+class TestLifecycleCallsAreOffloaded:
+    """Starting a container pulls an image; on the loop that stalls everyone."""
+
+    class Blocking:
+        """Records which thread its blocking calls ran on."""
+
+        def __init__(self, session_id: str) -> None:
+            self._id = session_id
+            self.last_activity = time.time()
+            self.start_thread: str | None = None
+            self.stop_thread: str | None = None
+
+        def start(self) -> None:
+            self.start_thread = threading.current_thread().name
+
+        def stop(self) -> None:
+            self.stop_thread = threading.current_thread().name
+
+        def is_alive(self) -> bool:
+            return True
+
+    async def test_start_and_stop_run_on_the_supplied_pool(self):
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="sandboxd") as pool:
+            manager = SessionManager(
+                sandbox_factory=self.Blocking, executor=pool, on_release=lambda _: None
+            )
+            sandbox = await manager.get_or_create("user-1")
+            await manager.release("user-1")
+
+        assert sandbox.start_thread is not None
+        assert sandbox.start_thread.startswith("sandboxd")
+        assert sandbox.stop_thread is not None
+        assert sandbox.stop_thread.startswith("sandboxd")
+
+    async def test_without_a_pool_the_default_one_is_used(self):
+        """Still off the loop — just sharing asyncio's pool with everything else."""
+        manager = SessionManager(sandbox_factory=self.Blocking)
+        sandbox = await manager.get_or_create("user-1")
+
+        assert sandbox.start_thread != threading.current_thread().name
+
+    async def test_a_pool_assigned_after_construction_is_honoured(self):
+        """A service builds its pool in lifespan startup, after its manager."""
+        manager = SessionManager(sandbox_factory=self.Blocking)
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="late") as pool:
+            manager.executor = pool
+            sandbox = await manager.get_or_create("user-1")
+
+        assert sandbox.start_thread is not None
+        assert sandbox.start_thread.startswith("late")
+
+    async def test_a_failed_start_is_stopped_off_the_loop_too(self):
+        class Broken(TestLifecycleCallsAreOffloaded.Blocking):
+            def start(self) -> None:
+                super().start()
+                raise RuntimeError("no daemon")
+
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="sandboxd") as pool:
+            manager = SessionManager(sandbox_factory=Broken, executor=pool)
+            with pytest.raises(RuntimeError, match="no daemon"):
+                await manager.get_or_create("user-1")
+
+        assert manager.session_count == 0
+
+
+class TestShutdownStopsSessionsConcurrently:
+    """A full pool must not turn a shutdown into minutes of waiting."""
+
+    class Slow:
+        def __init__(self, session_id: str) -> None:
+            self._id = session_id
+            self.last_activity = time.time()
+            self.stopped = False
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            time.sleep(0.05)
+            self.stopped = True
+
+        def is_alive(self) -> bool:
+            return True
+
+    async def test_stops_happen_in_parallel(self):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            manager = SessionManager(sandbox_factory=self.Slow, executor=pool)
+            for index in range(6):
+                await manager.get_or_create(f"s-{index}")
+
+            started = time.monotonic()
+            assert await manager.shutdown() == 6
+            elapsed = time.monotonic() - started
+
+        # Six 50 ms stops: concurrent lands well inside the 300 ms a sequential
+        # teardown would need.
+        assert elapsed < 0.2
+        assert manager.session_count == 0
+
+    async def test_one_uncooperative_sandbox_does_not_strand_the_others(self, caplog):
+        """A shutdown has no later attempt, so it cannot stop at the first failure."""
+
+        class Stubborn(TestShutdownStopsSessionsConcurrently.Slow):
+            def stop(self) -> None:
+                raise RuntimeError("wedged")
+
+        def factory(session_id: str):
+            return Stubborn(session_id) if session_id == "bad" else Slow_(session_id)
+
+        Slow_ = TestShutdownStopsSessionsConcurrently.Slow
+        manager = SessionManager(sandbox_factory=factory)
+        good = await manager.get_or_create("good")
+        await manager.get_or_create("bad")
+
+        with caplog.at_level(logging.WARNING):
+            assert await manager.shutdown() == 2
+
+        assert good.stopped is True
+        assert manager.session_count == 0
+        assert "did not stop cleanly" in caplog.text
+        assert "bad" in caplog.text

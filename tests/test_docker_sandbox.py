@@ -963,3 +963,404 @@ class TestDockerFileTransfer:
         from pydantic_ai_backends.backends.docker.sandbox import _extract_single_file
 
         assert _extract_single_file(io.BytesIO(b"not a tar")) == b""
+
+
+# ---------------------------------------------------------------------------
+# A fake daemon, so the file/command paths are exercised without real Docker.
+# Previously these were reachable only through `@pytest.mark.docker` tests,
+# which CI deselects — the class carried `# pragma: no cover` and the most
+# security-sensitive code in the package went unmeasured.
+# ---------------------------------------------------------------------------
+
+
+class _StubContainer:
+    """Container backed by an in-memory filesystem."""
+
+    def __init__(self, status: str = "running", files: dict[str, bytes] | None = None):
+        self.status = status
+        self.files: dict[str, bytes] = dict(files or {})
+        self.name = "stub"
+        self.attrs: dict = {"State": {"Running": status == "running"}}
+        self.started = 0
+        self.stopped = 0
+        self.removed = False
+        self.commands: list[list[str]] = []
+        self.exec_result: tuple[int, object] | None = None
+        self.exec_error: Exception | None = None
+        self.put_archive_ok = True
+        self.puts: list[tuple[str, bytes]] = []
+
+    # lifecycle
+    def start(self) -> None:
+        self.started += 1
+        self.status = "running"
+
+    def stop(self) -> None:
+        self.stopped += 1
+
+    def remove(self, force: bool = False) -> None:
+        self.removed = True
+
+    def reload(self) -> None:
+        pass
+
+    # commands
+    def exec_run(self, argv: list[str], workdir: str | None = None):
+        self.commands.append(argv)
+        if self.exec_error is not None:
+            raise self.exec_error
+        if self.exec_result is not None:
+            return self.exec_result
+        return 0, b""
+
+    # files
+    def get_archive(self, path: str):
+        if path not in self.files:
+            raise KeyError(path)
+        payload = self.files[path]
+        name = path.rsplit("/", 1)[-1]
+        blob = _tar_bytes(name, payload)
+
+        def stream():
+            # docker-py streams the archive from a generator, which is what
+            # makes closing it early on an oversized file possible at all.
+            yield blob
+
+        return stream(), {"size": len(payload)}
+
+    def put_archive(self, parent: str, archive: io.BytesIO) -> bool:
+        # The real SDK is handed a file object, not bytes.
+        blob = archive.getvalue()
+        self.puts.append((parent, blob))
+        if not self.put_archive_ok:
+            return False
+        with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+            for member in tar.getmembers():
+                handle = tar.extractfile(member)
+                assert handle is not None
+                self.files[f"{parent.rstrip('/')}/{member.name}"] = handle.read()
+        return True
+
+
+class _StubContainers:
+    def __init__(self, existing: dict[str, _StubContainer] | None = None):
+        self._existing = existing or {}
+        self.runs: list[tuple[str, dict]] = []
+        self.created = _StubContainer()
+
+    def get(self, name: str):
+        import docker.errors
+
+        if name not in self._existing:
+            raise docker.errors.NotFound(name)
+        return self._existing[name]
+
+    def run(self, image: str, **kwargs):
+        self.runs.append((image, kwargs))
+        return self.created
+
+
+class _StubClient:
+    def __init__(self, existing: dict[str, _StubContainer] | None = None):
+        self.containers = _StubContainers(existing)
+
+
+@pytest.fixture
+def stub_docker(monkeypatch):
+    """Patch the daemon and the image resolver out of the sandbox module."""
+    from pydantic_ai_backends.backends.docker import sandbox as sandbox_mod
+
+    client = _StubClient()
+    monkeypatch.setattr(sandbox_mod, "docker_client", lambda: client)
+    monkeypatch.setattr(sandbox_mod, "resolve_image", lambda *args: "resolved:image")
+    return client
+
+
+class TestContainerCreation:
+    """`_ensure_container` is what every operation goes through first."""
+
+    def test_a_container_is_created_once_and_reused(self, stub_docker):
+        sandbox = _sandbox(image="python:3.12-slim")
+
+        sandbox.start()
+        sandbox.start()
+
+        assert len(stub_docker.containers.runs) == 1
+        assert stub_docker.containers.runs[0][0] == "resolved:image"
+
+    def test_run_kwargs_carry_the_name_and_network(self, stub_docker):
+        sandbox = _sandbox(container_name="pinned", network_mode="none")
+
+        sandbox.start()
+
+        _, kwargs = stub_docker.containers.runs[0]
+        assert kwargs["name"] == "pinned"
+        assert kwargs["network_mode"] == "none"
+        # A named container exists to be reused, so it must not self-destruct.
+        assert kwargs["auto_remove"] is False
+
+    def test_a_runtime_named_as_a_string_is_looked_up(self, stub_docker):
+        sandbox = _sandbox(runtime="python-datascience")
+
+        assert sandbox._runtime is not None
+        assert sandbox._runtime.name == "python-datascience"
+        assert sandbox._work_dir == sandbox._runtime.work_dir
+
+    def test_idle_timeout_is_exposed(self):
+        assert _sandbox(idle_timeout=42).idle_timeout == 42
+
+
+class TestReattach:
+    """A named container is restarted rather than replaced."""
+
+    def test_a_running_container_is_adopted(self, monkeypatch):
+        from pydantic_ai_backends.backends.docker import sandbox as sandbox_mod
+
+        existing = _StubContainer(status="running")
+        client = _StubClient({"pinned": existing})
+        monkeypatch.setattr(sandbox_mod, "docker_client", lambda: client)
+
+        sandbox = _sandbox(container_name="pinned")
+        sandbox.start()
+
+        assert sandbox._container is existing
+        assert client.containers.runs == []
+        assert existing.started == 0
+
+    @pytest.mark.parametrize("status", ["created", "exited", "paused"])
+    def test_a_stopped_container_is_started_not_recreated(self, monkeypatch, status):
+        """Recreating it would discard everything the session installed."""
+        from pydantic_ai_backends.backends.docker import sandbox as sandbox_mod
+
+        existing = _StubContainer(status=status)
+        client = _StubClient({"pinned": existing})
+        monkeypatch.setattr(sandbox_mod, "docker_client", lambda: client)
+
+        sandbox = _sandbox(container_name="pinned")
+        sandbox.start()
+
+        assert sandbox._container is existing
+        assert existing.started == 1
+        assert client.containers.runs == []
+
+    def test_a_dead_container_is_replaced(self, monkeypatch):
+        from pydantic_ai_backends.backends.docker import sandbox as sandbox_mod
+
+        client = _StubClient({"pinned": _StubContainer(status="dead")})
+        monkeypatch.setattr(sandbox_mod, "docker_client", lambda: client)
+        monkeypatch.setattr(sandbox_mod, "resolve_image", lambda *args: "img")
+
+        sandbox = _sandbox(container_name="pinned")
+        sandbox.start()
+
+        assert len(client.containers.runs) == 1
+
+    def test_an_absent_container_is_created(self, stub_docker):
+        sandbox = _sandbox(container_name="missing")
+
+        sandbox.start()
+
+        assert len(stub_docker.containers.runs) == 1
+
+    def test_an_unnamed_sandbox_never_reattaches(self, stub_docker):
+        sandbox = _sandbox()
+
+        assert sandbox._reattach(stub_docker) is None
+
+
+class TestExecuteAgainstAStub:
+    """The command path, including how a failing exec is reported."""
+
+    def test_output_and_exit_code_are_returned(self, stub_docker):
+        sandbox = _sandbox()
+        sandbox.start()
+        sandbox._container.exec_result = (0, b"hello\n")
+
+        result = sandbox.execute("echo hello")
+
+        assert result.output == "hello\n"
+        assert result.exit_code == 0
+        assert sandbox._container.commands[-1] == ["sh", "-c", "echo hello"]
+
+    def test_a_timeout_wraps_the_command(self, stub_docker):
+        sandbox = _sandbox()
+        sandbox.start()
+
+        sandbox.execute("sleep 99", timeout=5)
+
+        assert sandbox._container.commands[-1][:3] == ["timeout", "5", "sh"]
+
+    def test_a_chunked_output_stream_is_joined(self, stub_docker):
+        """The SDK returns an iterator when the exec is not demuxed."""
+        sandbox = _sandbox()
+        sandbox.start()
+        sandbox._container.exec_result = (0, iter([b"one ", b"two"]))
+
+        assert sandbox.execute("x").output == "one two"
+
+    def test_a_daemon_failure_is_reported_not_raised(self, stub_docker):
+        sandbox = _sandbox()
+        sandbox.start()
+        sandbox._container.exec_error = RuntimeError("daemon gone")
+
+        result = sandbox.execute("x")
+
+        assert result.exit_code == 1
+        assert "daemon gone" in result.output
+
+
+class TestReadWriteEditAgainstAStub:
+    """The file operations, which never touched the fake daemon before."""
+
+    def test_write_then_read_round_trips(self, stub_docker):
+        sandbox = _sandbox()
+
+        written = sandbox.write("notes.md", "line one\nline two\n")
+
+        assert written.error is None
+        assert written.path == "/workspace/notes.md"
+        assert sandbox.read("notes.md") == "line one\nline two"
+
+    def test_write_creates_the_parent_directory(self, stub_docker):
+        sandbox = _sandbox()
+
+        sandbox.write("deep/nested/file.txt", "x")
+
+        assert any("mkdir -p" in " ".join(argv) for argv in sandbox._container.commands)
+
+    def test_a_failed_mkdir_is_reported(self, stub_docker):
+        sandbox = _sandbox()
+        sandbox.start()
+        sandbox._container.exec_result = (1, b"permission denied")
+
+        result = sandbox.write("x.txt", "y")
+
+        assert result.error is not None
+        assert "Failed to create directory" in result.error
+
+    def test_a_refused_upload_is_reported(self, stub_docker):
+        sandbox = _sandbox()
+        sandbox.start()
+        sandbox._container.put_archive_ok = False
+
+        result = sandbox.write("x.txt", "y")
+
+        assert result.error is not None
+        assert "put_archive" in result.error
+
+    def test_bytes_content_is_written_verbatim(self, stub_docker):
+        sandbox = _sandbox()
+
+        sandbox.write("blob.bin", b"\x00\x01\x02")
+
+        assert sandbox._container.files["/workspace/blob.bin"] == b"\x00\x01\x02"
+
+    def test_reading_a_missing_file_says_so(self, stub_docker):
+        sandbox = _sandbox()
+
+        assert "not found" in sandbox.read("nope.txt")
+
+    def test_reading_past_the_end_says_so(self, stub_docker):
+        sandbox = _sandbox()
+        sandbox.write("short.txt", "one\n")
+
+        assert sandbox.read("short.txt", offset=50) == "[End of file]"
+
+    def test_a_truncated_read_advertises_the_next_offset(self, stub_docker):
+        sandbox = _sandbox()
+        sandbox.write("many.txt", "\n".join(str(n) for n in range(10)))
+
+        out = sandbox.read("many.txt", offset=0, limit=4)
+
+        assert out.startswith("0\n1\n2\n3")
+        assert "offset=4" in out
+
+    def test_undecodable_content_is_reported(self, stub_docker, monkeypatch):
+        from pydantic_ai_backends.backends.docker import sandbox as sandbox_mod
+
+        sandbox = _sandbox()
+        sandbox.write("weird.bin", b"\xff\xfe")
+
+        def refuse(extension: str, data: bytes) -> str:
+            raise ValueError("no readable text")
+
+        monkeypatch.setattr(sandbox_mod, "bytes_to_text", refuse)
+
+        assert "no readable text" in sandbox.read("weird.bin")
+        assert "no readable text" in str(sandbox.edit("weird.bin", "a", "b").error)
+
+    def test_edit_replaces_and_writes_back(self, stub_docker):
+        sandbox = _sandbox()
+        sandbox.write("code.py", "print('a')\n")
+
+        result = sandbox.edit("code.py", "'a'", "'b'")
+
+        assert result.error is None
+        assert result.occurrences == 1
+        assert sandbox.read("code.py") == "print('b')"
+
+    def test_edit_of_a_missing_file_says_so(self, stub_docker):
+        sandbox = _sandbox()
+
+        assert "not found" in str(sandbox.edit("nope.txt", "a", "b").error)
+
+    def test_edit_reports_a_string_that_is_not_there(self, stub_docker):
+        sandbox = _sandbox()
+        sandbox.write("code.py", "print('a')\n")
+
+        assert sandbox.edit("code.py", "absent", "x").error is not None
+
+    def test_edit_reports_a_failed_write_back(self, stub_docker):
+        sandbox = _sandbox()
+        sandbox.write("code.py", "print('a')\n")
+        sandbox._container.put_archive_ok = False
+
+        assert "put_archive" in str(sandbox.edit("code.py", "'a'", "'b'").error)
+
+    def test_an_oversized_file_is_refused_by_read_and_edit(self, stub_docker):
+        sandbox = _sandbox(max_read_bytes=8)
+        sandbox.start()
+        sandbox._container.files["/workspace/big.txt"] = b"x" * 64
+
+        assert "read limit" in sandbox.read("big.txt")
+        assert "read limit" in str(sandbox.edit("big.txt", "x", "y").error)
+
+    def test_an_unexpected_failure_is_wrapped(self, stub_docker, monkeypatch):
+        sandbox = _sandbox()
+        sandbox.start()
+
+        def explode(path: str) -> bytes:
+            raise RuntimeError("socket reset")
+
+        monkeypatch.setattr(sandbox, "_fetch_file_bytes", explode)
+
+        assert "socket reset" in sandbox.read("x.txt")
+        assert "socket reset" in str(sandbox.edit("x.txt", "a", "b").error)
+
+    def test_a_write_failure_is_wrapped(self, stub_docker, monkeypatch):
+        sandbox = _sandbox()
+        sandbox.start()
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(sandbox._container, "put_archive", explode)
+
+        assert "disk full" in str(sandbox.write("x.txt", "y").error)
+
+    def test_a_stream_that_fails_mid_transfer_reads_as_absent(self, stub_docker):
+        """A socket dropping halfway is a missing file, not an exception."""
+        sandbox = _sandbox()
+        sandbox.start()
+
+        def broken_get_archive(path: str):
+            def stream():
+                yield b"partial"
+                raise OSError("connection reset")
+
+            return stream(), None
+
+        sandbox._container.get_archive = broken_get_archive
+
+        assert "not found" in sandbox.read("x.txt")
+        assert sandbox.read_bytes("x.txt") == b""

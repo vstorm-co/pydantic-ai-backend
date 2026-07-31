@@ -8,7 +8,7 @@ import shlex
 import tarfile
 import time
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic_ai_backends._editing import Replacement, replace_in_content
 from pydantic_ai_backends._limits import (
@@ -30,6 +30,8 @@ from pydantic_ai_backends.types import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     from docker import DockerClient
     from docker.models.containers import Container
 
@@ -61,7 +63,7 @@ class ReadLimitExceeded(Exception):
     """
 
 
-class DockerSandbox(BaseSandbox):  # pragma: no cover
+class DockerSandbox(BaseSandbox):
     """Docker-based sandbox for isolated command execution.
 
     The container starts lazily on the first operation. File transfers use
@@ -505,9 +507,14 @@ class DockerSandbox(BaseSandbox):  # pragma: no cover
         assert self._container is not None
 
         try:
-            stream, stat = self._container.get_archive(path)
+            raw_stream, stat = self._container.get_archive(path)
         except Exception:
             return b""
+
+        # docker-py streams the archive from a generator, so it can be closed to
+        # release the socket as soon as the file turns out to be too large. The
+        # stub only promises an Iterator, which has no `close`.
+        stream = cast("Generator[bytes, None, None]", raw_stream)
 
         # get_archive reports the size in a response header, so an oversized
         # file is refused before any of its content crosses the socket.

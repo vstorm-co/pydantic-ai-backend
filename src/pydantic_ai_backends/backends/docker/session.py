@@ -33,6 +33,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from concurrent.futures import Executor
+
     from pydantic_ai_backends.types import RuntimeConfig
 
 _logger = logging.getLogger(__name__)
@@ -86,6 +88,7 @@ class SessionManager:
         workspace_root: str | Path | None = None,
         max_sessions: int | None = None,
         on_release: Callable[[str], None] | None = None,
+        executor: Executor | None = None,
     ):
         """Initialize the manager.
 
@@ -110,6 +113,11 @@ class SessionManager:
                 notice that a reaping happened — polling `sessions` would mean
                 discovering it late, or never. It runs inside a cleanup pass, so
                 anything it raises aborts the rest of that pass.
+            executor: Thread pool the blocking `start()` and `stop()` calls run
+                on. `None` uses asyncio's default pool, which is shared with
+                every other `to_thread` caller in the process — a service
+                handing out sandboxes wants its own. Assignable afterwards, for
+                a caller whose pool outlives fewer things than its manager does.
         """
         self._sessions: dict[str, Any] = {}
         self._sandbox_factory = sandbox_factory
@@ -119,6 +127,7 @@ class SessionManager:
         self._workspace_root = Path(workspace_root) if workspace_root else None
         self._max_sessions = max_sessions
         self._on_release = on_release
+        self.executor = executor
         # Per-session locks serialize concurrent get_or_create calls for the
         # same id, so two awaits cannot each create and start a sandbox — one of
         # which would be overwritten in the dict and leaked.
@@ -167,16 +176,30 @@ class SessionManager:
                 sandbox = self._create_docker_sandbox(session_id, runtime)
 
             try:
-                sandbox.start()
+                await self._offload(sandbox.start)
             except Exception:
                 # An unregistered sandbox is one nothing else will ever stop, so
                 # a partial start would leak whatever it did manage to create.
                 with contextlib.suppress(Exception):
-                    sandbox.stop()
+                    await self._offload(sandbox.stop)
                 raise
 
             self._sessions[session_id] = sandbox
             return sandbox
+
+    async def _offload(self, call: Callable[[], Any]) -> None:
+        """Run a blocking sandbox lifecycle call off the event loop.
+
+        Starting a sandbox pulls or builds an image and stopping one waits for
+        the process inside to die — both are seconds, not milliseconds. Run on
+        the loop they stall every other session's work for the duration, which
+        for a service handing sandboxes to several tenants is the difference
+        between concurrent and merely asynchronous.
+        """
+        if self.executor is None:
+            await asyncio.to_thread(call)
+            return
+        await asyncio.get_running_loop().run_in_executor(self.executor, call)
 
     def _create_docker_sandbox(
         self,
@@ -206,7 +229,7 @@ class SessionManager:
 
         sandbox = self._sessions.pop(session_id)
         self._locks.pop(session_id, None)
-        sandbox.stop()
+        await self._offload(sandbox.stop)
         if self._on_release is not None:
             self._on_release(session_id)
         return True
@@ -302,14 +325,28 @@ class SessionManager:
     async def shutdown(self) -> int:
         """Stop every session and the cleanup loop.
 
+        Sessions are stopped concurrently, because stopping one is seconds of
+        waiting for the process inside to die and they do not wait on each
+        other: sequentially, a full pool turned a shutdown into minutes, and
+        an orchestrator that loses patience kills the process mid-teardown.
+
         Returns:
             Number of sessions that were stopped.
         """
         self.stop_cleanup_loop()
 
         session_ids = list(self._sessions)
-        for session_id in session_ids:
-            await self.release(session_id)
+        # `return_exceptions`, so one uncooperative sandbox cannot leave the
+        # rest of the pool running — a shutdown has no later attempt.
+        outcomes = await asyncio.gather(
+            *(self.release(session_id) for session_id in session_ids),
+            return_exceptions=True,
+        )
+        for session_id, outcome in zip(session_ids, outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                _logger.warning(
+                    "Session %s did not stop cleanly during shutdown: %s", session_id, outcome
+                )
         return len(session_ids)
 
     def __contains__(self, session_id: str) -> bool:

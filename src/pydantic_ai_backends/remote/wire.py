@@ -45,8 +45,11 @@ class ReadRequest(BaseModel):
     """Read a slice of a text file."""
 
     path: str
-    offset: int = 0
-    limit: int = 2000
+    offset: int = Field(default=0, ge=0)
+    """First line to return. Bounded because a negative offset would silently
+    slice from the end of the file rather than being rejected."""
+
+    limit: int = Field(default=2000, ge=1)
 
 
 class ReadResponse(BaseModel):

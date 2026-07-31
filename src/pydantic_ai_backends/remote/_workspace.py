@@ -79,8 +79,10 @@ def resolve_within(root: Path, path: str) -> Path:
 def list_workspace(root: Path, path: str) -> list[FileInfo]:
     """List one directory of a workspace.
 
-    Entries whose resolved target escapes the workspace are omitted rather than
-    reported, so a symlink planted by the sandbox cannot enumerate the host.
+    An entry the sandbox left in a state we cannot describe is omitted rather
+    than reported — a symlink out of the workspace, or one pointing at nothing.
+    Either would otherwise turn one planted link into a failure for the whole
+    directory, and untrusted code inside the container can plant both.
 
     Args:
         root: The session's workspace directory.
@@ -94,21 +96,17 @@ def list_workspace(root: Path, path: str) -> list[FileInfo]:
     if not directory.is_dir():
         raise FileNotFoundError(f"No such directory: {path}")
 
+    resolved_root = root.resolve()
     entries: list[FileInfo] = []
     for entry in directory.iterdir():
         try:
-            target = resolve_within(root, str(entry.relative_to(root.resolve())))
-        except (WorkspacePathError, ValueError):
+            relative = str(entry.relative_to(resolved_root))
+            target = resolve_within(root, relative)
+            is_dir = target.is_dir()
+            size = None if is_dir else target.stat().st_size
+        except (WorkspacePathError, ValueError, OSError):
             continue
-        is_dir = target.is_dir()
-        entries.append(
-            FileInfo(
-                name=entry.name,
-                path=str(entry.relative_to(root.resolve())),
-                is_dir=is_dir,
-                size=None if is_dir else target.stat().st_size,
-            )
-        )
+        entries.append(FileInfo(name=entry.name, path=relative, is_dir=is_dir, size=size))
     return sorted(entries, key=lambda item: (not item["is_dir"], item["name"]))
 
 
