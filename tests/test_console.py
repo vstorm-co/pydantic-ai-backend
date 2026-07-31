@@ -4,6 +4,7 @@ import inspect
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 from pydantic_ai import BinaryContent, RunContext
 
 from pydantic_ai_backends import (
@@ -23,6 +24,7 @@ from pydantic_ai_backends.toolsets._content import (
     image_content,
 )
 from pydantic_ai_backends.toolsets.console import ConsoleDeps
+from pydantic_ai_backends.types import ExecuteResponse
 
 # Minimal valid-ish PDF payload (header + EOF marker).
 PDF_DATA = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\n%%EOF\n"
@@ -639,3 +641,89 @@ class TestGrepOutputTruncation:
 
         assert out.startswith("Matches for 'needle':")
         assert "... and 10 more matches" in out
+
+
+class TestExecuteToolFailureHandling:
+    """A backend's exception must fail one tool call, not the agent's run."""
+
+    async def _execute(self, backend, command: str = "echo hi") -> str:
+        toolset = create_console_toolset()
+        return await toolset._console_execute_impl(  # type: ignore[attr-defined]
+            _make_ctx(MockDeps(backend=backend)), command
+        )
+
+    class Exploding:
+        """A third-party backend whose transport dropped mid-command."""
+
+        def __init__(self, error: Exception) -> None:
+            self._error = error
+
+        async def read_bytes(self, path: str) -> bytes:  # marks it async
+            return b""
+
+        async def execute(self, command: str, timeout: int | None = None):
+            raise self._error
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OSError("connection reset by peer"),
+            TimeoutError("no reply"),
+            ValueError("nonsense from the transport"),
+            RuntimeError("the one that was already handled"),
+        ],
+    )
+    async def test_any_transport_error_becomes_a_tool_error(self, error: Exception):
+        """Only `RuntimeError` was caught, so the rest ended the run."""
+        out = await self._execute(self.Exploding(error))
+
+        assert out.startswith("Error: ")
+        assert str(error) in out
+
+    async def test_a_successful_command_is_unaffected(self):
+        class Fine:
+            async def read_bytes(self, path: str) -> bytes:
+                return b""
+
+            async def execute(self, command: str, timeout: int | None = None):
+                return ExecuteResponse(output="hi\n", exit_code=0)
+
+        assert await self._execute(Fine()) == "hi\n"
+
+    async def test_a_nonzero_exit_is_reported_with_its_output(self):
+        class Failing:
+            async def read_bytes(self, path: str) -> bytes:
+                return b""
+
+            async def execute(self, command: str, timeout: int | None = None):
+                return ExecuteResponse(output="not found", exit_code=127)
+
+        out = await self._execute(Failing())
+
+        assert "exit code 127" in out
+        assert "not found" in out
+
+    async def test_truncated_output_says_so(self):
+        class Truncating:
+            async def read_bytes(self, path: str) -> bytes:
+                return b""
+
+            async def execute(self, command: str, timeout: int | None = None):
+                return ExecuteResponse(output="lots", exit_code=0, truncated=True)
+
+        assert (await self._execute(Truncating())).endswith("(output truncated)")
+
+    async def test_a_backend_without_execute_says_so(self):
+        assert "does not support command execution" in await self._execute(StateBackend())
+
+    async def test_a_backend_with_execution_disabled_says_so(self):
+        class Disabled:
+            execute_enabled = False
+
+            async def read_bytes(self, path: str) -> bytes:
+                return b""
+
+            async def execute(self, command: str, timeout: int | None = None):
+                raise AssertionError("must not be reached")
+
+        assert "disabled" in await self._execute(Disabled())

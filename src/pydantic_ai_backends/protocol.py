@@ -1,4 +1,34 @@
-"""Protocol definitions for backends."""
+"""Protocol definitions for backends.
+
+Failure contract
+----------------
+Every method here **returns** its failures and never raises. A backend sits in an
+agent's tool path, so an exception escaping one does not fail an operation — it
+ends the run. What a failure looks like differs per method, and the difference is
+deliberate:
+
+| Method | On failure |
+|---|---|
+| `execute` | `ExecuteResponse(output="Error: ...", exit_code=1)` |
+| `read` | a string starting `Error: ` or `[Error` |
+| `read_bytes` | `b""` — **never** an error message |
+| `write`, `edit` | the result's `error` field set |
+| `exists` | `False` |
+| `ls_info`, `glob_info` | `[]` |
+| `grep_raw` | a string, as opposed to the `list[GrepMatch]` of a success |
+
+`read_bytes` is the one worth reading twice. It returns empty rather than
+describing the problem because its caller cannot tell an error message from real
+file content — a probe that staged a screenshot would happily treat
+`b"Error: not found"` as the image. `read` can afford a message because its
+result is text destined for a model either way.
+
+Implementations are not expected to be defensive by hand at every call site: both
+:class:`~pydantic_ai_backends.BaseSandbox` and
+:class:`~pydantic_ai_backends.AsyncBaseSandbox` already honour this for every
+operation they derive from `execute`, so a subclass only has to keep the promise
+in `execute` and `edit`.
+"""
 
 from __future__ import annotations
 
@@ -188,6 +218,14 @@ class AsyncBackendProtocol(Protocol):
     """Async protocol for file storage backends.
 
     Sync backends can be adapted with :func:`pydantic_ai_backends.ensure_async`.
+    A backend that is *natively* async should implement this directly rather than
+    be adapted — subclass :class:`~pydantic_ai_backends.AsyncBaseSandbox` and it
+    is recognised as async without any method-shape guessing. Wrapping async code
+    in a sync facade so `ensure_async` adapts it is the one arrangement to avoid:
+    see :func:`pydantic_ai_backends.ensure_async` for why it deadlocks.
+
+    The module's failure contract applies unchanged — a coroutine that raises
+    ends an agent's run just as a function that raises does.
     """
 
     async def exists(self, path: str) -> bool: ...

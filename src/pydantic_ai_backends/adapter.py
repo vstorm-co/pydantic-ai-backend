@@ -159,12 +159,55 @@ class AsyncBackgroundSandboxAdapter(AsyncSandboxAdapter):
         return await self._offload(self._sandbox.kill_all_background)
 
 
+def is_async_backend(backend: object) -> bool:
+    """Whether a backend is already asynchronous and must not be thread-wrapped.
+
+    Public because it is the contract a third-party backend is judged by, and
+    getting it wrong is expensive in a way that is hard to debug: a natively
+    async backend mistaken for a sync one gets wrapped in a thread adapter,
+    which calls its coroutine function in a worker thread and hands the caller
+    the resulting coroutine object where bytes were expected — no exception,
+    just nonsense.
+
+    Args:
+        backend: The backend to classify.
+
+    Returns:
+        Whether the backend implements the async protocol directly.
+    """
+    from pydantic_ai_backends.backends.base import AsyncBaseSandbox
+
+    if isinstance(backend, AsyncBaseSandbox):
+        return True
+    # Any of the names `read_bytes` is reachable under, since the adapter accepts
+    # the legacy one too: a backend async everywhere but spelling it the old way
+    # would otherwise be classified as sync and quietly thread-wrapped.
+    return any(
+        inspect.iscoroutinefunction(getattr(backend, name, None))
+        for name in ("read_bytes", LEGACY_READ_BYTES)
+    )
+
+
 def ensure_async(
     backend: BackendProtocol | AsyncBackendProtocol,
     *,
     executor: Executor | None = None,
 ) -> AsyncBackendProtocol:
     """Return an async backend, wrapping sync ones as needed.
+
+    An already-async backend is passed through untouched, which is the point: a
+    thread adapter around async code is not merely wasteful but a deadlock
+    waiting to happen, since each call then occupies a worker thread that has to
+    hop back onto the event loop. Two things mark a backend as already async, in
+    this order:
+
+    - **Subclassing :class:`~pydantic_ai_backends.AsyncBaseSandbox`.**
+      Unambiguous, and the recommended way to write one.
+    - **`read_bytes` being a coroutine function.** The fallback, for a backend
+      that implements the protocol without inheriting from anything. It has to
+      be a method-shape check rather than `isinstance` against
+      `AsyncBackendProtocol`, because a runtime-checkable `Protocol` compares
+      method *names* — and a sync backend has exactly the same ones.
 
     Args:
         backend: Sync or async backend.
@@ -179,10 +222,10 @@ def ensure_async(
     """
     if isinstance(backend, AsyncBackendAdapter):
         return backend
+    if is_async_backend(backend):
+        return cast("AsyncBackendProtocol", backend)
 
     candidate: Any = backend
-    if inspect.iscoroutinefunction(getattr(candidate, "read_bytes", None)):
-        return cast("AsyncBackendProtocol", backend)
     if hasattr(candidate, "execute_background"):
         return AsyncBackgroundSandboxAdapter(cast("SandboxProtocol", backend), executor=executor)
     if hasattr(candidate, "execute"):

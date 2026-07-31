@@ -1,18 +1,25 @@
-"""Abstract sandbox with shell-based defaults for every file operation.
+"""Abstract sandboxes with shell-based defaults for every file operation.
 
 A subclass only has to implement `execute` and `edit`. Everything else is
 derived from shell commands, which is enough for any sandbox that offers a
 shell; subclasses with a native file API override the methods it covers.
+
+Two variants, one implementation. :class:`BaseSandbox` is for a sandbox reached
+synchronously — a Docker socket, a subprocess. :class:`AsyncBaseSandbox` is for
+one that is natively asynchronous — asyncssh, an async HTTP SDK — and is the
+class to subclass there rather than writing a synchronous facade over async code:
+the facade has to hop back onto the event loop from a worker thread, and a
+sandbox that reprovisions itself can then deadlock against its own thread pool.
+Both derive their file operations from :mod:`._shell`, so neither can drift.
 """
 
 from __future__ import annotations
 
-import shlex
 import time
 import uuid
 from abc import ABC, abstractmethod
-from pathlib import PurePosixPath
 
+from pydantic_ai_backends.backends import _shell
 from pydantic_ai_backends.types import (
     EditResult,
     ExecuteResponse,
@@ -21,12 +28,12 @@ from pydantic_ai_backends.types import (
     WriteResult,
 )
 
-LS_FIELD_COUNT = 9
-"""Fields in a `ls -la` line before the name; fewer means it is not an entry."""
+LS_FIELD_COUNT = _shell.LS_FIELD_COUNT
+"""Re-exported from `_shell`, where the parsing that uses it lives."""
 
 
-class BaseSandbox(ABC):
-    """Base class for sandboxes that expose a shell.
+class _SandboxIdentity:
+    """The identity and idle bookkeeping both base sandboxes share.
 
     Args:
         sandbox_id: Unique identifier for this sandbox. Generated when omitted.
@@ -50,23 +57,29 @@ class BaseSandbox(ABC):
         """Record activity, so idle cleanup does not reap a sandbox in use."""
         self._last_activity = time.time()
 
-    def start(self) -> None:  # pragma: no cover  # noqa: B027
+
+class BaseSandbox(_SandboxIdentity, ABC):
+    """Base class for synchronous sandboxes that expose a shell.
+
+    Args:
+        sandbox_id: Unique identifier for this sandbox. Generated when omitted.
+    """
+
+    def start(self) -> None:
         """Start the sandbox eagerly.
 
         The default is a no-op, since sandboxes start on first use.
         """
 
-    def is_alive(self) -> bool:  # pragma: no cover
+    def is_alive(self) -> bool:
         """Whether the sandbox is running and responsive."""
         return False
 
-    def stop(self) -> None:  # pragma: no cover  # noqa: B027
+    def stop(self) -> None:
         """Stop and clean up the sandbox."""
 
     @abstractmethod
-    def execute(
-        self, command: str, timeout: int | None = None
-    ) -> ExecuteResponse:  # pragma: no cover
+    def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
         """Run a command in the sandbox.
 
         Args:
@@ -76,7 +89,7 @@ class BaseSandbox(ABC):
         ...
 
     @abstractmethod
-    def edit(  # pragma: no cover
+    def edit(
         self, path: str, old_string: str, new_string: str, replace_all: bool = False
     ) -> EditResult:
         """Edit a file by replacing a string.
@@ -89,111 +102,31 @@ class BaseSandbox(ABC):
         """
         ...
 
-    def exists(self, path: str) -> bool:  # pragma: no cover
+    def exists(self, path: str) -> bool:
         """Whether `path` is a regular file, via `test -f`."""
-        return self.execute(f"test -f {shlex.quote(path)}", timeout=5).exit_code == 0
+        return self.execute(_shell.exists_command(path), timeout=5).exit_code == 0
 
-    def ls_info(self, path: str) -> list[FileInfo]:  # pragma: no cover
+    def ls_info(self, path: str) -> list[FileInfo]:
         """List one directory using `ls -la`."""
-        quoted_path = shlex.quote(path)
-        result = self.execute(f"ls -la {quoted_path}")
-        if result.exit_code != 0:
-            return []
+        return _shell.parse_ls(self.execute(_shell.ls_command(path)), path)
 
-        entries: list[FileInfo] = []
-        for line in result.output.strip().split("\n")[1:]:  # The first line is the total.
-            parts = line.split()
-            if len(parts) < LS_FIELD_COUNT:
-                continue
+    def read_bytes(self, path: str) -> bytes:
+        """Read a whole file with `cat`, or `b""` on any failure."""
+        return _shell.parse_read_bytes(self.execute(_shell.read_bytes_command(path)))
 
-            name = " ".join(parts[8:])
-            if name in (".", ".."):
-                continue
+    def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
+        """Read a slice of a file, numbered by its real line positions."""
+        return _shell.parse_read(self.execute(_shell.read_command(path, offset, limit)))
 
-            entries.append(
-                FileInfo(
-                    name=name,
-                    path=f"{quoted_path.rstrip('/')}/{name}",
-                    is_dir=parts[0].startswith("d"),
-                    size=int(parts[4]) if parts[4].isdigit() else None,
-                )
-            )
+    def write(self, path: str, content: str) -> WriteResult:
+        """Write a file with `cat` and a quoted heredoc."""
+        return _shell.parse_write(self.execute(_shell.write_command(path, content)), path)
 
-        return sorted(entries, key=lambda x: (not x["is_dir"], x["name"]))
+    def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
+        """Match files with `find`."""
+        return _shell.parse_glob(self.execute(_shell.glob_command(pattern, path)))
 
-    def read_bytes(self, path: str) -> bytes:  # pragma: no cover
-        """Read a whole file with `cat`.
-
-        Returns:
-            The content, or `b""` on any failure — matching `LocalBackend` and
-            `StateBackend`. Encoding an error message into the payload would
-            leave the caller unable to tell it from real file content.
-        """
-        result = self.execute(f"cat {shlex.quote(path)}")
-        if result.exit_code != 0:
-            return b""
-        return result.output.encode("utf-8", errors="replace")
-
-    def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:  # pragma: no cover
-        """Read a slice of a file, numbered by its real line positions.
-
-        `awk` rather than `sed | cat -n`, because the latter renumbers the slice
-        from 1 and would be off by `offset`.
-        """
-        start = offset + 1
-        end = offset + limit
-        result = self.execute(
-            f"awk 'NR>={start} && NR<={end} {{ printf \"%6d\\t%s\\n\", NR, $0 }}' "
-            f"{shlex.quote(path)}"
-        )
-
-        if result.exit_code != 0:
-            return f"Error: {result.output}"
-        if result.truncated:
-            return result.output + "\n\n... (output truncated)"
-        return result.output
-
-    def write(self, path: str, content: str) -> WriteResult:  # pragma: no cover
-        """Write a file with `cat` and a quoted heredoc.
-
-        The delimiter is quoted (`<< 'DELIM'`) so the shell expands nothing
-        inside the body and the content lands verbatim. Pre-escaping
-        backslashes or `$` here would corrupt it instead.
-        """
-        # Random delimiter so it cannot collide with a line of the content.
-        delimiter = f"EOF_{uuid.uuid4().hex[:8]}"
-        quoted_path = shlex.quote(path)
-
-        result = self.execute(
-            f"mkdir -p $(dirname {quoted_path}) && cat > {quoted_path} << '{delimiter}'\n"
-            f"{content}\n"
-            f"{delimiter}"
-        )
-        if result.exit_code != 0:
-            return WriteResult(error=result.output)
-        return WriteResult(path=path)
-
-    def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:  # pragma: no cover
-        """Match files with `find`.
-
-        The pattern is matched as `-path '*/{pattern}'` so a basename glob like
-        `*.py` matches files anywhere under the root, since `find -path` tests
-        the whole pathname.
-        """
-        quoted_path = shlex.quote(path)
-        quoted_pattern = shlex.quote(f"*/{pattern}")
-        result = self.execute(f"find {quoted_path} -path {quoted_pattern} -type f 2>/dev/null")
-
-        if result.exit_code != 0:
-            return []
-
-        entries = [
-            FileInfo(name=file.name, path=str(file), is_dir=False, size=None)
-            for file in (PurePosixPath(line) for line in result.output.splitlines())
-        ]
-        return sorted(entries, key=lambda x: x["path"])
-
-    def grep_raw(  # pragma: no cover
+    def grep_raw(
         self,
         pattern: str,
         path: str | None = None,
@@ -201,29 +134,122 @@ class BaseSandbox(ABC):
         ignore_hidden: bool = True,
     ) -> list[GrepMatch] | str:
         """Search file contents with `grep`."""
-        options = ["-rn"]
-        if ignore_hidden:
-            options.extend(["--exclude='.*'", "--exclude-dir='.*'"])
-        if glob:
-            options.append(f"--include='{glob}'")
+        command = _shell.grep_command(pattern, path, glob, ignore_hidden)
+        return _shell.parse_grep(self.execute(command))
 
-        result = self.execute(f"grep {' '.join(options)} '{pattern}' {shlex.quote(path or '.')}")
 
-        if result.exit_code == 1:  # grep exits 1 when nothing matched.
-            return []
-        if result.exit_code != 0:
-            return f"Error: {result.output}"
+class AsyncBaseSandbox(_SandboxIdentity, ABC):
+    """Base class for natively asynchronous sandboxes that expose a shell.
 
-        matches: list[GrepMatch] = []
-        for line in result.output.strip().split("\n"):
-            # grep prints file:line:content.
-            parts = line.split(":", 2)
-            if len(parts) < 3:
-                continue
-            try:
-                line_number = int(parts[1])
-            except ValueError:
-                continue
-            matches.append(GrepMatch(path=parts[0], line_number=line_number, line=parts[2]))
+    Subclass this when the sandbox is reached over an async transport — asyncssh,
+    an async HTTP client, any async SDK. Implement `execute` and `edit` as
+    coroutines and every other operation is derived from shell commands, exactly
+    as the synchronous base does.
 
-        return matches
+    Subclassing this rather than wrapping async code in a synchronous facade is
+    not a style preference. `ensure_async` cannot see through a facade: it
+    wraps the facade in a thread adapter, so each call runs on a worker thread
+    that has to hop back onto the event loop to reach the real async code. A
+    sandbox whose own recovery path also needs a thread — reprovisioning a dead
+    container, say — then waits for a thread that is waiting for the loop, and
+    starves the pool for every other agent sharing it. Being async all the way
+    down means `ensure_async` passes the backend through untouched and the
+    toolset awaits it directly.
+
+    Recognised by `ensure_async` through this base class, so no method-shape
+    sniffing is involved:
+
+    ```python
+    from pydantic_ai_backends import AsyncBaseSandbox, ExecuteResponse
+
+
+    class SSHSandbox(AsyncBaseSandbox):
+        async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
+            result = await self._connection.run(command, timeout=timeout)
+            return ExecuteResponse(output=result.stdout, exit_code=result.exit_status)
+
+        async def edit(self, path, old_string, new_string, replace_all=False) -> EditResult:
+            ...
+    ```
+
+    Failures are returned, never raised — see
+    :class:`~pydantic_ai_backends.protocol.AsyncBackendProtocol` for the contract
+    every method here is held to.
+
+    Args:
+        sandbox_id: Unique identifier for this sandbox. Generated when omitted.
+    """
+
+    async def start(self) -> None:
+        """Start the sandbox eagerly.
+
+        The default is a no-op, since sandboxes start on first use.
+        """
+
+    async def is_alive(self) -> bool:
+        """Whether the sandbox is running and responsive."""
+        return False
+
+    async def stop(self) -> None:
+        """Stop and clean up the sandbox."""
+
+    @abstractmethod
+    async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
+        """Run a command in the sandbox.
+
+        Args:
+            command: Command to execute.
+            timeout: Maximum execution time in seconds.
+        """
+        ...
+
+    @abstractmethod
+    async def edit(
+        self, path: str, old_string: str, new_string: str, replace_all: bool = False
+    ) -> EditResult:
+        """Edit a file by replacing a string.
+
+        Args:
+            path: File path to edit.
+            old_string: String to find and replace.
+            new_string: Replacement string.
+            replace_all: Replace every occurrence instead of only the first.
+        """
+        ...
+
+    async def exists(self, path: str) -> bool:
+        """Whether `path` is a regular file, via `test -f`."""
+        result = await self.execute(_shell.exists_command(path), timeout=5)
+        return result.exit_code == 0
+
+    async def ls_info(self, path: str) -> list[FileInfo]:
+        """List one directory using `ls -la`."""
+        return _shell.parse_ls(await self.execute(_shell.ls_command(path)), path)
+
+    async def read_bytes(self, path: str) -> bytes:
+        """Read a whole file with `cat`, or `b""` on any failure."""
+        return _shell.parse_read_bytes(await self.execute(_shell.read_bytes_command(path)))
+
+    async def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
+        """Read a slice of a file, numbered by its real line positions."""
+        return _shell.parse_read(await self.execute(_shell.read_command(path, offset, limit)))
+
+    async def write(self, path: str, content: str) -> WriteResult:
+        """Write a file with `cat` and a quoted heredoc."""
+        result = await self.execute(_shell.write_command(path, content))
+        return _shell.parse_write(result, path)
+
+    async def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
+        """Match files with `find`."""
+        return _shell.parse_glob(await self.execute(_shell.glob_command(pattern, path)))
+
+    async def grep_raw(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        ignore_hidden: bool = True,
+    ) -> list[GrepMatch] | str:
+        """Search file contents with `grep`."""
+        command = _shell.grep_command(pattern, path, glob, ignore_hidden)
+        return _shell.parse_grep(await self.execute(command))
