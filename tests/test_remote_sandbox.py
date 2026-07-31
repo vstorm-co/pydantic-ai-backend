@@ -3257,3 +3257,163 @@ class TestOciRuntimeSelection:
     def test_it_defaults_to_the_daemon_choice(self):
         """Naming a runtime the host has not registered turns sessions into 502s."""
         assert SandboxdConfig(token=SERVICE_TOKEN).oci_runtime is None
+
+
+class AsyncFakeSandbox:
+    """A natively async sandbox handed to the service as its builder."""
+
+    def __init__(self, session_id: str, runtime: Any) -> None:
+        self._id = session_id
+        self.runtime_entry = runtime
+        self.last_activity = 1_000.0
+        self.idle_timeout = 60
+        self.dead = False
+        self.stops = 0
+        self.removed = False
+        self.commands: list[str] = []
+        self.usage: SandboxUsage | None = None
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self, remove: bool = False) -> None:
+        self.stops += 1
+        self.removed = self.removed or remove
+
+    async def is_alive(self) -> bool:
+        return not self.dead
+
+    async def resource_usage(self) -> SandboxUsage | None:
+        return self.usage
+
+    async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
+        self.commands.append(command)
+        return ExecuteResponse(output="ok", exit_code=0)
+
+    async def read_bytes(self, path: str) -> bytes:
+        return b""
+
+    async def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
+        return "content"
+
+    async def write(self, path: str, content: str | bytes) -> WriteResult:
+        return WriteResult(path=path)
+
+    async def edit(self, path, old_string, new_string, replace_all=False) -> EditResult:
+        return EditResult(path=path, occurrences=1)
+
+    async def exists(self, path: str) -> bool:
+        return True
+
+    async def ls_info(self, path: str):
+        return []
+
+    async def glob_info(self, pattern: str, path: str = "/"):
+        return []
+
+    async def grep_raw(self, pattern, path=None, glob=None, ignore_hidden=True):
+        return []
+
+    def touch(self) -> None:
+        self.last_activity = 1_000.0
+
+
+class TestAsyncSandboxThroughTheService:
+    """An `AsyncBaseSandbox` must reach sandboxd, not just the toolset."""
+
+    @pytest.fixture
+    def async_harness(self):
+        built: dict[str, AsyncFakeSandbox] = {}
+
+        def build(session_id: str, runtime: Any) -> AsyncFakeSandbox:
+            built[session_id] = AsyncFakeSandbox(session_id, runtime)
+            return built[session_id]
+
+        config = SandboxdConfig(
+            token=SERVICE_TOKEN,
+            runtimes={"python": "python:3.12-slim"},
+            prewarm=False,
+        )
+        app = create_app(config, sandbox_builder=build)
+        return app, built
+
+    def test_liveness_is_resolved_not_reported_as_a_truthy_coroutine(self, async_harness):
+        app, built = async_harness
+        with TestClient(app) as client:
+            created = client.post(
+                "/sessions", json={"session_id": "a1"}, headers=_service_headers()
+            )
+            assert created.status_code == 200, created.text
+            assert created.json()["session"]["alive"] is True
+
+            built["a1"].dead = True
+            seen = client.get("/sessions/a1", headers=_service_headers())
+
+        assert seen.json()["alive"] is False
+
+    def test_operations_run_against_it(self, async_harness):
+        app, built = async_harness
+        with TestClient(app) as client:
+            _open_session(client, session_id="a2")
+
+            answer = client.post(
+                "/sessions/a2/exec",
+                json={"command": "echo hi"},
+                headers=_service_headers(),
+            )
+
+        assert answer.json()["output"] == "ok"
+        assert built["a2"].commands == ["echo hi"]
+
+    def test_usage_is_awaited_rather_than_thread_wrapped(self, async_harness):
+        """In a thread its coroutine never runs, so usage read as unavailable."""
+        app, built = async_harness
+        with TestClient(app) as client:
+            _open_session(client, session_id="a3")
+            built["a3"].usage = SandboxUsage(memory_bytes=4096)
+
+            seen = client.get("/sessions/a3?usage=true", headers=_service_headers())
+
+        assert seen.json()["usage"]["memory_bytes"] == 4096
+
+    def test_a_purge_actually_discards_the_container(self, async_harness):
+        app, built = async_harness
+        with TestClient(app) as client:
+            _open_session(client, session_id="a4")
+
+            closed = client.delete("/sessions/a4?purge=true", headers=_service_headers())
+
+        assert closed.status_code == 204
+        assert built["a4"].removed is True
+
+    def test_a_purge_falls_back_when_stop_takes_no_remove(self, async_harness):
+        """The base sandbox surface has nothing to discard beyond stopping."""
+        app, built = async_harness
+
+        class NoRemove(AsyncFakeSandbox):
+            async def stop(self) -> None:  # type: ignore[override]
+                self.stops += 1
+
+        with TestClient(app) as client:
+            _open_session(client, session_id="a5")
+            plain = NoRemove("a5", built["a5"].runtime_entry)
+            app.state.service.manager._sessions["a5"] = plain
+
+            closed = client.delete("/sessions/a5?purge=true", headers=_service_headers())
+
+        assert closed.status_code == 204
+        assert plain.stops >= 1
+
+    def test_reattaching_reports_liveness_too(self, async_harness):
+        app, _ = async_harness
+        with TestClient(app) as client:
+            _open_session(client, session_id="a6")
+
+            again = client.post(
+                "/sessions",
+                json={"session_id": "a6", "reuse": True},
+                headers=_service_headers(),
+            )
+
+        assert again.status_code == 200, again.text
+        assert again.json()["session"]["alive"] is True

@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import inspect
 import logging
 import time
 from collections.abc import Callable
@@ -162,10 +164,17 @@ class SessionManager:
         async with lock:
             existing = self._sessions.get(session_id)
             if existing is not None:
-                if existing.is_alive():
+                if await alive_of(existing):
                     _record_activity(existing)
                     return existing
+                # Dead, but very likely still holding client-side resources — an
+                # SSH connection, an HTTP client with an open pool. Dropping the
+                # reference alone leaks those until garbage collection, which for
+                # an `httpx.Client` means a warning and an unclosed socket. It is
+                # already dead, so a failing stop is expected and ignored.
                 del self._sessions[session_id]
+                with contextlib.suppress(Exception):
+                    await self._lifecycle(existing.stop)
 
             if self._max_sessions is not None and len(self._sessions) >= self._max_sessions:
                 raise SessionLimitExceeded(self._max_sessions)
@@ -176,30 +185,35 @@ class SessionManager:
                 sandbox = self._create_docker_sandbox(session_id, runtime)
 
             try:
-                await self._offload(sandbox.start)
+                await self._lifecycle(sandbox.start)
             except Exception:
                 # An unregistered sandbox is one nothing else will ever stop, so
                 # a partial start would leak whatever it did manage to create.
                 with contextlib.suppress(Exception):
-                    await self._offload(sandbox.stop)
+                    await self._lifecycle(sandbox.stop)
                 raise
 
             self._sessions[session_id] = sandbox
             return sandbox
 
-    async def _offload(self, call: Callable[[], Any]) -> None:
-        """Run a blocking sandbox lifecycle call off the event loop.
+    async def _lifecycle(self, call: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Invoke a sandbox's `start` or `stop`, whether it is sync or async.
 
-        Starting a sandbox pulls or builds an image and stopping one waits for
-        the process inside to die — both are seconds, not milliseconds. Run on
-        the loop they stall every other session's work for the duration, which
-        for a service handing sandboxes to several tenants is the difference
-        between concurrent and merely asynchronous.
+        A blocking call goes to a thread: starting a sandbox pulls or builds an
+        image and stopping one waits for the process inside to die, and on the
+        loop either stalls every other session for the duration.
+
+        A natively async sandbox is awaited directly instead. Handing its
+        coroutine *function* to a thread would merely create a coroutine nobody
+        awaits — so the sandbox would silently never start, never stop, and its
+        `is_alive` would return a truthy coroutine object for ever.
         """
+        if inspect.iscoroutinefunction(call):
+            return await call(*args, **kwargs)
+        bound = functools.partial(call, *args, **kwargs)
         if self.executor is None:
-            await asyncio.to_thread(call)
-            return
-        await asyncio.get_running_loop().run_in_executor(self.executor, call)
+            return await asyncio.to_thread(bound)
+        return await asyncio.get_running_loop().run_in_executor(self.executor, bound)
 
     def _create_docker_sandbox(
         self,
@@ -229,7 +243,7 @@ class SessionManager:
 
         sandbox = self._sessions.pop(session_id)
         self._locks.pop(session_id, None)
-        await self._offload(sandbox.stop)
+        await self._lifecycle(sandbox.stop)
         if self._on_release is not None:
             self._on_release(session_id)
         return True
@@ -354,6 +368,19 @@ class SessionManager:
 
     def __len__(self) -> int:
         return len(self._sessions)
+
+
+async def alive_of(sandbox: Any) -> bool:
+    """Whether a sandbox reports itself alive, for a sync or async sandbox.
+
+    An async sandbox's `is_alive()` returns a coroutine, and a coroutine object
+    is truthy — so a caller that only checked the return value would treat a
+    dead sandbox as alive for the rest of the process's life.
+    """
+    alive = sandbox.is_alive()
+    if inspect.isawaitable(alive):
+        alive = await alive
+    return bool(alive)
 
 
 def last_activity_of(sandbox: Any, default: float) -> float:

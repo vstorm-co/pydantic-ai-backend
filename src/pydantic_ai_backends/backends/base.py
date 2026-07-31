@@ -72,7 +72,15 @@ class BaseSandbox(_SandboxIdentity, ABC):
         """
 
     def is_alive(self) -> bool:
-        """Whether the sandbox is running and responsive."""
+        """Whether the sandbox is running and responsive.
+
+        **Override this.** The default answer is "no", and `SessionManager` reads
+        it as "replace the sandbox" — so a subclass that never overrides it has a
+        sandbox built, stopped and rebuilt on every single operation. It defaults
+        to `False` rather than `True` because a sandbox wrongly believed alive is
+        the harder failure to diagnose, but neither default is right for a real
+        sandbox: answer it.
+        """
         return False
 
     def stop(self) -> None:
@@ -187,7 +195,15 @@ class AsyncBaseSandbox(_SandboxIdentity, ABC):
         """
 
     async def is_alive(self) -> bool:
-        """Whether the sandbox is running and responsive."""
+        """Whether the sandbox is running and responsive.
+
+        **Override this.** The default answer is "no", and `SessionManager` reads
+        it as "replace the sandbox" — so a subclass that never overrides it has a
+        sandbox built, stopped and rebuilt on every single operation. It defaults
+        to `False` rather than `True` because a sandbox wrongly believed alive is
+        the harder failure to diagnose, but neither default is right for a real
+        sandbox: answer it.
+        """
         return False
 
     async def stop(self) -> None:

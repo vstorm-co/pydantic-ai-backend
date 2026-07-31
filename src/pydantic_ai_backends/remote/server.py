@@ -42,6 +42,7 @@ import asyncio
 import base64
 import binascii
 import functools
+import inspect
 import logging
 import os
 import re
@@ -69,6 +70,7 @@ from pydantic_ai_backends.backends.docker.runtimes import get_runtime
 from pydantic_ai_backends.backends.docker.session import (
     SessionLimitExceeded,
     SessionManager,
+    alive_of,
     last_activity_of,
 )
 from pydantic_ai_backends.remote import wire
@@ -751,11 +753,15 @@ def _default_docker_client() -> Any:
 
 
 def _usage_of(sandbox: Any) -> wire.SessionUsage | None:
-    """Sample a sandbox's usage, when it can report any."""
+    """Sample a sandbox's usage synchronously, when it can report any."""
     sampler = getattr(sandbox, "resource_usage", None)
     if sampler is None:
         return None
-    sampled = sampler()
+    return _as_wire_usage(sampler())
+
+
+def _as_wire_usage(sampled: Any) -> wire.SessionUsage | None:
+    """Convert whatever a sandbox reported, or `None` when it reported nothing."""
     if not isinstance(sampled, SandboxUsage):
         return None
     return wire.SessionUsage(
@@ -955,11 +961,15 @@ class _Service:
         session_id: str,
         sandbox: Any,
         usage: wire.SessionUsage | None = None,
+        *,
+        alive: bool,
     ) -> wire.SessionInfo:
         """Build the observable view of one session.
 
-        Takes an already-taken `usage` sample rather than fetching one: sampling
-        is slow enough that the caller has to decide when and how many at a time.
+        Takes an already-taken `usage` sample and an already-resolved `alive`
+        rather than fetching either: sampling is slow enough that the caller has
+        to decide when and how many at a time, and `is_alive` may be a coroutine
+        that this method — which runs in a worker thread — could not await.
 
         Raises:
             HTTPException: 404 when the session was reaped while this view was
@@ -976,7 +986,7 @@ class _Service:
             session_id=session_id,
             runtime=record.runtime,
             tenant=record.tenant,
-            alive=bool(sandbox.is_alive()),
+            alive=alive,
             created_at=record.created_at,
             last_activity=last_activity,
             idle_seconds=max(0.0, now - last_activity),
@@ -995,17 +1005,26 @@ class _Service:
         if cached is not None and now - cached[0] < USAGE_CACHE_SECONDS:
             return cached[1]
 
-        loop = asyncio.get_running_loop()
-        sample = await loop.run_in_executor(self._executor, _usage_of, sandbox)
+        sampler = getattr(sandbox, "resource_usage", None)
+        if inspect.iscoroutinefunction(sampler):
+            # Awaited here rather than in a thread: a coroutine function handed to
+            # the pool would return an un-awaited coroutine, which reports as no
+            # usage at all and leaves a warning behind.
+            sample = _as_wire_usage(await sampler())
+        else:
+            loop = asyncio.get_running_loop()
+            sample = await loop.run_in_executor(self._executor, _usage_of, sandbox)
         self._usage_cache[session_id] = (now, sample)
         return sample
 
     async def described(self, session_id: str, sandbox: Any, usage: bool) -> wire.SessionInfo:
         """Describe one session, sampling its usage only when asked."""
         sample = await self.sampled_usage(session_id, sandbox) if usage else None
+        alive = await alive_of(sandbox)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            self._executor, functools.partial(self.describe, session_id, sandbox, sample)
+            self._executor,
+            functools.partial(self.describe, session_id, sandbox, sample, alive=alive),
         )
 
     def health(self) -> wire.ServiceHealth:
@@ -1175,7 +1194,7 @@ class _Service:
         if open_already is not None:
             if not body.reuse:
                 raise HTTPException(status_code=409, detail=f"Session exists: {session_id}")
-            return self._attach(session_id, open_already, body.runtime)
+            return await self._attach(session_id, open_already, body.runtime)
         if session_id in self._pending:
             raise HTTPException(status_code=409, detail=f"Session is opening: {session_id}")
 
@@ -1205,7 +1224,7 @@ class _Service:
             tenant=body.tenant,
         )
         return wire.SessionCreated(
-            session=self.describe(session_id, sandbox),
+            session=self.describe(session_id, sandbox, alive=await alive_of(sandbox)),
             token=self._sessions[session_id].token,
         )
 
@@ -1285,7 +1304,7 @@ class _Service:
                 ),
             )
 
-    def _attach(
+    async def _attach(
         self, session_id: str, session: _Session, requested_runtime: str | None
     ) -> wire.SessionCreated:
         """Hand back an already-open session, with the token it was issued.
@@ -1308,8 +1327,9 @@ class _Service:
                     f"not {requested_runtime!r}. Close it before changing runtime."
                 ),
             )
+        sandbox = self.peek(session_id)
         return wire.SessionCreated(
-            session=self.describe(session_id, self.peek(session_id)),
+            session=self.describe(session_id, sandbox, alive=await alive_of(sandbox)),
             token=session.token,
         )
 
@@ -1326,9 +1346,7 @@ class _Service:
         """
         sandbox = self.manager.sessions.get(session_id)
         if purge and sandbox is not None:
-            # Discarding a container and deleting a directory tree both block,
-            # and a purge is the slowest close there is.
-            await self._in_thread(functools.partial(_remove_sandbox, sandbox))
+            await self._discard(sandbox)
 
         await self.manager.release(session_id)
 
@@ -1338,6 +1356,27 @@ class _Service:
                 await self._in_thread(
                     functools.partial(shutil.rmtree, session_dir, ignore_errors=True)
                 )
+
+    async def _discard(self, sandbox: Any) -> None:
+        """Stop a sandbox and throw its container away, sync or async.
+
+        Discarding a container blocks, so a synchronous sandbox goes to the
+        worker pool. An async one is awaited instead — in a thread its coroutine
+        would never run, and the container would survive the purge.
+        """
+        remover = getattr(sandbox, "stop", None)
+        if remover is None:  # pragma: no cover - every sandbox has stop()
+            return
+        if not inspect.iscoroutinefunction(remover):
+            await self._in_thread(functools.partial(_remove_sandbox, sandbox))
+            return
+        try:
+            pending = remover(remove=True)
+        except TypeError:
+            # The base sandbox surface takes no `remove`; it has nothing to
+            # discard beyond stopping.
+            pending = remover()
+        await pending
 
     def workspace_of(self, session_id: str) -> Path:
         """The host directory holding a session's files.
