@@ -1,7 +1,7 @@
 """Extended tests for backend implementations to reach 100% coverage."""
 
 from pydantic_ai_backends import CompositeBackend, LocalBackend, StateBackend
-from pydantic_ai_backends.backends.state import _normalize_path, _validate_path
+from pydantic_ai_backends._paths import normalize_path, unsafe_path_reason
 
 
 class TestPathValidation:
@@ -9,38 +9,38 @@ class TestPathValidation:
 
     def test_validate_path_with_double_dots(self):
         """Test that .. is rejected."""
-        error = _validate_path("../etc/passwd")
+        error = unsafe_path_reason("../etc/passwd")
         assert error is not None
         assert ".." in error
 
     def test_validate_path_with_tilde(self):
         """Test that ~ is rejected."""
-        error = _validate_path("~/secret")
+        error = unsafe_path_reason("~/secret")
         assert error is not None
         assert "~" in error
 
     def test_validate_path_windows_path(self):
         """Test that Windows paths are rejected."""
-        error = _validate_path("C:\\Windows\\System32")
+        error = unsafe_path_reason("C:\\Windows\\System32")
         assert error is not None
         assert "Windows" in error
 
     def test_validate_path_valid(self):
         """Test that valid paths pass."""
-        assert _validate_path("/valid/path") is None
-        assert _validate_path("relative/path") is None
+        assert unsafe_path_reason("/valid/path") is None
+        assert unsafe_path_reason("relative/path") is None
 
     def test_normalize_path_no_leading_slash(self):
         """Test normalization adds leading slash."""
-        assert _normalize_path("path/to/file") == "/path/to/file"
+        assert normalize_path("path/to/file") == "/path/to/file"
 
     def test_normalize_path_removes_trailing_slash(self):
         """Test normalization removes trailing slash."""
-        assert _normalize_path("/path/to/dir/") == "/path/to/dir"
+        assert normalize_path("/path/to/dir/") == "/path/to/dir"
 
     def test_normalize_path_root(self):
         """Test root path is preserved."""
-        assert _normalize_path("/") == "/"
+        assert normalize_path("/") == "/"
 
 
 class TestStateBackendExtended:
@@ -703,3 +703,41 @@ class TestCompositeBackendExtended:
 
         assert "/foobar/test.txt" not in routed.files
         assert "/foobar/test.txt" in default.files
+
+
+class TestStateBackendListing:
+    """Directory listing and per-path guards that the happy path skips."""
+
+    def _backend(self):
+        backend = StateBackend()
+        backend.write("/src/app.py", "print('hi')")
+        backend.write("/src/lib/util.py", "x = 1")
+        backend.write("/README.md", "# hi")
+        return backend
+
+    def test_listing_a_subdirectory_ignores_siblings(self):
+        entries = self._backend().ls_info("/src")
+
+        assert [(e["name"], e["is_dir"]) for e in entries] == [("lib", True), ("app.py", False)]
+
+    def test_a_directory_is_reported_once_for_many_children(self):
+        backend = self._backend()
+        backend.write("/src/lib/other.py", "y = 2")
+
+        assert [e["name"] for e in backend.ls_info("/src") if e["is_dir"]] == ["lib"]
+
+    def test_listing_a_file_path_returns_just_that_file(self):
+        entries = self._backend().ls_info("/README.md")
+
+        assert [e["name"] for e in entries] == ["README.md"]
+
+    def test_read_bytes_rejects_an_unsafe_path(self):
+        assert self._backend().read_bytes("../escape.py") == b""
+
+    def test_read_rejects_an_unsafe_path(self):
+        assert self._backend().read("../escape.py").startswith("Error: Path cannot contain")
+
+    def test_edit_reports_a_missing_file(self):
+        result = self._backend().edit("/nope.py", "a", "b")
+
+        assert result.error == "File '/nope.py' not found"

@@ -12,12 +12,12 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_backends import LocalBackend, create_console_toolset, ensure_async
-from pydantic_ai_backends.backends.local import MAX_READ_OUTPUT
-from pydantic_ai_backends.toolsets.console import (
-    _edit_staleness_error,
-    _fingerprint,
-    _read_fingerprints,
-    _record_read,
+from pydantic_ai_backends.backends.local import MAX_READ_OUTPUT_CHARS
+from pydantic_ai_backends.toolsets._tracking import (
+    fingerprint,
+    read_fingerprints,
+    record_read,
+    staleness_error,
 )
 
 
@@ -64,15 +64,15 @@ class TestReadCeiling:
     def test_default_read_truncates_when_huge(self, tmp_path: Path) -> None:
         backend = LocalBackend(root_dir=tmp_path)
         # One enormous line so a default read blows past the ceiling.
-        backend.write("huge.txt", "x" * (MAX_READ_OUTPUT + 5000))
+        backend.write("huge.txt", "x" * (MAX_READ_OUTPUT_CHARS + 5000))
         out = backend.read("huge.txt")  # default: no explicit range
         assert not out.startswith("Error")
         assert "truncated at" in out
-        assert len(out) <= MAX_READ_OUTPUT + 200  # ceiling + the notice
+        assert len(out) <= MAX_READ_OUTPUT_CHARS + 200  # ceiling + the notice
 
     def test_explicit_range_too_large_errors(self, tmp_path: Path) -> None:
         backend = LocalBackend(root_dir=tmp_path)
-        backend.write("huge.txt", "x" * (MAX_READ_OUTPUT + 5000))
+        backend.write("huge.txt", "x" * (MAX_READ_OUTPUT_CHARS + 5000))
         out = backend.read("huge.txt", offset=0, limit=5)  # explicit limit
         assert out.startswith("Error")
         assert "too large" in out
@@ -86,27 +86,27 @@ class TestReadCeiling:
 
 class TestEditStalenessUnit:
     def test_fingerprint_distinguishes_content(self) -> None:
-        assert _fingerprint(b"a") == _fingerprint(b"a")
-        assert _fingerprint(b"a") != _fingerprint(b"b")
+        assert fingerprint(b"a") == fingerprint(b"a")
+        assert fingerprint(b"a") != fingerprint(b"b")
 
     async def test_never_read_is_not_stale(self, tmp_path: Path) -> None:
         be = LocalBackend(root_dir=tmp_path)
         be.write("f.txt", "hi")
         # No recorded read → not our concern → no error.
-        assert await _edit_staleness_error(ensure_async(be), be, "f.txt") is None
+        assert await staleness_error(ensure_async(be), be, "f.txt") is None
 
     async def test_unchanged_after_read_is_ok(self, tmp_path: Path) -> None:
         be = LocalBackend(root_dir=tmp_path)
         be.write("f.txt", "hello")
-        _record_read(be, "f.txt", b"hello")
-        assert await _edit_staleness_error(ensure_async(be), be, "f.txt") is None
+        record_read(be, "f.txt", b"hello")
+        assert await staleness_error(ensure_async(be), be, "f.txt") is None
 
     async def test_changed_after_read_errors(self, tmp_path: Path) -> None:
         be = LocalBackend(root_dir=tmp_path)
         be.write("f.txt", "hello")
-        _record_read(be, "f.txt", b"hello")
+        record_read(be, "f.txt", b"hello")
         be.write("f.txt", "hello world")  # external change
-        err = await _edit_staleness_error(ensure_async(be), be, "f.txt")
+        err = await staleness_error(ensure_async(be), be, "f.txt")
         assert err is not None and "changed since you last read it" in err
 
 
@@ -160,7 +160,7 @@ class TestEditStalenessIntegration:
         assert be.read("f.txt").endswith("A B c")
 
     def teardown_method(self) -> None:
-        _read_fingerprints.clear()
+        read_fingerprints.clear()
 
 
 def _png_bytes(w: int, h: int) -> bytes:
@@ -185,16 +185,16 @@ def _dims(data: bytes) -> tuple[int, int]:
 
 class TestImageDownscale:
     def test_small_image_unchanged(self) -> None:
-        from pydantic_ai_backends.toolsets.console import _downscale_image
+        from pydantic_ai_backends.toolsets._content import downscale_image
 
         data = _png_bytes(100, 80)
-        assert _downscale_image(data, max_dim=1568) == data
+        assert downscale_image(data, max_dim=1568) == data
 
     def test_large_image_downscaled(self) -> None:
-        from pydantic_ai_backends.toolsets.console import _downscale_image
+        from pydantic_ai_backends.toolsets._content import downscale_image
 
         data = _png_bytes(3000, 2000)
-        out = _downscale_image(data, max_dim=1568)
+        out = downscale_image(data, max_dim=1568)
         assert max(_dims(out)) <= 1568
         assert out != data
 
@@ -211,14 +211,14 @@ class TestImageDownscale:
 
 class TestGrepIgnoreDirs:
     def test_path_ignored_helper(self) -> None:
-        from pydantic_ai_backends.backends.local import _grep_path_ignored
+        from pydantic_ai_backends.backends.local import is_ignored_path
 
-        assert _grep_path_ignored(("src", "node_modules", "x.js"), True) is True
-        assert _grep_path_ignored(("src", "app.py"), True) is False
-        assert _grep_path_ignored(("src", ".env"), True) is True  # hidden + ignore
-        assert _grep_path_ignored(("src", ".env"), False) is False  # ignore off → keep
-        assert _grep_path_ignored(("__pycache__", "x"), False) is False  # ignore off → keep
-        assert _grep_path_ignored(("__pycache__", "x"), True) is True  # junk skipped
+        assert is_ignored_path(("src", "node_modules", "x.js"), True) is True
+        assert is_ignored_path(("src", "app.py"), True) is False
+        assert is_ignored_path(("src", ".env"), True) is True  # hidden + ignore
+        assert is_ignored_path(("src", ".env"), False) is False  # ignore off → keep
+        assert is_ignored_path(("__pycache__", "x"), False) is False  # ignore off → keep
+        assert is_ignored_path(("__pycache__", "x"), True) is True  # junk skipped
 
     def test_python_grep_skips_build_dirs(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -239,3 +239,34 @@ class TestGrepIgnoreDirs:
         assert any("app.py" in p for p in paths)
         assert not any("node_modules" in p for p in paths)
         assert not any("__pycache__" in p for p in paths)
+
+
+class TestEditLock:
+    def test_same_path_shares_a_lock_and_paths_do_not(self) -> None:
+        from pydantic_ai_backends.toolsets._tracking import edit_lock
+
+        backend = LocalBackend(root_dir="/tmp")
+        other = LocalBackend(root_dir="/tmp")
+
+        assert edit_lock(backend, "a.txt") is edit_lock(backend, "a.txt")
+        assert edit_lock(backend, "a.txt") is not edit_lock(backend, "b.txt")
+        assert edit_lock(backend, "a.txt") is not edit_lock(other, "a.txt")
+
+
+class TestBaseSandboxActivity:
+    def test_touch_advances_last_activity(self) -> None:
+        from pydantic_ai_backends.backends.base import BaseSandbox
+
+        class Sandbox(BaseSandbox):
+            def execute(self, command: str, timeout: int | None = None):  # type: ignore[override]
+                raise NotImplementedError
+
+            def edit(self, path, old_string, new_string, replace_all=False):  # type: ignore[override]
+                raise NotImplementedError
+
+        sandbox = Sandbox("s1")
+        sandbox._last_activity = 0.0
+
+        sandbox.touch()
+
+        assert sandbox.last_activity > 0.0

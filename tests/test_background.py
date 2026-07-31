@@ -107,17 +107,17 @@ class TestLocalBackendBackground:
     def test_kill_all_clears_and_removes_dir(self, tmp_path: Path) -> None:
         backend = LocalBackend(root_dir=str(tmp_path))
         backend.execute_background("sleep 30")
-        bg_dir = backend._bg_dir
+        bg_dir = backend._background._output_dir
         assert bg_dir is not None and bg_dir.exists()
         backend.kill_all_background()
         assert backend.list_background() == []
-        assert backend._bg_dir is None
+        assert backend._background._output_dir is None
         assert not bg_dir.exists()
 
     def test_kill_all_noop_when_nothing_started(self, tmp_path: Path) -> None:
         # No background process ever started → no temp dir to remove.
         backend = LocalBackend(root_dir=str(tmp_path))
-        assert backend._bg_dir is None
+        assert backend._background._output_dir is None
         backend.kill_all_background()  # must not raise
         assert backend.list_background() == []
 

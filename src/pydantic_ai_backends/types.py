@@ -86,6 +86,28 @@ class BackgroundProcessInfo:
     exit_code: int | None = None
 
 
+@dataclass(frozen=True)
+class SandboxUsage:
+    """Point-in-time resource usage of a sandbox.
+
+    Every field is optional because the numbers come from whatever the
+    underlying runtime reports, and a container that has just started (or has
+    already exited) exposes only some of them.
+
+    Attributes:
+        memory_bytes: Resident memory currently used.
+        memory_limit_bytes: Ceiling the runtime is enforcing, if any.
+        cpu_percent: CPU use across the sample, as a percentage of one core
+            multiplied by the number of cores available.
+        pids: Number of processes running inside the sandbox.
+    """
+
+    memory_bytes: int | None = None
+    memory_limit_bytes: int | None = None
+    cpu_percent: float | None = None
+    pids: int | None = None
+
+
 class GrepMatch(TypedDict):
     """A single grep match result."""
 
@@ -97,9 +119,9 @@ class GrepMatch(TypedDict):
 class RuntimeConfig(BaseModel):
     """Configuration for a Docker runtime environment.
 
-    A runtime defines a pre-configured execution environment with specific
-    packages and settings. Can be used with DockerSandbox to provide
-    ready-to-use environments without manual package installation.
+    Describes a pre-configured execution environment so a `DockerSandbox` needs
+    no manual package installation. Give it either a ready-made `image`, or a
+    `base_image` plus `packages` to build from.
 
     Example:
         ```python
@@ -123,21 +145,18 @@ class RuntimeConfig(BaseModel):
     description: str = ""
     """Human-readable description of the runtime."""
 
-    # Image source (one of these)
     image: str | None = None
     """Ready-to-use Docker image (e.g., "myregistry/python-ds:v1")."""
 
     base_image: str | None = None
     """Base image to build upon (e.g., "python:3.12-slim")."""
 
-    # Packages to install (only if base_image)
     packages: list[str] = []
     """Packages to install (e.g., ["pandas", "numpy", "matplotlib"])."""
 
     package_manager: Literal["pip", "npm", "apt", "cargo"] = "pip"
     """Package manager to use for installation."""
 
-    # Additional configuration
     setup_commands: list[str] = []
     """Additional setup commands to run (e.g., ["apt-get update"])."""
 
@@ -147,6 +166,5 @@ class RuntimeConfig(BaseModel):
     work_dir: str = "/workspace"
     """Working directory inside the container."""
 
-    # Cache settings
     cache_image: bool = True
     """Whether to cache the built image locally."""

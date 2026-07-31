@@ -49,12 +49,36 @@ uv add pydantic-ai-backend[daytona]
 pip install pydantic-ai-backend[daytona]
 ```
 
+### Remote Sandbox (client)
+
+To use sandboxes that live in another process, so your application never needs
+Docker access (installs `httpx` only):
+
+```bash
+uv add pydantic-ai-backend[remote]
+# or
+pip install pydantic-ai-backend[remote]
+```
+
+### sandboxd (service)
+
+For the service that owns Docker and rents out sandboxes over HTTP. Install this
+in the *sandbox service* image, not in your application:
+
+```bash
+uv add pydantic-ai-backend[server]
+# or
+pip install pydantic-ai-backend[server]
+```
+
+See [Remote Sandboxes](concepts/remote.md).
+
 ### All Dependencies
 
 ```bash
-uv add pydantic-ai-backend[console,docker,daytona]
+uv add pydantic-ai-backend[console,docker,daytona,remote]
 # or
-pip install pydantic-ai-backend[console,docker,daytona]
+pip install pydantic-ai-backend[console,docker,daytona,remote]
 ```
 
 ## Environment Setup

@@ -1,9 +1,75 @@
 """Tests for DockerSandbox initialization (without running Docker)."""
 
-import mimetypes
+import io
+import sys
+import tarfile
 import time
+import types
 
 import pytest
+
+
+def _tar_bytes(name: str, payload: bytes) -> bytes:
+    """Build a single-member tar archive, as Docker's get_archive returns."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        info = tarfile.TarInfo(name=name)
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    return buffer.getvalue()
+
+
+class _FakeArchiveStream:
+    """Archive stream that records consumption and closure.
+
+    Mirrors the generator `docker.Container.get_archive` returns so tests can
+    assert that an oversized file is abandoned before its body is transferred.
+    """
+
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = chunks
+        self.consumed = 0
+        self.closed = False
+
+    def __iter__(self):
+        for chunk in self._chunks:
+            self.consumed += len(chunk)
+            yield chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeContainer:
+    """Minimal stand-in for a running Docker container."""
+
+    def __init__(self, chunks: list[bytes] | None = None, stat: dict[str, int] | None = None):
+        self.stream = _FakeArchiveStream(chunks or [])
+        self.stat = stat
+
+    def get_archive(self, path: str):
+        return self.stream, self.stat
+
+
+class _RecordingChardet:
+    """chardet stub that records how many bytes each detect() call received."""
+
+    def __init__(self, encoding: str = "utf-8", confidence: float = 0.99):
+        self.seen_sizes: list[int] = []
+        self._result = {"encoding": encoding, "confidence": confidence}
+
+    def detect(self, data: bytes) -> dict[str, object]:
+        self.seen_sizes.append(len(data))
+        return self._result
+
+
+def _sandbox(**kwargs):
+    """Build a DockerSandbox without touching the Docker daemon."""
+    from pydantic_ai_backends import DockerSandbox
+
+    sandbox = DockerSandbox.__new__(DockerSandbox)
+    sandbox.__init__(**kwargs)
+    return sandbox
 
 
 @pytest.fixture(scope="module")
@@ -264,47 +330,6 @@ class TestDockerSandboxEdit:
         assert content.count("qux") == 3
 
 
-class TestDockerSandboxReadTextHandling:
-    """Unit tests for the sandbox read helpers that don't require Docker."""
-
-    def test_convert_bytes_to_text_uses_mimetype_detection(self, monkeypatch):
-        """Ensure files detected as text via mimetypes are decoded as text."""
-        from pydantic_ai_backends import DockerSandbox
-
-        sandbox = DockerSandbox.__new__(DockerSandbox)
-
-        decoded_value = "decoded via mimetype"
-
-        def fake_decode(self, file_bytes):
-            return decoded_value
-
-        monkeypatch.setitem(mimetypes.types_map, ".cfg", "text/x-config")
-        monkeypatch.setattr(DockerSandbox, "_decode_text", fake_decode, raising=False)
-
-        result = sandbox._convert_bytes_to_text("cfg", b"whatever")
-        assert result == decoded_value
-
-    def test_decode_unknown_text_binary_fallback(self, monkeypatch):
-        """When no encoding decodes cleanly, binary marker should be returned."""
-        import pydantic_ai_backends.backends.docker.sandbox as sandbox_mod
-        from pydantic_ai_backends import DockerSandbox
-
-        sandbox = DockerSandbox.__new__(DockerSandbox)
-
-        # Force chardet to detect utf-8 so binary bytes produce many
-        # replacement characters and trigger the binary heuristic.
-        fake_chardet = type(
-            "FakeChardet",
-            (),
-            {"detect": staticmethod(lambda b: {"encoding": "utf-8", "confidence": 0.5})},
-        )()
-        monkeypatch.setattr(sandbox_mod, "_get_chardet", lambda: fake_chardet)
-
-        raw_bytes = bytearray(range(129, 255)) * 4
-        with pytest.raises(ValueError, match="Binary File"):
-            sandbox._decode_unknown_text(raw_bytes)
-
-
 class TestDockerSandboxGrepRaw:
     """Tests for BaseSandbox.grep_raw default path behaviour."""
 
@@ -454,71 +479,487 @@ class TestDockerSandboxNetworkMode:
             sandbox.stop()
 
 
-class TestBuildDockerfile:
-    """Tests for Dockerfile generation and input validation (no Docker needed)."""
+class TestSharedDockerClient:
+    """Tests for the process-wide Docker client (no Docker daemon needed)."""
 
-    def _build(self, **kwargs):
-        from pydantic_ai_backends.backends.docker.sandbox import _build_dockerfile
-        from pydantic_ai_backends.types import RuntimeConfig
+    @pytest.fixture(autouse=True)
+    def _reset_client(self, monkeypatch):
+        """Clear the cached client so each test builds its own."""
+        import pydantic_ai_backends.backends.docker._client as client_mod
 
-        kwargs.setdefault("name", "test")
-        kwargs.setdefault("base_image", "python:3.12-slim")
-        return _build_dockerfile(RuntimeConfig(**kwargs))
+        monkeypatch.setattr(client_mod, "_client", None)
+        monkeypatch.setattr(client_mod, "_client_pid", None)
 
-    def test_basic_pip_runtime(self):
-        dockerfile = self._build(packages=["pandas", "numpy"])
-        assert "FROM python:3.12-slim" in dockerfile
-        assert "RUN pip install --no-cache-dir pandas numpy" in dockerfile
-        assert "WORKDIR /workspace" in dockerfile
+    def test_client_is_rebuilt_after_a_fork(self, monkeypatch):
+        """Pooled sockets must not be shared across forked workers."""
+        import pydantic_ai_backends.backends.docker._client as client_mod
 
-    def test_npm_installs_locally_not_global(self):
-        """npm packages install into the work_dir, not globally (-g)."""
-        dockerfile = self._build(
-            packages=["react", "react-dom"],
-            package_manager="npm",
-            work_dir="/app",
+        built: list[str] = []
+        fake_docker = types.ModuleType("docker")
+        fake_docker.from_env = lambda: built.append("client") or f"client-{len(built)}"
+        monkeypatch.setitem(sys.modules, "docker", fake_docker)
+
+        monkeypatch.setattr(client_mod.os, "getpid", lambda: 1000)
+        parent = client_mod.docker_client()
+        assert client_mod.docker_client() is parent
+
+        # Same module state, new process: the cached client belongs to the parent.
+        monkeypatch.setattr(client_mod.os, "getpid", lambda: 2000)
+        child = client_mod.docker_client()
+
+        assert child != parent
+        assert len(built) == 2
+
+    def test_client_is_built_once_and_reused(self, monkeypatch):
+        """from_env() runs a blocking daemon handshake, so it must not repeat."""
+        import pydantic_ai_backends.backends.docker._client as client_mod
+
+        sentinel = object()
+        calls: list[int] = []
+        fake_docker = types.ModuleType("docker")
+        fake_docker.from_env = lambda: (calls.append(1), sentinel)[1]
+        monkeypatch.setitem(sys.modules, "docker", fake_docker)
+
+        assert client_mod.docker_client() is sentinel
+        assert client_mod.docker_client() is sentinel
+        assert len(calls) == 1
+
+
+class TestDockerSandboxResourceLimits:
+    """Tests that limits and hardening reach `containers.run` (no daemon needed)."""
+
+    @pytest.fixture
+    def fake_client(self, monkeypatch):
+        """Install fake `docker` modules and a recording client."""
+        import pydantic_ai_backends.backends.docker.sandbox as sandbox_mod
+
+        fake_errors = types.ModuleType("docker.errors")
+        fake_errors.NotFound = type("NotFound", (Exception,), {})
+        fake_errors.ImageNotFound = type("ImageNotFound", (Exception,), {})
+        fake_docker = types.ModuleType("docker")
+        fake_docker.errors = fake_errors
+        monkeypatch.setitem(sys.modules, "docker", fake_docker)
+        monkeypatch.setitem(sys.modules, "docker.errors", fake_errors)
+
+        class Containers:
+            def __init__(self):
+                self.image = None
+                self.kwargs = None
+
+            def run(self, image, **kwargs):
+                self.image = image
+                self.kwargs = kwargs
+                return _FakeContainer()
+
+        class Client:
+            def __init__(self):
+                self.containers = Containers()
+
+        client = Client()
+        monkeypatch.setattr(sandbox_mod, "docker_client", lambda: client)
+        return client
+
+    def test_defaults_bound_processes_and_block_escalation(self, fake_client):
+        """A default sandbox still caps PIDs and denies setuid escalation."""
+        _sandbox()._ensure_container()
+
+        kwargs = fake_client.containers.kwargs
+        assert kwargs["pids_limit"] == 512
+        assert kwargs["security_opt"] == ["no-new-privileges:true"]
+        # Memory and CPU stay unlimited unless asked for, so existing
+        # workloads are not silently throttled.
+        assert "mem_limit" not in kwargs
+        assert "nano_cpus" not in kwargs
+
+    def test_memory_limit_pins_swap_to_the_same_value(self, fake_client):
+        """An unmatched swap ceiling lets a capped container starve the host."""
+        _sandbox(mem_limit="512m")._ensure_container()
+
+        kwargs = fake_client.containers.kwargs
+        assert kwargs["mem_limit"] == "512m"
+        assert kwargs["memswap_limit"] == "512m"
+
+    def test_cpu_limit_converts_cores_to_nano_cpus(self, fake_client):
+        _sandbox(cpus=1.5)._ensure_container()
+
+        assert fake_client.containers.kwargs["nano_cpus"] == 1_500_000_000
+
+    def test_pids_limit_can_be_disabled(self, fake_client):
+        _sandbox(pids_limit=None)._ensure_container()
+
+        assert "pids_limit" not in fake_client.containers.kwargs
+
+    def test_init_limit_defaults(self):
+        sandbox = _sandbox()
+
+        assert sandbox._mem_limit is None
+        assert sandbox._cpus is None
+        assert sandbox._pids_limit == 512
+        assert sandbox._max_read_bytes == 8 * 1024 * 1024
+
+
+class TestDockerSandboxReadLimits:
+    """Tests for the bounded file-fetch path (no Docker daemon needed)."""
+
+    def test_read_bytes_extracts_archive_member(self):
+        """The happy path still returns file content after the buffer rework."""
+        sandbox = _sandbox()
+        payload = b"hello sandbox"
+        sandbox._container = _FakeContainer([_tar_bytes("f.txt", payload)])
+
+        assert sandbox.read_bytes("/workspace/f.txt") == payload
+
+    def test_read_bytes_empty_when_archive_holds_no_regular_file(self):
+        """A directory-only archive yields empty bytes, not a crash."""
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as tar:
+            info = tarfile.TarInfo(name="subdir")
+            info.type = tarfile.DIRTYPE
+            tar.addfile(info)
+
+        sandbox = _sandbox()
+        sandbox._container = _FakeContainer([buffer.getvalue()])
+
+        assert sandbox.read_bytes("/workspace/subdir") == b""
+
+    def test_read_bytes_empty_when_archive_is_corrupt(self):
+        sandbox = _sandbox()
+        sandbox._container = _FakeContainer([b"not a tar archive"])
+
+        assert sandbox.read_bytes("/workspace/f.txt") == b""
+
+    def test_read_bytes_empty_when_get_archive_fails(self):
+        class Failing:
+            def get_archive(self, path):
+                raise RuntimeError("no such container")
+
+        sandbox = _sandbox()
+        sandbox._container = Failing()
+
+        assert sandbox.read_bytes("/workspace/missing.txt") == b""
+
+    def test_oversized_file_is_refused_before_its_body_transfers(self):
+        """The size header lets us reject without paying for the download."""
+        sandbox = _sandbox(max_read_bytes=1024)
+        container = _FakeContainer([b"x" * 4096], stat={"size": 10_000})
+        sandbox._container = container
+
+        message = sandbox.read("/workspace/big.log")
+
+        assert "over the 1024-byte read limit" in message
+        assert "10000 bytes" in message
+        assert container.stream.consumed == 0
+        assert container.stream.closed is True
+
+    def test_oversized_file_refused_while_streaming_without_size_header(self):
+        """Daemons that omit the header must still not blow up the host."""
+        sandbox = _sandbox(max_read_bytes=1024)
+        container = _FakeContainer([b"x" * 800] * 4, stat=None)
+        sandbox._container = container
+
+        message = sandbox.read("/workspace/big.log")
+
+        assert "exceeds the 1024-byte read limit" in message
+        # Stopped as soon as the cap was crossed rather than draining it all.
+        assert container.stream.consumed == 1600
+        assert container.stream.closed is True
+
+    def test_read_bytes_returns_empty_for_oversized_file(self):
+        """`read_bytes` keeps its documented empty-bytes contract."""
+        sandbox = _sandbox(max_read_bytes=1024)
+        sandbox._container = _FakeContainer([b"x" * 4096], stat={"size": 10_000})
+
+        assert sandbox.read_bytes("/workspace/big.log") == b""
+
+    def test_edit_reports_the_read_limit(self):
+        """Edit surfaces the limit instead of claiming the file is missing."""
+        sandbox = _sandbox(max_read_bytes=1024)
+        sandbox._container = _FakeContainer([b"x" * 4096], stat={"size": 10_000})
+
+        result = sandbox.edit("/workspace/big.log", "a", "b")
+
+        assert result.error is not None
+        assert "read limit" in result.error
+        assert "not found" not in result.error
+
+
+class TestDockerSandboxExecuteOutputCap:
+    """Tests for the byte-bounded execute() output."""
+
+    def _sandbox_with_output(self, output: bytes):
+        class Container:
+            def exec_run(self, cmd, workdir=None):
+                return 0, output
+
+        sandbox = _sandbox()
+        sandbox._container = Container()
+        return sandbox
+
+    def test_output_under_cap_is_returned_whole(self):
+        result = self._sandbox_with_output(b"hello").execute("echo hello")
+
+        assert result.output == "hello"
+        assert result.truncated is False
+
+    def test_output_over_cap_is_truncated_to_the_byte_limit(self):
+        from pydantic_ai_backends import _limits
+
+        cap = _limits.MAX_EXECUTE_OUTPUT_BYTES
+        result = self._sandbox_with_output(b"y" * (cap + 500)).execute("cat big.log")
+
+        assert result.truncated is True
+        assert len(result.output) == cap
+
+
+class TestDockerSandboxLiveness:
+    """Tests for the cached liveness check (no Docker daemon needed)."""
+
+    class _Container:
+        def __init__(self, status: str = "running"):
+            self.status = status
+            self.reloads = 0
+            self.stopped = 0
+            self.removed = 0
+
+        def reload(self) -> None:
+            self.reloads += 1
+
+        def stop(self) -> None:
+            self.stopped += 1
+
+        def remove(self, force: bool = False) -> None:
+            self.removed += 1
+
+    def test_no_container_is_not_alive(self):
+        assert _sandbox().is_alive() is False
+
+    def test_repeated_checks_hit_the_daemon_once(self):
+        """SessionManager calls this per request; reload() is a round trip."""
+        sandbox = _sandbox()
+        container = self._Container()
+        sandbox._container = container
+
+        assert all(sandbox.is_alive() for _ in range(5))
+        assert container.reloads == 1
+
+    def test_cache_expires(self, monkeypatch):
+        import pydantic_ai_backends.backends.docker.sandbox as sandbox_mod
+
+        sandbox = _sandbox()
+        container = self._Container()
+        sandbox._container = container
+
+        clock = [1000.0]
+        monkeypatch.setattr(sandbox_mod.time, "monotonic", lambda: clock[0])
+
+        assert sandbox.is_alive() is True
+        clock[0] += sandbox_mod.ALIVE_CACHE_SECONDS + 0.1
+        assert sandbox.is_alive() is True
+        assert container.reloads == 2
+
+    def test_non_running_status_is_not_alive(self):
+        sandbox = _sandbox()
+        sandbox._container = self._Container(status="exited")
+
+        assert sandbox.is_alive() is False
+
+    def test_reload_failure_is_not_alive_and_is_cached(self):
+        class Failing(TestDockerSandboxLiveness._Container):
+            def reload(self) -> None:
+                self.reloads += 1
+                raise RuntimeError("daemon gone")
+
+        sandbox = _sandbox()
+        container = Failing()
+        sandbox._container = container
+
+        assert sandbox.is_alive() is False
+        assert sandbox.is_alive() is False
+        assert container.reloads == 1
+
+    def test_stop_clears_the_cached_answer(self):
+        sandbox = _sandbox()
+        sandbox._container = self._Container()
+
+        assert sandbox.is_alive() is True
+        sandbox.stop()
+
+        assert sandbox._alive_checked_at is None
+        assert sandbox.is_alive() is False
+
+
+class TestDockerSandboxStop:
+    """Tests for stop() and explicit container removal."""
+
+    def test_stop_does_not_remove_by_default(self):
+        """A named container is meant to survive — that is the point of naming it."""
+        sandbox = _sandbox(container_name="reusable")
+        container = TestDockerSandboxLiveness._Container()
+        sandbox._container = container
+
+        sandbox.stop()
+
+        assert container.stopped == 1
+        assert container.removed == 0
+
+    def test_stop_with_remove_deletes_the_container(self):
+        sandbox = _sandbox(container_name="reusable")
+        container = TestDockerSandboxLiveness._Container()
+        sandbox._container = container
+
+        sandbox.stop(remove=True)
+
+        assert container.stopped == 1
+        assert container.removed == 1
+        assert sandbox._container is None
+
+    def test_stop_is_idempotent_and_never_raises(self):
+        class Hostile(TestDockerSandboxLiveness._Container):
+            def stop(self) -> None:
+                raise RuntimeError("already gone")
+
+            def remove(self, force: bool = False) -> None:
+                raise RuntimeError("already gone")
+
+        sandbox = _sandbox()
+        sandbox._container = Hostile()
+
+        sandbox.stop(remove=True)
+        sandbox.stop(remove=True)
+
+        assert sandbox._container is None
+
+
+class TestDockerSandboxResourceUsage:
+    """Tests for resource_usage() and the stats parsing helpers."""
+
+    def _stats(self, **overrides):
+        stats = {
+            "memory_stats": {"usage": 2048, "limit": 8192},
+            "pids_stats": {"current": 11},
+            "cpu_stats": {
+                "cpu_usage": {"total_usage": 2_000},
+                "system_cpu_usage": 12_000,
+                "online_cpus": 4,
+            },
+            "precpu_stats": {
+                "cpu_usage": {"total_usage": 1_000},
+                "system_cpu_usage": 10_000,
+            },
+        }
+        stats.update(overrides)
+        return stats
+
+    def _sandbox_with_stats(self, stats):
+        class Container:
+            def stats(self, stream=False):
+                if isinstance(stats, Exception):
+                    raise stats
+                return stats
+
+        sandbox = _sandbox()
+        sandbox._container = Container()
+        return sandbox
+
+    def test_no_container_reports_no_usage(self):
+        assert _sandbox().resource_usage() is None
+
+    def test_usage_is_parsed_from_stats(self):
+        usage = self._sandbox_with_stats(self._stats()).resource_usage()
+
+        assert usage is not None
+        assert usage.memory_bytes == 2048
+        assert usage.memory_limit_bytes == 8192
+        assert usage.pids == 11
+        # 1000 / 2000 * 4 cores * 100
+        assert usage.cpu_percent == pytest.approx(200.0)
+
+    def test_cpu_defaults_to_one_core_when_not_reported(self):
+        stats = self._stats()
+        del stats["cpu_stats"]["online_cpus"]
+
+        usage = self._sandbox_with_stats(stats).resource_usage()
+
+        assert usage is not None
+        assert usage.cpu_percent == pytest.approx(50.0)
+
+    def test_cpu_is_none_without_a_previous_sample(self):
+        """Docker reports totals, so the first sample has no rate to compute."""
+        usage = self._sandbox_with_stats(self._stats(precpu_stats={})).resource_usage()
+
+        assert usage is not None
+        assert usage.cpu_percent is None
+        assert usage.memory_bytes == 2048
+
+    def test_cpu_is_none_when_the_system_counter_does_not_advance(self):
+        stats = self._stats()
+        stats["precpu_stats"]["system_cpu_usage"] = stats["cpu_stats"]["system_cpu_usage"]
+
+        usage = self._sandbox_with_stats(stats).resource_usage()
+
+        assert usage is not None
+        assert usage.cpu_percent is None
+
+    def test_missing_sections_yield_empty_usage(self):
+        usage = self._sandbox_with_stats({}).resource_usage()
+
+        assert usage is not None
+        assert usage.memory_bytes is None
+        assert usage.memory_limit_bytes is None
+        assert usage.cpu_percent is None
+        assert usage.pids is None
+
+    def test_non_numeric_fields_are_ignored(self):
+        usage = self._sandbox_with_stats(
+            {"memory_stats": {"usage": "lots"}, "pids_stats": {"current": None}}
+        ).resource_usage()
+
+        assert usage is not None
+        assert usage.memory_bytes is None
+        assert usage.pids is None
+
+    def test_stats_failure_reports_no_usage(self):
+        assert self._sandbox_with_stats(RuntimeError("daemon gone")).resource_usage() is None
+
+    def test_non_dict_stats_reports_no_usage(self):
+        assert self._sandbox_with_stats(["unexpected"]).resource_usage() is None
+
+
+class TestDockerFileTransfer:
+    """Tests for the tar helpers behind write()/read_bytes() (no daemon needed)."""
+
+    def test_archive_round_trips_content(self):
+        from pydantic_ai_backends.backends.docker.sandbox import (
+            _extract_single_file,
+            _single_file_archive,
         )
-        assert "npm install react react-dom" in dockerfile
-        assert "npm install -g" not in dockerfile
 
-    def test_apt_and_cargo(self):
-        apt = self._build(packages=["curl"], package_manager="apt")
-        assert "apt-get update && apt-get install -y curl" in apt
-        cargo = self._build(packages=["ripgrep"], package_manager="cargo")
-        assert "cargo install ripgrep" in cargo
+        archive = _single_file_archive("app.py", b"print('hi')")
 
-    def test_env_vars_quoted(self):
-        dockerfile = self._build(env_vars={"FOO": "bar baz"})
-        assert "ENV FOO='bar baz'" in dockerfile
+        assert _extract_single_file(archive) == b"print('hi')"
 
-    def test_rejects_package_command_injection(self):
-        with pytest.raises(ValueError, match="Invalid package name"):
-            self._build(packages=["foo; rm -rf /"])
+    def test_archive_entry_is_named_and_mode_0644(self):
+        from pydantic_ai_backends.backends.docker.sandbox import _single_file_archive
 
-    def test_rejects_empty_package(self):
-        with pytest.raises(ValueError, match="Invalid package name"):
-            self._build(packages=[""])
+        archive = _single_file_archive("app.py", b"body")
+        with tarfile.open(fileobj=archive, mode="r") as tar:
+            (entry,) = tar.getmembers()
 
-    def test_rejects_env_value_newline(self):
-        with pytest.raises(ValueError, match="newline"):
-            self._build(env_vars={"FOO": "line1\nRUN evil"})
+        assert entry.name == "app.py"
+        assert entry.mode == 0o644
+        assert entry.size == 4
 
-    def test_rejects_env_key(self):
-        with pytest.raises(ValueError, match="environment variable name"):
-            self._build(env_vars={"BAD KEY": "value"})
+    def test_extract_ignores_an_archive_without_regular_files(self):
+        from pydantic_ai_backends.backends.docker.sandbox import _extract_single_file
 
-    def test_rejects_workdir_metacharacters(self):
-        with pytest.raises(ValueError, match="work_dir"):
-            self._build(work_dir="/app; rm -rf /")
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as tar:
+            tar.addfile(tarfile.TarInfo(name="adir"))
+        buffer.seek(0)
 
-    def test_rejects_setup_command_newline(self):
-        with pytest.raises(ValueError, match="setup command"):
-            self._build(setup_commands=["echo hi\nRUN evil"])
+        assert _extract_single_file(buffer) == b""
 
-    def test_setup_command_emitted(self):
-        dockerfile = self._build(setup_commands=["echo hello"])
-        assert "RUN echo hello" in dockerfile
+    def test_extract_tolerates_a_corrupt_stream(self):
+        from pydantic_ai_backends.backends.docker.sandbox import _extract_single_file
 
-    def test_scoped_npm_package_allowed(self):
-        dockerfile = self._build(packages=["@types/react"], package_manager="npm", work_dir="/app")
-        assert "@types/react" in dockerfile
+        assert _extract_single_file(io.BytesIO(b"not a tar")) == b""

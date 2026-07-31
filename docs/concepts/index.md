@@ -116,4 +116,5 @@ Available presets: `DEFAULT_RULESET`, `PERMISSIVE_RULESET`, `READONLY_RULESET`, 
 | Unit tests | `StateBackend` | Testing agent behavior |
 | Safe code execution | `DockerSandbox` | Code interpreter |
 | Multi-user web apps | `SessionManager` | SaaS product |
+| App itself runs in a container | [`RemoteSandbox`](remote.md) | Self-hosted SaaS, no docker-in-docker |
 | Mixed (project + temp) | `CompositeBackend` | Complex workflows |

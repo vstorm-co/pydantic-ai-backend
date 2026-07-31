@@ -24,16 +24,34 @@ uv run mypy src/pydantic_ai_backends  # MyPy check
 
 ```
 src/pydantic_ai_backends/
-├── types.py          # FileData, FileInfo, WriteResult, EditResult, etc.
-├── protocol.py       # BackendProtocol, SandboxProtocol
-├── state.py          # StateBackend (in-memory)
-├── filesystem.py     # FilesystemBackend (real filesystem)
-├── composite.py      # CompositeBackend (routing)
-├── sandbox.py        # BaseSandbox, DockerSandbox, LocalSandbox
-├── session.py        # SessionManager
-├── runtimes.py       # RuntimeConfig, BUILTIN_RUNTIMES
-└── __init__.py       # Public API with lazy loading
+├── __init__.py       # Public API, lazily loaded
+├── types.py          # FileData, FileInfo, WriteResult, EditResult, RuntimeConfig
+├── protocol.py       # BackendProtocol, SandboxProtocol (+ async variants)
+├── adapter.py        # Sync -> async adapters, ensure_async()
+├── capability.py     # ConsoleCapability for pydantic-ai
+├── hashline.py       # Content-hash line editing
+├── _editing.py       # Shared `edit` replacement rules
+├── _limits.py        # Output and read ceilings
+├── _optional.py      # Optional-extra imports with install hints
+├── _paths.py         # Virtual path normalisation and validation
+├── _text.py          # Encoding detection, decoding, PDF extraction
+├── backends/
+│   ├── base.py       # BaseSandbox (shell-based defaults)
+│   ├── state.py      # StateBackend (in-memory)
+│   ├── local.py      # LocalBackend (real filesystem + shell)
+│   ├── composite.py  # PrefixRouter, CompositeBackend, AsyncCompositeBackend
+│   ├── daytona.py    # DaytonaSandbox
+│   ├── kubernetes.py # KubernetesPodSandbox
+│   ├── _background.py  # Long-lived process registry
+│   ├── _guard.py     # Synchronous permission enforcement
+│   └── docker/       # sandbox.py, session.py, runtimes.py, _client/_image/_stats
+├── permissions/      # types.py, checker.py, presets.py
+├── toolsets/         # console.py, descriptions.py, _content/_tracking/_ruleset
+└── remote/           # client.py (RemoteSandbox), server.py (sandboxd), wire.py
 ```
+
+Modules with a leading underscore are internal: no compatibility promise, and the
+names inside them are public so call sites read cleanly.
 
 ## Core Pattern
 

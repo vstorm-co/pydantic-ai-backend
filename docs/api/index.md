@@ -27,6 +27,7 @@ result = agent.run_sync("Create hello.py and run it", deps=Deps(backend=backend)
 | [Backends](backends.md) | LocalBackend, StateBackend, CompositeBackend |
 | [Docker](docker.md) | DockerSandbox, SessionManager, RuntimeConfig |
 | [Daytona](daytona.md) | DaytonaSandbox cloud sandbox |
+| [Remote](remote.md) | RemoteSandbox client, sandboxd service, wire protocol |
 | [Toolsets](toolsets.md) | Console toolset for pydantic-ai |
 | [Types](types.md) | Type definitions |
 

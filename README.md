@@ -6,7 +6,8 @@
 
 <p align="center">
   <b>Sandboxed execution & file tools for agents.</b><br>
-  A ready-made console toolset over State / Local / Docker / Daytona backends.
+  A ready-made console toolset over State / Local / Docker / Daytona backends,<br>
+  plus a sandbox service so your app never needs Docker access.
 </p>
 
 <p align="center">
@@ -29,7 +30,7 @@
 </p>
 
 <p align="center">
-  <b>Console toolset</b> &nbsp;&bull;&nbsp; <b>State / Local / Docker / Daytona</b> &nbsp;&bull;&nbsp; <b>Permission system</b> &nbsp;&bull;&nbsp; <b>Session manager</b> &nbsp;&bull;&nbsp; <b>Image support</b>
+  <b>Console toolset</b> &nbsp;&bull;&nbsp; <b>State / Local / Docker / Daytona / Remote</b> &nbsp;&bull;&nbsp; <b>Permission system</b> &nbsp;&bull;&nbsp; <b>Session manager</b> &nbsp;&bull;&nbsp; <b>No docker-in-docker</b>
 </p>
 
 ---
@@ -47,6 +48,7 @@
 | **Code Review Bot** | Read-only backend with grep/glob search |
 | **Secure Execution** | Permission system blocks dangerous operations |
 | **Testing/CI** | In-memory StateBackend for fast, isolated tests |
+| **Containerised SaaS** | `sandboxd` owns Docker so your app container never holds the socket |
 
 ## Installation
 
@@ -69,8 +71,14 @@ pip install pydantic-ai-backend[console]
 # Docker sandbox support
 pip install pydantic-ai-backend[docker]
 
+# Remote sandboxes — client only needs httpx
+pip install pydantic-ai-backend[remote]
+
+# The sandbox service itself (install in the service image, not your app)
+pip install pydantic-ai-backend[server]
+
 # Everything
-pip install pydantic-ai-backend[console,docker]
+pip install pydantic-ai-backend[console,docker,remote]
 ```
 
 ## Quick Start — ConsoleCapability (Recommended)
@@ -134,6 +142,7 @@ print(result.output)
 | `StateBackend` | In-memory | No | Testing, ephemeral sessions |
 | `LocalBackend` | Filesystem | Yes | Local development, CLI tools |
 | `DockerSandbox` | Container | Yes | Multi-user, untrusted code |
+| `RemoteSandbox` | Container, in another process | Yes | Containerised apps that must not hold the Docker socket |
 | `CompositeBackend` | Routed | Varies | Complex multi-source setups |
 
 ### In-Memory (StateBackend)
@@ -181,6 +190,113 @@ sandbox = DockerSandbox(
 )
 # Next time: finds existing container and reattaches
 ```
+
+### Remote Sandbox (RemoteSandbox + sandboxd)
+
+If your application runs in a container, giving it a Docker sandbox the obvious
+way means mounting `/var/run/docker.sock` — which is an unauthenticated API for
+**root on the host**. Docker-in-Docker needs `--privileged` and lands in the same
+place. So instead, one small service owns the socket and your app speaks HTTP to
+it:
+
+```python
+from pydantic_ai_backends.remote import RemoteSandbox
+
+sandbox = RemoteSandbox("http://sandboxd:8080", token="...", session_id="conv-42")
+print(sandbox.execute("python -c 'print(1+1)'").output)  # "2"
+sandbox.stop()
+```
+
+Nothing starts until it is used: the session — and the container behind it — opens
+on the first operation, so an agent granted a sandbox it never touches costs no
+container and not even a round trip.
+
+`RemoteSandbox` has the same synchronous surface as `DockerSandbox`, so it drops
+into a console toolset or `SessionManager` unchanged. Failures degrade (`b""`,
+`[]`, `Error: ...`) instead of raising — a socket blip must not end an agent run.
+
+The service is a few lines, and the client chooses **nothing** about the
+container:
+
+```python
+from pydantic_ai_backends.remote.server import SandboxdConfig, create_app
+
+app = create_app(
+    SandboxdConfig(
+        token="a-long-random-secret",
+        runtimes={"python": "python:3.12-slim"},   # allowlist; a request sends an alias
+        mem_limit="1g",
+        cpus=2.0,
+        network_mode="none",                       # sandboxes get no network by default
+        max_sessions=20,                           # beyond this: 429, not unbounded containers
+        workspace_root="/workspaces",              # files survive idle reaping
+    )
+)
+```
+
+```yaml
+services:
+  app:
+    environment: { SANDBOXD_URL: http://sandboxd:8080 }
+    networks: [backend]          # no docker.sock here
+
+  sandboxd:
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    networks: [backend]          # and no `ports:` either
+```
+
+Sessions can outlive the run that created them — pass `reuse=True` and the same
+`session_id` to reattach on a later turn, so an agent keeps the files it wrote.
+What the id keys on (a run, a chat, a user, an agent) is what decides who shares
+the sandbox.
+
+Three settings decide what survives an idle timeout, and they cover different
+things: `workspace_root` keeps the **work directory**, `persist_containers` keeps
+the container's **write layer** so `pip install` survives too, and
+`workspace_ttl` **reclaims** workspaces nobody opens any more. `stop(purge=True)`
+drops a session's files for good when its conversation is deleted.
+
+Users can see what the agent wrote — including in a conversation from last week,
+long after its sandbox was reaped. `WorkspaceArchive` reads the stored workspace
+off the host volume, so **no container starts**:
+
+```python
+from pydantic_ai_backends.remote import WorkspaceArchive
+
+archive = WorkspaceArchive("http://sandboxd:8080", token="...")
+for entry in archive.ls("conv-42"):
+    print(entry["path"], entry["size"])
+print(archive.read("conv-42", "report.md"))
+```
+
+Proxy it from your backend rather than handing a token to the browser — a session
+token authorizes `execute` too.
+
+### The operator dashboard
+
+`SandboxdConfig(ui_enabled=True)` serves a dashboard at `/ui` — one
+self-contained HTML file, no build step and no CDN, so it works offline and
+behind a strict CSP. Three views:
+
+**Sessions** — capacity at a glance, and every open session with its tenant, idle
+time and memory against its own ceiling.
+
+![sandboxd dashboard, sessions view](assets/dashboard-sessions.png)
+
+**Workspace** — one session at full width: a terminal with command history, a
+file browser, the activity log and session info.
+
+![sandboxd dashboard, workspace view with the terminal](assets/dashboard-workspace.png)
+
+**Runtimes & policy** — the allowlist with each runtime's image, ceilings and
+whether it gets a network, the config that produces it, and every limit in force.
+
+![sandboxd dashboard, runtimes and policy view](assets/dashboard-runtimes.png)
+
+Off by default: the page asks a human for the service token, and that token can
+start containers on the host.
+
+[Remote sandboxes →](https://vstorm-co.github.io/pydantic-ai-backend/concepts/remote/)
 
 ## Console Toolset
 
@@ -249,13 +365,25 @@ backend = LocalBackend(root_dir="/workspace", permissions=READONLY_RULESET)
 
 Pre-configured environments:
 
-| Runtime | Base Image | Packages |
-|---------|------------|----------|
-| `python-minimal` | python:3.12-slim | (none) |
-| `python-datascience` | python:3.12-slim | pandas, numpy, matplotlib, scikit-learn |
-| `python-web` | python:3.12-slim | fastapi, uvicorn, sqlalchemy, httpx |
-| `node-minimal` | node:20-slim | (none) |
-| `node-react` | node:20-slim | typescript, vite, react |
+| Runtime | Image | What it adds |
+|---|---|---|
+| `python-minimal` | python:3.12-slim | standard library only |
+| `python-datascience` | built on python:3.12-slim | pandas, numpy, matplotlib, scikit-learn, seaborn |
+| `python-analytics` | built on python:3.12-slim | duckdb, polars, pyarrow |
+| `python-web` | built on python:3.12-slim | fastapi, uvicorn, sqlalchemy, httpx |
+| `python-scraping` | built on python:3.12-slim | httpx, beautifulsoup4, lxml, markdownify |
+| `python-documents` | built on python:3.12-slim | pypdf, python-docx, openpyxl, pillow |
+| `node-minimal` | node:20-slim | nothing |
+| `node-typescript` | built on node:20-slim | typescript, tsx, vitest |
+| `node-react` | built on node:20-slim | typescript, vite, react, react-dom, @types/react |
+| `bun` | oven/bun:1-slim | Bun's own bundler, test runner and package manager |
+| `deno` | denoland/deno:alpine | TypeScript with no install step |
+| `go` | golang:1.23-alpine | Go toolchain |
+| `rust` | rust:1-slim | Rust toolchain with cargo |
+
+A runtime naming an `image` starts as fast as a pull. One naming a `base_image`
+plus `packages` builds an image on first use and hits the cache afterwards, which
+is worth it when installing them per session would dominate.
 
 Custom runtime:
 
@@ -305,10 +433,11 @@ sandbox = await manager.get_or_create("user-123")
 
 | Feature | Description |
 |---------|-------------|
-| **Multiple Backends** | In-memory, filesystem, Docker — same interface |
+| **Multiple Backends** | In-memory, filesystem, Docker, Daytona, Kubernetes, remote — same interface |
 | **Console Toolset** | Ready-to-use tools for pydantic-ai agents |
 | **Permission System** | Pattern-based access control with presets |
 | **Docker Isolation** | Safe execution of untrusted code |
+| **No Docker-in-Docker** | `sandboxd` holds the socket; your app holds a token |
 | **Session Management** | Multi-user support with workspace persistence |
 | **Image Support** | Multimodal models can see images via BinaryContent |
 | **Pre-built Runtimes** | Python and Node.js environments ready to go |

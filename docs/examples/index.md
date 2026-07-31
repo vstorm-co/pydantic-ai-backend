@@ -15,6 +15,7 @@ Complete examples showing how to use **pydantic-ai-backend** with [pydantic-ai](
 |---------|-------------|
 | [Docker Sandbox](docker-sandbox.md) | Safe code execution in Docker |
 | [Multi-User Web App](multi-user.md) | FastAPI server with user isolation |
+| [Remote Sandbox](remote-sandbox.md) | Docker sandboxes without Docker in your app container |
 
 ## Full Examples
 

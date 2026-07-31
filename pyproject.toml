@@ -44,6 +44,17 @@ kubernetes = [
     "kubernetes>=29.0.0",
     "httpx>=0.28.0",
 ]
+remote = [
+    "httpx>=0.28.0",
+]
+server = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "httpx>=0.28.0",
+    "docker>=7.0",
+    "pypdf>=5.1.0",
+    "chardet>=5.2.0",
+]
 dev = [
     "pydantic-ai-slim>=1.74.0",
     "pytest>=9.0.0",
@@ -58,6 +69,7 @@ dev = [
     "kubernetes>=29.0.0",
     "httpx>=0.28.0",
     "pillow>=10.0.0",
+    "fastapi>=0.115.0",
 ]
 
 [project.urls]

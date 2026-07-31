@@ -346,7 +346,7 @@ class TestDaytonaSandboxEdit:
         ]
 
         result = sandbox.edit("/f.py", "baz", "qux")
-        assert result.error == "String not found in file"
+        assert result.error == "String 'baz' not found in file"
 
     def test_edit_multiple_without_replace_all(self) -> None:
         sandbox = _make_sandbox()
@@ -390,7 +390,7 @@ class TestDaytonaSandboxEdit:
         # read_bytes swallows the error and returns b"", so the edit reports
         # that the search string was not found in the (empty) content.
         result = sandbox.edit("/f.py", "a", "b")
-        assert result.error == "String not found in file"
+        assert result.error == "String 'a' not found in file"
 
     def test_edit_write_error(self) -> None:
         sandbox = _make_sandbox()

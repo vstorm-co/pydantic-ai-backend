@@ -7,8 +7,8 @@ from pydantic_ai_backends.permissions.checker import (
     PermissionChecker,
     PermissionDeniedError,
     PermissionError,
-    _glob_to_regex,
-    _matches_pattern,
+    glob_to_regex,
+    matches_pattern,
 )
 from pydantic_ai_backends.permissions.types import (
     OperationPermissions,
@@ -22,34 +22,34 @@ class TestGlobToRegex:
 
     def test_simple_star(self):
         """Test single * matching."""
-        regex = _glob_to_regex("*.txt")
+        regex = glob_to_regex("*.txt")
         assert regex.match("file.txt")
         assert regex.match("test.txt")
         assert not regex.match("dir/file.txt")
 
     def test_double_star(self):
         """Test ** matching (recursive)."""
-        regex = _glob_to_regex("**/*.txt")
+        regex = glob_to_regex("**/*.txt")
         assert regex.match("file.txt")
         assert regex.match("dir/file.txt")
         assert regex.match("a/b/c/file.txt")
 
     def test_question_mark(self):
         """Test ? matching single character."""
-        regex = _glob_to_regex("file?.txt")
+        regex = glob_to_regex("file?.txt")
         assert regex.match("file1.txt")
         assert regex.match("fileA.txt")
         assert not regex.match("file12.txt")
 
     def test_exact_match(self):
         """Test exact filename matching."""
-        regex = _glob_to_regex(".env")
+        regex = glob_to_regex(".env")
         assert regex.match(".env")
         assert not regex.match(".env.local")
 
     def test_character_class(self):
         """Test [abc] character class matching."""
-        regex = _glob_to_regex("file[123].txt")
+        regex = glob_to_regex("file[123].txt")
         assert regex.match("file1.txt")
         assert regex.match("file2.txt")
         assert regex.match("file3.txt")
@@ -57,7 +57,7 @@ class TestGlobToRegex:
 
     def test_character_class_with_exclaim_negates(self):
         """Glob `[!abc]` negation maps to regex `[^abc]` (any char except)."""
-        regex = _glob_to_regex("file[!123].txt")
+        regex = glob_to_regex("file[!123].txt")
         # Negation: anything except 1, 2, 3 matches (including '!' itself,
         # which is not one of the negated characters).
         assert regex.match("file4.txt")
@@ -70,21 +70,21 @@ class TestGlobToRegex:
 
     def test_negated_character_class_caret(self):
         """Test [^abc] negated character class."""
-        regex = _glob_to_regex("file[^123].txt")
+        regex = glob_to_regex("file[^123].txt")
         assert regex.match("file4.txt")
         assert regex.match("fileA.txt")
         assert not regex.match("file1.txt")
 
     def test_character_class_with_bracket_first(self):
         """Test character class with ] as first character."""
-        regex = _glob_to_regex("file[]abc].txt")
+        regex = glob_to_regex("file[]abc].txt")
         assert regex.match("file].txt")
         assert regex.match("filea.txt")
         assert not regex.match("filed.txt")
 
     def test_unclosed_bracket_literal(self):
         """Test that unclosed [ is treated as literal."""
-        regex = _glob_to_regex("file[.txt")
+        regex = glob_to_regex("file[.txt")
         assert regex.match("file[.txt")
         assert not regex.match("file1.txt")
 
@@ -94,28 +94,28 @@ class TestMatchesPattern:
 
     def test_simple_match(self):
         """Test simple pattern matching."""
-        assert _matches_pattern("test.txt", "*.txt")
-        assert not _matches_pattern("test.py", "*.txt")
+        assert matches_pattern("test.txt", "*.txt")
+        assert not matches_pattern("test.py", "*.txt")
 
     def test_recursive_match(self):
         """Test recursive pattern matching with **."""
-        assert _matches_pattern("/home/user/.env", "**/.env")
-        assert _matches_pattern(".env", "**/.env")
-        assert _matches_pattern("project/config/.env", "**/.env")
+        assert matches_pattern("/home/user/.env", "**/.env")
+        assert matches_pattern(".env", "**/.env")
+        assert matches_pattern("project/config/.env", "**/.env")
 
     def test_env_patterns(self):
         """Test common .env patterns."""
         pattern = "**/.env*"
-        assert _matches_pattern("/home/user/.env", pattern)
-        assert _matches_pattern("/home/user/.env.local", pattern)
-        assert _matches_pattern(".env.production", pattern)
+        assert matches_pattern("/home/user/.env", pattern)
+        assert matches_pattern("/home/user/.env.local", pattern)
+        assert matches_pattern(".env.production", pattern)
 
     def test_secrets_pattern(self):
         """Test secrets pattern matching."""
         pattern = "**/secrets/**"
-        assert _matches_pattern("/home/user/secrets/api.key", pattern)
-        assert _matches_pattern("project/secrets/config.json", pattern)
-        assert not _matches_pattern("/home/user/config.json", pattern)
+        assert matches_pattern("/home/user/secrets/api.key", pattern)
+        assert matches_pattern("project/secrets/config.json", pattern)
+        assert not matches_pattern("/home/user/config.json", pattern)
 
 
 class TestPermissionChecker:
@@ -225,10 +225,10 @@ class TestPermissionChecker:
         )
         checker = PermissionChecker(ruleset)
 
-        found = checker._find_matching_rule("read", "/home/.env")
+        found = checker.find_matching_rule("read", "/home/.env")
         assert found is rule
 
-        not_found = checker._find_matching_rule("read", "/home/file.txt")
+        not_found = checker.find_matching_rule("read", "/home/file.txt")
         assert not_found is None
 
 

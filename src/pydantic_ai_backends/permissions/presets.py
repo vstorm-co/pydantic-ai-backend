@@ -1,14 +1,14 @@
-"""Pre-configured permission rulesets for common use cases."""
+"""Ready-made permission rulesets for common postures."""
 
 from __future__ import annotations
 
 from pydantic_ai_backends.permissions.types import (
     OperationPermissions,
+    PermissionAction,
     PermissionRule,
     PermissionRuleset,
 )
 
-# Common patterns for sensitive files
 SECRETS_PATTERNS = [
     "**/.env",
     "**/.env.*",
@@ -23,8 +23,8 @@ SECRETS_PATTERNS = [
     "**/.ssh/**",
     "**/.gnupg/**",
 ]
+"""Paths that typically hold credentials."""
 
-# Common patterns for system files
 SYSTEM_PATTERNS = [
     "/etc/**",
     "/var/**",
@@ -35,96 +35,85 @@ SYSTEM_PATTERNS = [
     "/sys/**",
     "/proc/**",
 ]
+"""Paths owned by the operating system rather than the workspace."""
 
-# Dangerous command patterns
 DANGEROUS_COMMANDS = [
     "rm -rf /*",
     "rm -rf /",
-    ":(){:|:&};:",  # Fork bomb
+    ":(){:|:&};:",  # Fork bomb.
     "dd if=*of=/dev/*",
     "mkfs*",
     "> /dev/sda",
     "chmod -R 777 /",
 ]
+"""Commands with no legitimate use inside a workspace."""
+
+SECRETS_DESCRIPTION = "Protect sensitive files"
+SYSTEM_DESCRIPTION = "Protect sensitive and system files"
+DANGEROUS_DESCRIPTION = "Block dangerous commands"
 
 
-def _create_deny_rules(patterns: list[str], description: str) -> list[PermissionRule]:
-    """Create deny rules for a list of patterns."""
-    return [PermissionRule(pattern=p, action="deny", description=description) for p in patterns]
+def deny_rules(patterns: list[str], description: str) -> list[PermissionRule]:
+    """Turn a list of patterns into deny rules sharing one description."""
+    return [
+        PermissionRule(pattern=pattern, action="deny", description=description)
+        for pattern in patterns
+    ]
 
-
-# =============================================================================
-# DEFAULT_RULESET
-# =============================================================================
-# Safe defaults: allow reads (except secrets), ask for writes/executes
 
 DEFAULT_RULESET = PermissionRuleset(
     default="ask",
     read=OperationPermissions(
         default="allow",
-        rules=_create_deny_rules(SECRETS_PATTERNS, "Protect sensitive files"),
+        rules=deny_rules(SECRETS_PATTERNS, SECRETS_DESCRIPTION),
     ),
     write=OperationPermissions(
         default="ask",
-        rules=_create_deny_rules(SECRETS_PATTERNS, "Protect sensitive files"),
+        rules=deny_rules(SECRETS_PATTERNS, SECRETS_DESCRIPTION),
     ),
     edit=OperationPermissions(
         default="ask",
-        rules=_create_deny_rules(SECRETS_PATTERNS, "Protect sensitive files"),
+        rules=deny_rules(SECRETS_PATTERNS, SECRETS_DESCRIPTION),
     ),
     execute=OperationPermissions(
         default="ask",
-        rules=_create_deny_rules(DANGEROUS_COMMANDS, "Block dangerous commands"),
+        rules=deny_rules(DANGEROUS_COMMANDS, DANGEROUS_DESCRIPTION),
     ),
     glob=OperationPermissions(default="allow"),
     grep=OperationPermissions(default="allow"),
     ls=OperationPermissions(default="allow"),
 )
-
-
-# =============================================================================
-# PERMISSIVE_RULESET
-# =============================================================================
-# Allow most operations, deny only dangerous ones
+"""Safe default: reads allowed except secrets, writes and commands ask first."""
 
 PERMISSIVE_RULESET = PermissionRuleset(
     default="allow",
     read=OperationPermissions(
         default="allow",
-        rules=_create_deny_rules(SECRETS_PATTERNS, "Protect sensitive files"),
+        rules=deny_rules(SECRETS_PATTERNS, SECRETS_DESCRIPTION),
     ),
     write=OperationPermissions(
         default="allow",
-        rules=_create_deny_rules(
-            SECRETS_PATTERNS + SYSTEM_PATTERNS, "Protect sensitive and system files"
-        ),
+        rules=deny_rules(SECRETS_PATTERNS + SYSTEM_PATTERNS, SYSTEM_DESCRIPTION),
     ),
     edit=OperationPermissions(
         default="allow",
-        rules=_create_deny_rules(
-            SECRETS_PATTERNS + SYSTEM_PATTERNS, "Protect sensitive and system files"
-        ),
+        rules=deny_rules(SECRETS_PATTERNS + SYSTEM_PATTERNS, SYSTEM_DESCRIPTION),
     ),
     execute=OperationPermissions(
         default="allow",
-        rules=_create_deny_rules(DANGEROUS_COMMANDS, "Block dangerous commands"),
+        rules=deny_rules(DANGEROUS_COMMANDS, DANGEROUS_DESCRIPTION),
     ),
     glob=OperationPermissions(default="allow"),
     grep=OperationPermissions(default="allow"),
     ls=OperationPermissions(default="allow"),
 )
-
-
-# =============================================================================
-# READONLY_RULESET
-# =============================================================================
-# Allow read operations only, deny writes and executes
+"""Everything allowed except secrets, system paths and dangerous commands."""
 
 READONLY_RULESET = PermissionRuleset(
     default="deny",
     read=OperationPermissions(
         default="allow",
-        rules=_create_deny_rules(SECRETS_PATTERNS, "Protect sensitive files"),
+        rules=deny_rules(SECRETS_PATTERNS, SECRETS_DESCRIPTION),
     ),
     write=OperationPermissions(default="deny"),
     edit=OperationPermissions(default="deny"),
@@ -133,45 +122,36 @@ READONLY_RULESET = PermissionRuleset(
     grep=OperationPermissions(default="allow"),
     ls=OperationPermissions(default="allow"),
 )
-
-
-# =============================================================================
-# STRICT_RULESET
-# =============================================================================
-# Everything requires explicit approval
+"""Reads, listings and searches only — nothing may change or run."""
 
 STRICT_RULESET = PermissionRuleset(
     default="ask",
     read=OperationPermissions(
         default="ask",
-        rules=_create_deny_rules(SECRETS_PATTERNS, "Protect sensitive files"),
+        rules=deny_rules(SECRETS_PATTERNS, SECRETS_DESCRIPTION),
     ),
     write=OperationPermissions(
         default="ask",
-        rules=_create_deny_rules(SECRETS_PATTERNS, "Protect sensitive files"),
+        rules=deny_rules(SECRETS_PATTERNS, SECRETS_DESCRIPTION),
     ),
     edit=OperationPermissions(
         default="ask",
-        rules=_create_deny_rules(SECRETS_PATTERNS, "Protect sensitive files"),
+        rules=deny_rules(SECRETS_PATTERNS, SECRETS_DESCRIPTION),
     ),
     execute=OperationPermissions(
         default="ask",
-        rules=_create_deny_rules(DANGEROUS_COMMANDS, "Block dangerous commands"),
+        rules=deny_rules(DANGEROUS_COMMANDS, DANGEROUS_DESCRIPTION),
     ),
     glob=OperationPermissions(default="ask"),
     grep=OperationPermissions(default="ask"),
     ls=OperationPermissions(default="ask"),
 )
-
-
-# =============================================================================
-# Factory functions for custom rulesets
-# =============================================================================
+"""Every operation requires explicit approval."""
 
 
 def create_ruleset(
     *,
-    default: str = "ask",
+    default: PermissionAction = "ask",
     allow_read: bool = True,
     allow_write: bool = False,
     allow_edit: bool = False,
@@ -181,49 +161,40 @@ def create_ruleset(
     allow_ls: bool = True,
     deny_secrets: bool = True,
 ) -> PermissionRuleset:
-    """Create a custom permission ruleset.
+    """Build a ruleset from per-operation allow/ask switches.
 
-    A convenience factory for creating rulesets with common configurations.
+    Each `allow_*` flag chooses between `"allow"` and `"ask"` for that
+    operation's default.
 
     Args:
-        default: Global default action ("allow", "deny", or "ask").
-        allow_read: Whether to allow read operations by default.
-        allow_write: Whether to allow write operations by default.
-        allow_edit: Whether to allow edit operations by default.
-        allow_execute: Whether to allow execute operations by default.
-        allow_glob: Whether to allow glob operations by default.
-        allow_grep: Whether to allow grep operations by default.
-        allow_ls: Whether to allow ls operations by default.
-        deny_secrets: Whether to deny access to sensitive file patterns.
-
-    Returns:
-        A configured PermissionRuleset.
+        default: Global default for operations with no configuration.
+        allow_read: Allow reads outright rather than asking.
+        allow_write: Allow writes outright rather than asking.
+        allow_edit: Allow edits outright rather than asking.
+        allow_execute: Allow commands outright rather than asking.
+        allow_glob: Allow globbing outright rather than asking.
+        allow_grep: Allow searching outright rather than asking.
+        allow_ls: Allow listings outright rather than asking.
+        deny_secrets: Deny the paths in `SECRETS_PATTERNS` for read/write/edit.
 
     Example:
         ```python
-        # Create a ruleset that allows reads and writes but asks for execute
-        ruleset = create_ruleset(
-            allow_read=True,
-            allow_write=True,
-            allow_execute=False,
-        )
+        ruleset = create_ruleset(allow_read=True, allow_write=True, allow_execute=False)
         ```
     """
-
-    def _action(allowed: bool) -> str:
-        return "allow" if allowed else "ask"
-
-    secret_rules = (
-        _create_deny_rules(SECRETS_PATTERNS, "Protect sensitive files") if deny_secrets else []
-    )
+    secret_rules = deny_rules(SECRETS_PATTERNS, SECRETS_DESCRIPTION) if deny_secrets else []
 
     return PermissionRuleset(
-        default=default,  # type: ignore[arg-type]
-        read=OperationPermissions(default=_action(allow_read), rules=secret_rules),  # type: ignore[arg-type]
-        write=OperationPermissions(default=_action(allow_write), rules=secret_rules),  # type: ignore[arg-type]
-        edit=OperationPermissions(default=_action(allow_edit), rules=secret_rules),  # type: ignore[arg-type]
-        execute=OperationPermissions(default=_action(allow_execute)),  # type: ignore[arg-type]
-        glob=OperationPermissions(default=_action(allow_glob)),  # type: ignore[arg-type]
-        grep=OperationPermissions(default=_action(allow_grep)),  # type: ignore[arg-type]
-        ls=OperationPermissions(default=_action(allow_ls)),  # type: ignore[arg-type]
+        default=default,
+        read=OperationPermissions(default=_allow_or_ask(allow_read), rules=secret_rules),
+        write=OperationPermissions(default=_allow_or_ask(allow_write), rules=secret_rules),
+        edit=OperationPermissions(default=_allow_or_ask(allow_edit), rules=secret_rules),
+        execute=OperationPermissions(default=_allow_or_ask(allow_execute)),
+        glob=OperationPermissions(default=_allow_or_ask(allow_glob)),
+        grep=OperationPermissions(default=_allow_or_ask(allow_grep)),
+        ls=OperationPermissions(default=_allow_or_ask(allow_ls)),
     )
+
+
+def _allow_or_ask(allowed: bool) -> PermissionAction:
+    return "allow" if allowed else "ask"

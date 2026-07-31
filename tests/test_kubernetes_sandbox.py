@@ -209,7 +209,26 @@ class FakeTimeout:
 fake_httpx = types.ModuleType("httpx")
 fake_httpx.Client = FakeHttpClient
 fake_httpx.Timeout = FakeTimeout
-sys.modules["httpx"] = fake_httpx
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _stub_httpx_module():
+    """Swap in the fake httpx for this module only.
+
+    `KubernetesPodSandbox` imports httpx lazily inside `__init__`, so the stub
+    only has to exist while these tests run. Installing it at import time
+    instead left it in `sys.modules` for every module collected afterwards,
+    breaking anything that needs the real library.
+    """
+    real = sys.modules.get("httpx")
+    sys.modules["httpx"] = fake_httpx
+    try:
+        yield
+    finally:
+        if real is None:
+            sys.modules.pop("httpx", None)
+        else:
+            sys.modules["httpx"] = real
 
 
 # Now import the SUT.
@@ -568,7 +587,7 @@ def test_edit_string_not_found() -> None:
     sb = _started()
     sb._http.handler = _fs_handler({"/f.txt": "alpha beta"})
     result = sb.edit("/f.txt", "zzz", "x")
-    assert result.error == "String not found in file"
+    assert result.error == "String 'zzz' not found in file"
 
 
 def test_edit_multiple_occurrences_requires_replace_all() -> None:
@@ -606,14 +625,3 @@ def test_edit_surfaces_write_error() -> None:
     sb._http.handler = handler
     result = sb.edit("/f.txt", "alpha", "beta")
     assert result.error is not None
-
-
-def test_edit_surfaces_read_bytes_error_sentinel(monkeypatch: pytest.MonkeyPatch) -> None:
-    # mode="api" delegates read_bytes to BaseSandbox, which returns a
-    # b"[Error: ...]" sentinel on a failed `cat`. edit() must surface it
-    # as the error instead of treating the text as file content.
-    sb = _started()
-    monkeypatch.setattr(sb, "read_bytes", lambda path: b"[Error: cat: missing: No such file]")
-    result = sb.edit("/missing", "a", "b")
-    assert result.error is not None
-    assert result.error.startswith("[Error:")

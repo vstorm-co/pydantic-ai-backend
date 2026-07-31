@@ -1,4 +1,9 @@
-"""Base sandbox class for isolated command execution."""
+"""Abstract sandbox with shell-based defaults for every file operation.
+
+A subclass only has to implement `execute` and `edit`. Everything else is
+derived from shell commands, which is enough for any sandbox that offers a
+shell; subclasses with a native file API override the methods it covers.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,6 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Any
 
 from pydantic_ai_backends.types import (
     EditResult,
@@ -17,96 +21,43 @@ from pydantic_ai_backends.types import (
     WriteResult,
 )
 
-if TYPE_CHECKING:
-    pass
-
-CODE_EXT: frozenset[str] = frozenset(
-    {
-        "py",
-        "js",
-        "java",
-        "cpp",
-        "c",
-        "h",
-        "cs",
-        "rb",
-        "go",
-        "rs",
-        "php",
-        "html",
-        "css",
-        "sh",
-        "sql",
-        "ts",
-        "jsx",
-        "tsx",
-    }
-)
-TEXT_EXT: frozenset[str] = frozenset(
-    {"txt", "log", "md", "json", "xml", "csv", "yaml", "yml", "toml"}
-)
-
-
-def _get_chardet() -> Any:  # pragma: no cover
-    """Lazy import for chardet."""
-    try:
-        import chardet
-
-        return chardet
-    except ImportError as e:
-        raise ImportError(
-            "chardet package required for encoding detection. "
-            "Install with: pip install pydantic-ai-backend[docker]"
-        ) from e
-
-
-def _get_pypdf() -> Any:  # pragma: no cover
-    """Lazy import for pypdf."""
-    try:
-        import pypdf
-
-        return pypdf
-    except ImportError as e:
-        raise ImportError(
-            "pypdf package required for PDF reading. "
-            "Install with: pip install pydantic-ai-backend[docker]"
-        ) from e
+LS_FIELD_COUNT = 9
+"""Fields in a `ls -la` line before the name; fewer means it is not an entry."""
 
 
 class BaseSandbox(ABC):
-    """Abstract base class for sandbox backends.
+    """Base class for sandboxes that expose a shell.
 
-    Sandboxes provide isolated environments for executing commands and
-    managing files. Subclasses must implement the execute() method.
+    Args:
+        sandbox_id: Unique identifier for this sandbox. Generated when omitted.
     """
 
     def __init__(self, sandbox_id: str | None = None):
-        """Initialize the sandbox.
-
-        Args:
-            sandbox_id: Unique identifier for this sandbox. Generated if not provided.
-        """
-        self._id = sandbox_id or str(uuid.uuid4())  # pragma: no cover
-        self._last_activity = time.time()  # pragma: no cover
+        self._id = sandbox_id or str(uuid.uuid4())
+        self._last_activity = time.time()
 
     @property
     def id(self) -> str:
         """Unique identifier for this sandbox."""
-        return self._id  # pragma: no cover
+        return self._id
+
+    @property
+    def last_activity(self) -> float:
+        """Wall clock of the last operation, which idle cleanup reaps against."""
+        return self._last_activity
+
+    def touch(self) -> None:
+        """Record activity, so idle cleanup does not reap a sandbox in use."""
+        self._last_activity = time.time()
 
     def start(self) -> None:  # pragma: no cover  # noqa: B027
-        """Start the sandbox.
+        """Start the sandbox eagerly.
 
-        Override for eager initialization. The default is a no-op
-        (sandboxes start lazily on first operation).
+        The default is a no-op, since sandboxes start on first use.
         """
 
     def is_alive(self) -> bool:  # pragma: no cover
-        """Check if the sandbox is running.
-
-        Returns:
-            True if the sandbox is running and responsive, False otherwise.
-        """
+        """Whether the sandbox is running and responsive."""
         return False
 
     def stop(self) -> None:  # pragma: no cover  # noqa: B027
@@ -116,14 +67,11 @@ class BaseSandbox(ABC):
     def execute(
         self, command: str, timeout: int | None = None
     ) -> ExecuteResponse:  # pragma: no cover
-        """Execute a command in the sandbox.
+        """Run a command in the sandbox.
 
         Args:
             command: Command to execute.
             timeout: Maximum execution time in seconds.
-
-        Returns:
-            ExecuteResponse with output, exit code, and truncation status.
         """
         ...
 
@@ -131,130 +79,106 @@ class BaseSandbox(ABC):
     def edit(  # pragma: no cover
         self, path: str, old_string: str, new_string: str, replace_all: bool = False
     ) -> EditResult:
-        """Edit a file by replacing strings.
+        """Edit a file by replacing a string.
 
         Args:
             path: File path to edit.
             old_string: String to find and replace.
             new_string: Replacement string.
-            replace_all: If True, replace all occurrences. Otherwise, replace only first.
-
-        Returns:
-            EditResult with path, error, or occurrence count.
+            replace_all: Replace every occurrence instead of only the first.
         """
         ...
 
     def exists(self, path: str) -> bool:  # pragma: no cover
-        """Check existence via `test -f` in the sandbox shell."""
-        result = self.execute(f"test -f {shlex.quote(path)}", timeout=5)
-        return result.exit_code == 0
+        """Whether `path` is a regular file, via `test -f`."""
+        return self.execute(f"test -f {shlex.quote(path)}", timeout=5).exit_code == 0
 
     def ls_info(self, path: str) -> list[FileInfo]:  # pragma: no cover
-        """List files using ls command."""
-        path = shlex.quote(path)
-        result = self.execute(f"ls -la {path}")
+        """List one directory using `ls -la`."""
+        quoted_path = shlex.quote(path)
+        result = self.execute(f"ls -la {quoted_path}")
         if result.exit_code != 0:
             return []
 
         entries: list[FileInfo] = []
-        for line in result.output.strip().split("\n")[1:]:  # Skip total line
-            if not line.strip():
-                continue
-
+        for line in result.output.strip().split("\n")[1:]:  # The first line is the total.
             parts = line.split()
-            if len(parts) < 9:
+            if len(parts) < LS_FIELD_COUNT:
                 continue
 
-            perms = parts[0]
-            size = int(parts[4]) if parts[4].isdigit() else None
             name = " ".join(parts[8:])
-
             if name in (".", ".."):
                 continue
 
-            full_path = f"{path.rstrip('/')}/{name}"
             entries.append(
                 FileInfo(
                     name=name,
-                    path=full_path,
-                    is_dir=perms.startswith("d"),
-                    size=size,
+                    path=f"{quoted_path.rstrip('/')}/{name}",
+                    is_dir=parts[0].startswith("d"),
+                    size=int(parts[4]) if parts[4].isdigit() else None,
                 )
             )
 
         return sorted(entries, key=lambda x: (not x["is_dir"], x["name"]))
 
     def read_bytes(self, path: str) -> bytes:  # pragma: no cover
-        """Read raw bytes from a file using the cat command.
+        """Read a whole file with `cat`.
 
-        Returns empty bytes on failure (missing file, permission denied, etc.)
-        to match LocalBackend/StateBackend, rather than encoding an error
-        message into the returned payload (which a caller could not
-        distinguish from real file content beginning with "[Error:").
+        Returns:
+            The content, or `b""` on any failure — matching `LocalBackend` and
+            `StateBackend`. Encoding an error message into the payload would
+            leave the caller unable to tell it from real file content.
         """
-        path = shlex.quote(path)
-        result = self.execute(f"cat {path}")
-
+        result = self.execute(f"cat {shlex.quote(path)}")
         if result.exit_code != 0:
             return b""
-
         return result.output.encode("utf-8", errors="replace")
 
     def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:  # pragma: no cover
-        """Read file using awk with real file line numbers.
+        """Read a slice of a file, numbered by its real line positions.
 
-        Line numbers reflect the original file positions (starting at
-        `offset + 1`), matching StateBackend/LocalBackend. A plain
-        `sed ... | cat -n` would renumber the slice from 1 and be off by
-        `offset`.
+        `awk` rather than `sed | cat -n`, because the latter renumbers the slice
+        from 1 and would be off by `offset`.
         """
-        start = offset + 1  # 1-indexed
+        start = offset + 1
         end = offset + limit
-
-        path = shlex.quote(path)
         result = self.execute(
-            f"awk 'NR>={start} && NR<={end} {{ printf \"%6d\\t%s\\n\", NR, $0 }}' {path}"
+            f"awk 'NR>={start} && NR<={end} {{ printf \"%6d\\t%s\\n\", NR, $0 }}' "
+            f"{shlex.quote(path)}"
         )
 
         if result.exit_code != 0:
             return f"Error: {result.output}"
-
         if result.truncated:
             return result.output + "\n\n... (output truncated)"
-
         return result.output
 
     def write(self, path: str, content: str) -> WriteResult:  # pragma: no cover
-        """Write file using cat with a quoted heredoc.
+        """Write a file with `cat` and a quoted heredoc.
 
-        The heredoc delimiter is quoted (`<< 'DELIM'`) so the shell performs
-        no expansion inside the body; the content is therefore written
-        verbatim with no escaping. Pre-escaping backslash/$/backtick here would
-        corrupt the content (doubled backslashes, literal `\\$` etc.).
+        The delimiter is quoted (`<< 'DELIM'`) so the shell expands nothing
+        inside the body and the content lands verbatim. Pre-escaping
+        backslashes or `$` here would corrupt it instead.
         """
-        # Use a unique random delimiter to avoid colliding with a body line.
+        # Random delimiter so it cannot collide with a line of the content.
         delimiter = f"EOF_{uuid.uuid4().hex[:8]}"
-
         quoted_path = shlex.quote(path)
-        command = (
+
+        result = self.execute(
             f"mkdir -p $(dirname {quoted_path}) && cat > {quoted_path} << '{delimiter}'\n"
             f"{content}\n"
             f"{delimiter}"
         )
-        result = self.execute(command)
-
         if result.exit_code != 0:
             return WriteResult(error=result.output)
-
         return WriteResult(path=path)
 
     def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:  # pragma: no cover
-        """Find files using the find command.
+        """Match files with `find`.
 
-        The path is shlex-quoted exactly once (not re-wrapped in single
-        quotes). The pattern is matched with `-path '*/{pattern}'` so that
-        basename globs like `*.py` match files anywhere under the search
-        root, since `find -path` matches the whole pathname.
+        The pattern is matched as `-path '*/{pattern}'` so a basename glob like
+        `*.py` matches files anywhere under the root, since `find -path` tests
+        the whole pathname.
         """
         quoted_path = shlex.quote(path)
         quoted_pattern = shlex.quote(f"*/{pattern}")
@@ -263,19 +187,10 @@ class BaseSandbox(ABC):
         if result.exit_code != 0:
             return []
 
-        entries: list[FileInfo] = []
-        for full_file_path in result.output.splitlines():
-            file_path = PurePosixPath(full_file_path)
-            name = file_path.name
-            entries.append(
-                FileInfo(
-                    name=name,
-                    path=str(file_path),
-                    is_dir=False,
-                    size=None,
-                )
-            )
-
+        entries = [
+            FileInfo(name=file.name, path=str(file), is_dir=False, size=None)
+            for file in (PurePosixPath(line) for line in result.output.splitlines())
+        ]
         return sorted(entries, key=lambda x: x["path"])
 
     def grep_raw(  # pragma: no cover
@@ -285,44 +200,30 @@ class BaseSandbox(ABC):
         glob: str | None = None,
         ignore_hidden: bool = True,
     ) -> list[GrepMatch] | str:
-        """Search using grep command."""
-        search_path = path or "."
-
-        search_path = shlex.quote(search_path)
-
+        """Search file contents with `grep`."""
         options = ["-rn"]
         if ignore_hidden:
             options.extend(["--exclude='.*'", "--exclude-dir='.*'"])
         if glob:
             options.append(f"--include='{glob}'")
 
-        options_str = " ".join(options)
-        cmd = f"grep {options_str} '{pattern}' {search_path}"
+        result = self.execute(f"grep {' '.join(options)} '{pattern}' {shlex.quote(path or '.')}")
 
-        result = self.execute(cmd)
-
-        if result.exit_code == 1:  # No matches
+        if result.exit_code == 1:  # grep exits 1 when nothing matched.
             return []
         if result.exit_code != 0:
             return f"Error: {result.output}"
 
         matches: list[GrepMatch] = []
         for line in result.output.strip().split("\n"):
-            if not line:
-                continue
-
-            # Parse grep output: file:line:content
+            # grep prints file:line:content.
             parts = line.split(":", 2)
-            if len(parts) >= 3:
-                try:
-                    matches.append(
-                        GrepMatch(
-                            path=parts[0],
-                            line_number=int(parts[1]),
-                            line=parts[2],
-                        )
-                    )
-                except ValueError:
-                    continue
+            if len(parts) < 3:
+                continue
+            try:
+                line_number = int(parts[1])
+            except ValueError:
+                continue
+            matches.append(GrepMatch(path=parts[0], line_number=line_number, line=parts[2]))
 
         return matches
