@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.17] - 2026-08-01
+
 ### Added
 
 - **`AsyncBaseSandbox`** — the shell-derived file operations, for a sandbox that is natively asynchronous. `BaseSandbox` gives a subclass every operation for the price of implementing `execute` and `edit`, but only synchronously, so an author reaching a sandbox over asyncssh or an async HTTP SDK got nothing from it and hand-wrote all eight: `ls -la` and its parsing, `awk` for a numbered read, `find -path` for a glob, `grep -rn`, a heredoc write. That is a reimplementation of a class we already ship, and one that drifts from ours the moment either changes. Both bases now derive their operations from one internal module, so a subclass implements `execute` and `edit` — as coroutines — and nothing else.
