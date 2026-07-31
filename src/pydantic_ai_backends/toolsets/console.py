@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 from pydantic_ai import RunContext
+from pydantic_ai.exceptions import (
+    ApprovalRequired,
+    CallDeferred,
+    ModelRetry,
+    SkipModelRequest,
+    SkipToolExecution,
+    SkipToolValidation,
+    UserError,
+)
 from pydantic_ai.toolsets import FunctionToolset
 
 from pydantic_ai_backends.adapter import ensure_async
@@ -110,6 +120,62 @@ class _ConsoleToolsetTestAttrs(Protocol):
     _console_execute_impl: Callable[..., Awaitable[str]]
 
 
+_ToolFn = TypeVar("_ToolFn", bound=Callable[..., Awaitable[Any]])
+
+_PASSES_THROUGH = (
+    ModelRetry,
+    ApprovalRequired,
+    CallDeferred,
+    SkipToolExecution,
+    SkipToolValidation,
+    SkipModelRequest,
+    UserError,
+)
+"""Exceptions that must reach pydantic-ai rather than becoming a tool error.
+
+None of the first six is a failure — they steer the run. `ModelRetry` asks the
+model to try again with a message, `ApprovalRequired` suspends the call for a
+human, `CallDeferred` hands it to an external process, and the `Skip*` family
+short-circuits execution or validation. Swallowing `ModelRetry` in particular
+turns a retry into a dead end the model cannot recover from.
+
+`UserError` is the seventh for the opposite reason: it means the library was
+misused, and reporting a programming error to the model as a failed file
+operation hides the bug instead of surfacing it. It subclasses `RuntimeError`, so
+the narrower `except RuntimeError` this replaced was already swallowing it.
+
+They share no base class, hence the list. All seven exist as of the
+`pydantic-ai-slim` floor this package declares.
+"""
+
+
+def _degrade_on_error(fn: _ToolFn) -> _ToolFn:
+    """Turn a backend's exception into a failed tool call, not a failed run.
+
+    The protocol asks a backend to return its failures rather than raise, and
+    every bundled one does — so this only ever catches a *third-party* backend
+    arriving with whatever its transport raises: `OSError` from a dropped socket,
+    an SSH or HTTP client's own error class, `TimeoutError`. Left uncaught, any of
+    those escapes the tool and ends the agent's run, which is a far worse outcome
+    than the model being told one operation failed and choosing what to do next.
+
+    Applied to every tool rather than the few that looked risky: the file
+    operations reach the same backend over the same transport as `execute` does,
+    so there is no reason one would raise and another would not.
+    """
+
+    @functools.wraps(fn)
+    async def guarded(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await fn(*args, **kwargs)
+        except _PASSES_THROUGH:
+            raise
+        except Exception as exc:
+            return f"Error: {exc}"
+
+    return cast("_ToolFn", guarded)
+
+
 def create_console_toolset(  # noqa: C901
     id: str | None = None,
     backend: BackendProtocol | AsyncBackendProtocol | None = None,
@@ -211,6 +277,7 @@ def create_console_toolset(  # noqa: C901
         return None
 
     @toolset.tool(description=described.get("ls", LS_DESCRIPTION))
+    @_degrade_on_error
     async def ls(  # pragma: no cover
         ctx: RunContext[ConsoleDeps],
         path: str = ".",
@@ -236,6 +303,7 @@ def create_console_toolset(  # noqa: C901
     if edit_format == "hashline":
 
         @toolset.tool(description=described.get("read_file", HASHLINE_READ_FILE_DESCRIPTION))
+        @_degrade_on_error
         async def read_file(  # pragma: no cover
             ctx: RunContext[ConsoleDeps],
             path: str,
@@ -266,6 +334,7 @@ def create_console_toolset(  # noqa: C901
     else:
 
         @toolset.tool(description=described.get("read_file", READ_FILE_DESCRIPTION))
+        @_degrade_on_error
         async def read_file(  # pragma: no cover
             ctx: RunContext[ConsoleDeps],
             path: str,
@@ -293,6 +362,7 @@ def create_console_toolset(  # noqa: C901
         description=described.get("write_file", WRITE_FILE_DESCRIPTION),
         requires_approval=write_approval,
     )
+    @_degrade_on_error
     async def write_file(  # pragma: no cover
         ctx: RunContext[ConsoleDeps],
         path: str,
@@ -319,6 +389,7 @@ def create_console_toolset(  # noqa: C901
             description=described.get("hashline_edit", HASHLINE_EDIT_DESCRIPTION),
             requires_approval=write_approval,
         )
+        @_degrade_on_error
         async def hashline_edit(  # pragma: no cover
             ctx: RunContext[ConsoleDeps],
             path: str,
@@ -374,6 +445,7 @@ of replacing it.
             description=described.get("edit_file", EDIT_FILE_DESCRIPTION),
             requires_approval=write_approval,
         )
+        @_degrade_on_error
         async def edit_file(  # pragma: no cover
             ctx: RunContext[ConsoleDeps],
             path: str,
@@ -408,6 +480,7 @@ the old_string must appear exactly once in the file.
             return f"Edited {result.path}: replaced {result.occurrences} occurrence(s)"
 
     @toolset.tool(description=described.get("glob", GLOB_DESCRIPTION))
+    @_degrade_on_error
     async def glob(  # pragma: no cover
         ctx: RunContext[ConsoleDeps],
         pattern: str,
@@ -430,6 +503,7 @@ the old_string must appear exactly once in the file.
         return "\n".join(lines)
 
     @toolset.tool(description=described.get("grep", GREP_DESCRIPTION))
+    @_degrade_on_error
     async def grep(  # pragma: no cover
         ctx: RunContext[ConsoleDeps],
         pattern: str,
@@ -478,6 +552,7 @@ the old_string must appear exactly once in the file.
             description=described.get("execute", EXECUTE_DESCRIPTION),
             requires_approval=execute_approval,
         )
+        @_degrade_on_error
         async def execute(
             ctx: RunContext[ConsoleDeps],
             command: str,
@@ -498,16 +573,7 @@ for long-running builds or test suites.
             if hasattr(target, "execute_enabled") and not target.execute_enabled:  # pyright: ignore[reportAttributeAccessIssue]
                 return "Error: Shell execution is disabled for this backend"
 
-            try:
-                result = await async_backend.execute(command, timeout)  # pyright: ignore[reportAttributeAccessIssue]
-            except Exception as e:
-                # Every bundled backend returns its failures, so only a
-                # third-party one reaches here — and it reaches here with
-                # whatever its transport raises: `OSError` from a dropped
-                # socket, an SSH or HTTP client's own error, `TimeoutError`.
-                # Narrowing this to `RuntimeError` made every one of those end
-                # the agent's run instead of failing one tool call.
-                return f"Error: {e}"
+            result = await async_backend.execute(command, timeout)  # pyright: ignore[reportAttributeAccessIssue]
 
             output = result.output
             if result.truncated:
@@ -530,6 +596,7 @@ for long-running builds or test suites.
             description=described.get("run_in_background", RUN_IN_BACKGROUND_DESCRIPTION),
             requires_approval=execute_approval,
         )
+        @_degrade_on_error
         async def run_in_background(  # pragma: no cover
             ctx: RunContext[ConsoleDeps],
             command: str,
@@ -542,10 +609,7 @@ for long-running builds or test suites.
             sandbox = background(ctx)
             if sandbox is None:
                 return _NO_BACKGROUND_SUPPORT
-            try:
-                handle = await sandbox.execute_background(command)
-            except Exception as e:
-                return f"Error: {e}"
+            handle = await sandbox.execute_background(command)
             return (
                 f"Started background shell {handle.shell_id} (pid {handle.pid}).\n"
                 f"Use read_output('{handle.shell_id}') to follow its output and "
@@ -553,6 +617,7 @@ for long-running builds or test suites.
             )
 
         @toolset.tool(description=described.get("read_output", READ_OUTPUT_DESCRIPTION))
+        @_degrade_on_error
         async def read_output(  # pragma: no cover
             ctx: RunContext[ConsoleDeps],
             shell_id: str,
@@ -575,6 +640,7 @@ for long-running builds or test suites.
             description=described.get("kill_shell", KILL_SHELL_DESCRIPTION),
             requires_approval=execute_approval,
         )
+        @_degrade_on_error
         async def kill_shell(  # pragma: no cover
             ctx: RunContext[ConsoleDeps],
             shell_id: str,
@@ -592,6 +658,7 @@ for long-running builds or test suites.
             return f"Background shell {shell_id} was already finished or unknown."
 
         @toolset.tool(description=described.get("list_shells", LIST_SHELLS_DESCRIPTION))
+        @_degrade_on_error
         async def list_shells(  # pragma: no cover
             ctx: RunContext[ConsoleDeps],
         ) -> str:

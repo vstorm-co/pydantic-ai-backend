@@ -911,3 +911,127 @@ class TestShutdownStopsSessionsConcurrently:
         assert manager.session_count == 0
         assert "did not stop cleanly" in caplog.text
         assert "bad" in caplog.text
+
+
+class AsyncSandbox:
+    """A natively async sandbox, the shape `AsyncBaseSandbox` gives you."""
+
+    def __init__(self, session_id: str) -> None:
+        self._id = session_id
+        self.last_activity = time.time()
+        self.dead = False
+        self.starts = 0
+        self.stops = 0
+
+    async def start(self) -> None:
+        self.starts += 1
+
+    async def stop(self) -> None:
+        self.stops += 1
+
+    async def is_alive(self) -> bool:
+        return not self.dead
+
+
+class TestAsyncSandboxLifecycle:
+    """A coroutine handed to a thread never runs, and nothing says so."""
+
+    async def test_start_is_awaited_not_thread_wrapped(self):
+        manager = SessionManager(sandbox_factory=AsyncSandbox)
+
+        sandbox = await manager.get_or_create("s1")
+
+        assert sandbox.starts == 1
+
+    async def test_liveness_is_awaited_not_taken_as_truthy(self):
+        """A coroutine object is truthy, so a dead sandbox looked alive for ever."""
+        manager = SessionManager(sandbox_factory=AsyncSandbox)
+        first = await manager.get_or_create("s1")
+        first.dead = True
+
+        second = await manager.get_or_create("s1")
+
+        assert second is not first
+
+    async def test_a_sandbox_found_dead_is_stopped_before_being_dropped(self):
+        """It still holds an SSH connection or an HTTP pool; dropping it leaks."""
+        manager = SessionManager(sandbox_factory=AsyncSandbox)
+        first = await manager.get_or_create("s1")
+        first.dead = True
+
+        await manager.get_or_create("s1")
+
+        assert first.stops == 1
+
+    async def test_a_failing_stop_on_a_dead_sandbox_is_ignored(self):
+        """It is already dead, so its stop failing is expected, not fatal."""
+
+        class Stubborn(AsyncSandbox):
+            async def stop(self) -> None:
+                raise OSError("transport already gone")
+
+        manager = SessionManager(sandbox_factory=Stubborn)
+        first = await manager.get_or_create("s1")
+        first.dead = True
+
+        replaced = await manager.get_or_create("s1")
+
+        assert replaced is not first
+
+    async def test_release_awaits_stop(self):
+        manager = SessionManager(sandbox_factory=AsyncSandbox)
+        sandbox = await manager.get_or_create("s1")
+
+        assert await manager.release("s1") is True
+        assert sandbox.stops == 1
+
+    async def test_shutdown_awaits_every_stop(self):
+        manager = SessionManager(sandbox_factory=AsyncSandbox)
+        for index in range(3):
+            await manager.get_or_create(f"s-{index}")
+        held = [manager.sessions[f"s-{index}"] for index in range(3)]
+
+        assert await manager.shutdown() == 3
+        assert [sandbox.stops for sandbox in held] == [1, 1, 1]
+
+    async def test_a_sync_sandbox_still_goes_to_a_thread(self):
+        """The blocking path must not regress into running on the loop."""
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="pooled") as pool:
+            manager = SessionManager(
+                sandbox_factory=TestLifecycleCallsAreOffloaded.Blocking, executor=pool
+            )
+            sandbox = await manager.get_or_create("s1")
+
+        assert sandbox.start_thread is not None
+        assert sandbox.start_thread.startswith("pooled")
+
+
+class TestAliveOf:
+    """The helper both the manager and the service resolve liveness with."""
+
+    async def test_a_sync_sandbox_is_read_directly(self):
+        from pydantic_ai_backends.backends.docker.session import alive_of
+
+        class Sync:
+            def is_alive(self) -> bool:
+                return True
+
+        assert await alive_of(Sync()) is True
+
+    async def test_an_async_sandbox_is_awaited(self):
+        from pydantic_ai_backends.backends.docker.session import alive_of
+
+        class Async:
+            async def is_alive(self) -> bool:
+                return False
+
+        assert await alive_of(Async()) is False
+
+    async def test_a_truthy_non_bool_is_normalised(self):
+        from pydantic_ai_backends.backends.docker.session import alive_of
+
+        class Odd:
+            def is_alive(self):
+                return "running"
+
+        assert await alive_of(Odd()) is True

@@ -6,6 +6,16 @@ from pathlib import Path
 
 import pytest
 from pydantic_ai import BinaryContent, RunContext
+from pydantic_ai.exceptions import (
+    ApprovalRequired,
+    CallDeferred,
+    ModelRetry,
+    SkipModelRequest,
+    SkipToolExecution,
+    SkipToolValidation,
+    UserError,
+)
+from pydantic_ai.messages import ModelResponse
 
 from pydantic_ai_backends import (
     LocalBackend,
@@ -727,3 +737,122 @@ class TestExecuteToolFailureHandling:
                 raise AssertionError("must not be reached")
 
         assert "disabled" in await self._execute(Disabled())
+
+
+class TestEveryToolDegradesOnABackendException:
+    """The file tools reach the same backend over the same transport as execute."""
+
+    class Hostile:
+        """A third-party backend whose transport drops on every call."""
+
+        def __init__(self, error: Exception) -> None:
+            self._error = error
+
+        async def read_bytes(self, path: str) -> bytes:  # marks it async
+            raise self._error
+
+        async def exists(self, path: str) -> bool:
+            raise self._error
+
+        async def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
+            raise self._error
+
+        async def write(self, path: str, content: str | bytes):
+            raise self._error
+
+        async def edit(self, path, old_string, new_string, replace_all=False):
+            raise self._error
+
+        async def ls_info(self, path: str):
+            raise self._error
+
+        async def glob_info(self, pattern: str, path: str = "/"):
+            raise self._error
+
+        async def grep_raw(self, pattern, path=None, glob=None, ignore_hidden=True):
+            raise self._error
+
+        async def execute(self, command: str, timeout: int | None = None):
+            raise self._error
+
+    @pytest.mark.parametrize(
+        "tool,args",
+        [
+            ("ls", {"path": "/"}),
+            ("read_file", {"path": "/f.txt"}),
+            ("write_file", {"path": "/f.txt", "content": "x"}),
+            ("edit_file", {"path": "/f.txt", "old_string": "a", "new_string": "b"}),
+            ("glob", {"pattern": "*.py"}),
+            ("grep", {"pattern": "todo"}),
+            ("execute", {"command": "echo hi"}),
+        ],
+    )
+    async def test_a_transport_error_is_reported_not_raised(self, tool: str, args: dict):
+        """Uncaught, any of these ends the agent's run instead of one tool call."""
+        backend = self.Hostile(OSError("connection reset by peer"))
+        toolset = create_console_toolset()
+        ctx = _make_ctx(MockDeps(backend=backend))
+
+        out = await toolset.tools[tool].function_schema.function(ctx, **args)  # type: ignore[attr-defined]
+
+        assert isinstance(out, str)
+        assert out.startswith("Error: ")
+        assert "connection reset by peer" in out
+
+    async def test_the_guard_preserves_a_successful_result(self):
+        backend = StateBackend()
+        backend.write("/f.txt", "hello")
+        toolset = create_console_toolset()
+        ctx = _make_ctx(MockDeps(backend=backend))
+
+        out = await toolset.tools["ls"].function_schema.function(ctx, path="/")  # type: ignore[attr-defined]
+
+        assert "f.txt" in out
+
+
+class TestControlFlowExceptionsPassThrough:
+    """pydantic-ai steers a run through exceptions; the guard must not eat them."""
+
+    @staticmethod
+    def _backend(error: Exception):
+        class Raising:
+            async def read_bytes(self, path: str) -> bytes:
+                raise error
+
+            async def ls_info(self, path: str):
+                raise error
+
+            async def execute(self, command: str, timeout: int | None = None):
+                raise error
+
+        return Raising()
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ModelRetry("try a different path"),
+            ApprovalRequired(),
+            CallDeferred(),
+            SkipToolExecution("a canned result"),
+            SkipToolValidation({"path": "/"}),
+            SkipModelRequest(ModelResponse(parts=[])),
+            UserError("the library was misused"),
+        ],
+    )
+    @pytest.mark.parametrize("tool,args", [("ls", {"path": "/"}), ("execute", {"command": "x"})])
+    async def test_it_reaches_the_framework(self, error, tool: str, args: dict):
+        """`ModelRetry` swallowed becomes a dead end the model cannot recover from."""
+        toolset = create_console_toolset()
+        ctx = _make_ctx(MockDeps(backend=self._backend(error)))
+
+        with pytest.raises(type(error)):
+            await toolset.tools[tool].function_schema.function(ctx, **args)  # type: ignore[attr-defined]
+
+    async def test_an_ordinary_transport_error_still_degrades(self):
+        """The passthrough must not turn the guard off for real failures."""
+        toolset = create_console_toolset()
+        ctx = _make_ctx(MockDeps(backend=self._backend(OSError("socket gone"))))
+
+        out = await toolset.tools["ls"].function_schema.function(ctx, path="/")  # type: ignore[attr-defined]
+
+        assert out.startswith("Error: ")
