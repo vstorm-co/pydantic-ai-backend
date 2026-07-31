@@ -1798,6 +1798,9 @@
       ["Runtimes warmed at startup", policy.prewarm
         ? '<dd class="is-good">yes</dd>'
         : '<dd class="is-off">no — the first session builds</dd>'],
+      ["Isolation", policy.oci_runtime
+        ? '<dd class="is-good">' + esc(policy.oci_runtime) + ", own syscall or kernel boundary</dd>"
+        : '<dd class="is-off">daemon default — shares the host kernel</dd>'],
       ["Image builder", policy.buildkit
         ? '<dd class="is-good">BuildKit, caches kept between builds</dd>'
         : '<dd class="is-off">classic, no cache mounts</dd>'],

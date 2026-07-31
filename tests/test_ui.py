@@ -181,6 +181,7 @@ class TestWireCoupling:
             "tmpfs_size",
             "prewarm",
             "buildkit",
+            "oci_runtime",
         }
 
         assert read <= set(wire.ServicePolicy.model_fields)

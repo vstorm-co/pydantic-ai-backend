@@ -296,6 +296,8 @@ class RuntimePolicy(BaseModel):
     cpu_shares: int | None = None
     pids_limit: int | None = None
     network_mode: str | None = None
+    oci_runtime: str | None = None
+    """Low-level runtime this one runs under, or `None` for the daemon's default."""
 
 
 class ServicePolicy(BaseModel):
@@ -319,6 +321,9 @@ class ServicePolicy(BaseModel):
     cpu_shares: int | None = None
     pids_limit: int | None = None
     network_mode: str | None = None
+    oci_runtime: str | None = None
+    """Default low-level runtime, or `None` for whatever the daemon defaults to."""
+
     work_dir: str = ""
     idle_timeout: int = 0
     execute_timeout: int = 0

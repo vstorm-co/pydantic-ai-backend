@@ -122,6 +122,13 @@ class SandboxRuntime:
         pids_limit: Process ceiling.
         network_mode: Docker network mode. Naming anything but `"none"` here is
             how one runtime is allowed the network while others are not.
+        oci_runtime: Low-level runtime the daemon starts this runtime's
+            containers with — `"runsc"` for gVisor, `"kata"` for a microVM per
+            container. Unlike the ceilings above this changes the *isolation
+            boundary*, and it is per runtime for the same reason they are: the
+            runtime that installs arbitrary packages off the network is the one
+            worth paying gVisor's I/O overhead for, while a plain shell is not.
+            Must be registered with the daemon; `None` takes its default.
     """
 
     image: str | None = None
@@ -132,6 +139,7 @@ class SandboxRuntime:
     cpu_shares: int | None = None
     pids_limit: int | None = None
     network_mode: str | None = None
+    oci_runtime: str | None = None
 
     def __post_init__(self) -> None:
         if (self.image is None) == (self.runtime is None):
@@ -337,6 +345,13 @@ class SandboxdConfig:
         network_mode: Default Docker network mode. `"none"` because a service
             handing sandboxes to untrusted code should not give them the network
             unless that is a deliberate choice, per runtime or service-wide.
+        oci_runtime: Default low-level runtime for every sandbox, overridable per
+            runtime. `None` takes the daemon's default — which is the right
+            default for us to ship, because naming a runtime the host has not
+            registered turns every session into a `502`. Set it to `"runsc"` once
+            gVisor is installed to put every sandbox behind a userspace syscall
+            layer; `crun` belongs in the daemon's own config instead, since it is
+            a faster `runc` rather than a different isolation model.
         work_dir: Working directory inside every sandbox. Applied to built
             runtimes as well, overriding whatever their `RuntimeConfig` says, so
             that one directory is where the workspace volume is mounted, what
@@ -402,6 +417,7 @@ class SandboxdConfig:
     pids_limit: int | None = 512
     tmpfs_size: str | None = "64m"
     network_mode: str | None = "none"
+    oci_runtime: str | None = None
     work_dir: str = "/workspace"
     workspace_root: str | None = None
     persist_containers: bool = False
@@ -462,6 +478,9 @@ class SandboxdConfig:
             ),
             "network_mode": (
                 runtime.network_mode if runtime.network_mode is not None else self.network_mode
+            ),
+            "oci_runtime": (
+                runtime.oci_runtime if runtime.oci_runtime is not None else self.oci_runtime
             ),
         }
 
@@ -1065,6 +1084,7 @@ class _Service:
             cpu_shares=config.cpu_shares,
             pids_limit=config.pids_limit,
             network_mode=config.network_mode,
+            oci_runtime=config.oci_runtime,
             work_dir=config.work_dir,
             idle_timeout=config.idle_timeout,
             execute_timeout=config.execute_timeout,
@@ -1091,6 +1111,7 @@ class _Service:
             cpu_shares=limits["cpu_shares"],
             pids_limit=limits["pids_limit"],
             network_mode=limits["network_mode"],
+            oci_runtime=limits["oci_runtime"],
         )
 
     async def listing(self, usage: bool) -> wire.SessionList:

@@ -103,6 +103,7 @@ class DockerSandbox(BaseSandbox):
         pids_limit: int | None = DEFAULT_PIDS_LIMIT,
         tmpfs: dict[str, str] | None = None,
         max_read_bytes: int = DEFAULT_MAX_READ_BYTES,
+        oci_runtime: str | None = None,
     ):
         """Initialize the sandbox without starting its container.
 
@@ -149,6 +150,22 @@ class DockerSandbox(BaseSandbox):
             max_read_bytes: Largest file `read`/`read_bytes`/`edit` will pull
                 out of the container. Oversized files are refused instead of
                 being buffered into the host's memory.
+            oci_runtime: Low-level runtime the daemon starts this container
+                with — Docker's `--runtime`. `None` takes the daemon's default,
+                normally `runc`.
+
+                This is the one knob that changes the *isolation boundary*
+                rather than a resource ceiling, which is why it is per sandbox:
+                `"runsc"` (gVisor) moves syscall handling into userspace and
+                `"kata"` gives the container its own kernel in a microVM, while
+                a container under plain `runc` shares the host's. Untrusted
+                model-written code is exactly the workload that argues for one
+                of them.
+
+                The runtime must already be registered with the daemon in
+                `/etc/docker/daemon.json`; naming an unregistered one makes the
+                daemon refuse to start the container. See the installation docs
+                for the host side, including `crun` as a faster drop-in default.
         """
         super().__init__(session_id or sandbox_id)
 
@@ -165,6 +182,7 @@ class DockerSandbox(BaseSandbox):
         self._pids_limit = pids_limit
         self._tmpfs = tmpfs or {}
         self._max_read_bytes = max_read_bytes
+        self._oci_runtime = oci_runtime
         self._alive = False
         self._alive_checked_at: float | None = None
 
@@ -282,6 +300,8 @@ class DockerSandbox(BaseSandbox):
             kwargs["cpu_shares"] = self._cpu_shares
         if self._tmpfs:
             kwargs["tmpfs"] = {path: _with_exec(options) for path, options in self._tmpfs.items()}
+        if self._oci_runtime is not None:
+            kwargs["runtime"] = self._oci_runtime
         return kwargs
 
     def is_alive(self) -> bool:

@@ -1364,3 +1364,34 @@ class TestReadWriteEditAgainstAStub:
 
         assert "not found" in sandbox.read("x.txt")
         assert sandbox.read_bytes("x.txt") == b""
+
+
+class TestOciRuntimePassthrough:
+    """Docker takes one low-level runtime per container; we have to pass it."""
+
+    def test_it_reaches_containers_run(self, stub_docker):
+        sandbox = _sandbox(oci_runtime="runsc")
+
+        sandbox.start()
+
+        _, kwargs = stub_docker.containers.runs[0]
+        assert kwargs["runtime"] == "runsc"
+
+    def test_it_is_absent_by_default(self, stub_docker):
+        """Absent, not `None` — the daemon rejects an empty runtime name."""
+        sandbox = _sandbox()
+
+        sandbox.start()
+
+        _, kwargs = stub_docker.containers.runs[0]
+        assert "runtime" not in kwargs
+
+    def test_it_composes_with_the_resource_ceilings(self, stub_docker):
+        sandbox = _sandbox(oci_runtime="kata", mem_limit="1g", network_mode="none")
+
+        sandbox.start()
+
+        _, kwargs = stub_docker.containers.runs[0]
+        assert kwargs["runtime"] == "kata"
+        assert kwargs["mem_limit"] == "1g"
+        assert kwargs["network_mode"] == "none"

@@ -28,6 +28,7 @@ from pydantic_ai_backends import StateBackend
 from pydantic_ai_backends.remote import RemoteSandbox, wire
 from pydantic_ai_backends.remote.server import (
     SandboxdConfig,
+    SandboxRuntime,
     _session_volumes,
     create_app,
 )
@@ -2051,6 +2052,7 @@ class TestPerRuntimeCeilings:
             "cpu_shares": None,
             "pids_limit": 128,
             "network_mode": "none",
+            "oci_runtime": None,
         }
 
     def test_a_runtime_may_raise_above_the_service_default(self):
@@ -3210,3 +3212,48 @@ class TestDashboardIsReadOnce:
             assert client.get("/ui").status_code == 200
 
         assert reads == [1]
+
+
+class TestOciRuntimeSelection:
+    """Which low-level runtime the daemon starts a sandbox with."""
+
+    def test_the_service_default_reaches_every_sandbox(self):
+        config = SandboxdConfig(
+            token=SERVICE_TOKEN,
+            runtimes={"python": "python:3.12-slim"},
+            oci_runtime="runsc",
+        )
+
+        limits = config.limits_for(config.resolve_runtime("python")[1])
+
+        assert limits["oci_runtime"] == "runsc"
+
+    def test_a_runtime_overrides_the_service_default(self):
+        """The runtime that installs off the network is the one worth gVisor."""
+        config = SandboxdConfig(
+            token=SERVICE_TOKEN,
+            runtimes={
+                "shell": SandboxRuntime(image="alpine:3"),
+                "scraping": SandboxRuntime(image="python:3.12-slim", oci_runtime="runsc"),
+            },
+            default_runtime="shell",
+            oci_runtime=None,
+        )
+
+        assert config.limits_for(config.resolve_runtime("shell")[1])["oci_runtime"] is None
+        assert config.limits_for(config.resolve_runtime("scraping")[1])["oci_runtime"] == "runsc"
+
+    def test_the_policy_reports_the_effective_runtime(self):
+        """An operator needs the one in force, not the one before the override."""
+        harness = Harness(oci_runtime="runsc")
+        with harness.client() as client:
+            policy = wire.ServicePolicy.model_validate(
+                client.get("/policy", headers=_service_headers()).json()
+            )
+
+        assert policy.oci_runtime == "runsc"
+        assert {entry.oci_runtime for entry in policy.runtimes} == {"runsc"}
+
+    def test_it_defaults_to_the_daemon_choice(self):
+        """Naming a runtime the host has not registered turns sessions into 502s."""
+        assert SandboxdConfig(token=SERVICE_TOKEN).oci_runtime is None
