@@ -342,6 +342,74 @@ additionally implement
 See the [API Reference](../api/index.md#protocols) for the full rendered
 protocol signatures.
 
+### Failure contract
+
+Every protocol method **returns** its failures and never raises. A backend sits
+in an agent's tool path, so an exception escaping one does not fail an
+operation — it ends the run.
+
+| Method | On failure |
+|---|---|
+| `execute` | `ExecuteResponse(output="Error: ...", exit_code=1)` |
+| `read` | a string starting `Error: ` or `[Error` |
+| `read_bytes` | `b""` — **never** an error message |
+| `write`, `edit` | the result's `error` field set |
+| `exists` | `False` |
+| `ls_info`, `glob_info` | `[]` |
+| `grep_raw` | a string, as opposed to a `list[GrepMatch]` |
+
+`read_bytes` returns empty rather than describing the problem because its caller
+cannot tell an error message from real file content — code staging a screenshot
+would treat `b"Error: not found"` as the image. `read` can afford a message,
+because its result is text destined for a model either way.
+
+## Writing your own backend
+
+Subclass a base rather than implementing the protocol by hand: both derive every
+file operation from shell commands, so you implement `execute` and `edit` and get
+`ls_info`, `read`, `read_bytes`, `write`, `glob_info`, `grep_raw` and `exists`
+for free — and they honour the failure contract above for you.
+
+Which base depends on how the sandbox is reached, not on preference:
+
+```python
+from pydantic_ai_backends import AsyncBaseSandbox, BaseSandbox, EditResult, ExecuteResponse
+
+
+class MySandbox(BaseSandbox):
+    """A sandbox reached synchronously — a socket, a subprocess."""
+
+    def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse: ...
+
+    def edit(self, path, old_string, new_string, replace_all=False) -> EditResult: ...
+
+
+class MyAsyncSandbox(AsyncBaseSandbox):
+    """A sandbox reached over an async transport — asyncssh, an async HTTP SDK."""
+
+    async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse: ...
+
+    async def edit(self, path, old_string, new_string, replace_all=False) -> EditResult: ...
+```
+
+!!! warning "Do not wrap async code in a sync facade"
+
+    If the sandbox is natively async, subclass `AsyncBaseSandbox`. Writing a
+    synchronous facade over async code so that
+    [`ensure_async`][pydantic_ai_backends.adapter.ensure_async] adapts it will
+    deadlock under load: `ensure_async` cannot see through the facade, so it
+    wraps it in a thread adapter and each call occupies a worker thread that then
+    has to hop back onto the event loop to reach the real async code. A sandbox
+    whose own recovery path also needs a thread — reprovisioning a dead
+    container — waits for a thread that is waiting for the loop, and starves the
+    pool for every other agent sharing it.
+
+    `ensure_async` recognises `AsyncBaseSandbox` by its class and passes it
+    through untouched, so the toolset awaits your coroutines directly with no
+    threads involved. A backend that inherits from nothing of ours is still
+    recognised if `read_bytes` is a coroutine function — see
+    [`is_async_backend`][pydantic_ai_backends.adapter.is_async_backend].
+
 ## Path Security
 
 All backends validate paths to prevent directory traversal:

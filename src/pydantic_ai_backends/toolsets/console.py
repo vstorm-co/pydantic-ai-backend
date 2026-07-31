@@ -107,6 +107,7 @@ class _ConsoleToolsetTestAttrs(Protocol):
 
     _console_default_ignore_hidden: bool
     _console_grep_impl: Callable[..., Awaitable[str]]
+    _console_execute_impl: Callable[..., Awaitable[str]]
 
 
 def create_console_toolset(  # noqa: C901
@@ -477,7 +478,7 @@ the old_string must appear exactly once in the file.
             description=described.get("execute", EXECUTE_DESCRIPTION),
             requires_approval=execute_approval,
         )
-        async def execute(  # pragma: no cover
+        async def execute(
             ctx: RunContext[ConsoleDeps],
             command: str,
             timeout: int | None = DEFAULT_EXECUTE_TIMEOUT,
@@ -499,7 +500,13 @@ for long-running builds or test suites.
 
             try:
                 result = await async_backend.execute(command, timeout)  # pyright: ignore[reportAttributeAccessIssue]
-            except RuntimeError as e:
+            except Exception as e:
+                # Every bundled backend returns its failures, so only a
+                # third-party one reaches here — and it reaches here with
+                # whatever its transport raises: `OSError` from a dropped
+                # socket, an SSH or HTTP client's own error, `TimeoutError`.
+                # Narrowing this to `RuntimeError` made every one of those end
+                # the agent's run instead of failing one tool call.
                 return f"Error: {e}"
 
             output = result.output
@@ -508,6 +515,9 @@ for long-running builds or test suites.
             if result.exit_code is not None and result.exit_code != 0:
                 return f"Command failed (exit code {result.exit_code}):\n{output}"
             return str(output)
+
+        # Exposed for the test suite.
+        cast(_ConsoleToolsetTestAttrs, toolset)._console_execute_impl = execute
 
     if include_execute and include_background:
 
@@ -534,7 +544,7 @@ for long-running builds or test suites.
                 return _NO_BACKGROUND_SUPPORT
             try:
                 handle = await sandbox.execute_background(command)
-            except (RuntimeError, PermissionError) as e:
+            except Exception as e:
                 return f"Error: {e}"
             return (
                 f"Started background shell {handle.shell_id} (pid {handle.pid}).\n"

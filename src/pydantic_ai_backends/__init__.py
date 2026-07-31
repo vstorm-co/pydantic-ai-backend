@@ -74,6 +74,7 @@ from pydantic_ai_backends.types import (
 )
 
 if TYPE_CHECKING:
+    from pydantic_ai_backends.backends.base import AsyncBaseSandbox
     from pydantic_ai_backends.backends.daytona import DaytonaSandbox
     from pydantic_ai_backends.backends.docker import (
         BUILTIN_RUNTIMES,
@@ -167,7 +168,7 @@ _LAZY_MODULES: dict[str, tuple[str, ...]] = {
         "get_console_system_prompt",
     ),
     "pydantic_ai_backends.capability": ("ConsoleCapability",),
-    "pydantic_ai_backends.backends.base": ("BaseSandbox",),
+    "pydantic_ai_backends.backends.base": ("AsyncBaseSandbox", "BaseSandbox"),
     "pydantic_ai_backends.backends.daytona": ("DaytonaSandbox",),
     "pydantic_ai_backends.backends.docker.sandbox": ("DockerSandbox",),
     "pydantic_ai_backends.backends.docker.session": ("SandboxFactory", "SessionManager"),
@@ -221,6 +222,7 @@ __all__ = [
     "BackgroundOutput",
     "BackgroundProcessInfo",
     "BackgroundSandboxProtocol",
+    "AsyncBaseSandbox",
     "BaseSandbox",
     "CompositeBackend",
     "ConsoleCapability",

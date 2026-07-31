@@ -418,3 +418,76 @@ async def test_ensure_async_keeps_an_existing_adapter_and_its_executor() -> None
         assert executor.submissions == 1
     finally:
         executor.shutdown(wait=True)
+
+
+class TestAsyncDetection:
+    """Mistaking an async backend for a sync one is a silent, expensive bug."""
+
+    def test_an_async_base_sandbox_passes_through_untouched(self):
+        """Recognised by its base class, with no method-shape guessing."""
+        from pydantic_ai_backends import AsyncBaseSandbox, ensure_async
+        from pydantic_ai_backends.types import EditResult, ExecuteResponse
+
+        class SSHish(AsyncBaseSandbox):
+            async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
+                return ExecuteResponse(output="", exit_code=0)
+
+            async def edit(self, path, old, new, replace_all=False) -> EditResult:
+                return EditResult(path=path)
+
+        sandbox = SSHish()
+
+        assert ensure_async(sandbox) is sandbox
+
+    def test_a_hand_rolled_async_backend_is_still_recognised(self):
+        """The fallback, for a backend that inherits from nothing of ours."""
+        from pydantic_ai_backends import ensure_async
+        from pydantic_ai_backends.adapter import is_async_backend
+
+        class HandRolled:
+            async def read_bytes(self, path: str) -> bytes:
+                return b""
+
+            async def execute(self, command: str, timeout: int | None = None): ...
+
+        backend = HandRolled()
+
+        assert is_async_backend(backend) is True
+        assert ensure_async(backend) is backend
+
+    def test_the_legacy_read_bytes_name_is_recognised_too(self):
+        """Wrapped in a thread adapter, its coroutine would be returned as bytes."""
+        from pydantic_ai_backends import ensure_async
+        from pydantic_ai_backends.adapter import is_async_backend
+
+        class LegacyNames:
+            async def _read_bytes(self, path: str) -> bytes:
+                return b""
+
+            async def execute(self, command: str, timeout: int | None = None): ...
+
+        backend = LegacyNames()
+
+        assert is_async_backend(backend) is True
+        assert ensure_async(backend) is backend
+
+    def test_a_sync_backend_is_not_mistaken_for_an_async_one(self):
+        from pydantic_ai_backends import StateBackend
+        from pydantic_ai_backends.adapter import is_async_backend
+
+        assert is_async_backend(StateBackend()) is False
+
+    def test_a_sync_base_sandbox_is_not_mistaken_either(self):
+        """Both bases have identical method names, so only the class tells them apart."""
+        from pydantic_ai_backends import BaseSandbox
+        from pydantic_ai_backends.adapter import is_async_backend
+        from pydantic_ai_backends.types import EditResult, ExecuteResponse
+
+        class Blocking(BaseSandbox):
+            def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
+                return ExecuteResponse(output="", exit_code=0)
+
+            def edit(self, path, old, new, replace_all=False) -> EditResult:
+                return EditResult(path=path)
+
+        assert is_async_backend(Blocking()) is False
