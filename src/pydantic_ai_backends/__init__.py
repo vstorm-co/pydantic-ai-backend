@@ -47,6 +47,7 @@ from pydantic_ai_backends.adapter import (
     AsyncBackgroundSandboxAdapter,
     AsyncSandboxAdapter,
     ensure_async,
+    is_async_backend,
 )
 from pydantic_ai_backends.backends.composite import AsyncCompositeBackend, CompositeBackend
 from pydantic_ai_backends.backends.local import LocalBackend
@@ -282,6 +283,7 @@ __all__ = [
     "create_console_toolset",
     "create_ruleset",
     "ensure_async",
+    "is_async_backend",
     "format_hashline_output",
     "get_console_system_prompt",
     "get_runtime",

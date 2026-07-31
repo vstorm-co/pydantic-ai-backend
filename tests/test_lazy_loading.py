@@ -54,3 +54,12 @@ class TestLazyLoading:
         with pytest.raises(AttributeError) as excinfo:
             _ = pydantic_ai_backends.NonExistentClass
         assert "NonExistentClass" in str(excinfo.value)
+
+
+def test_adapter_helpers_are_importable_from_the_root():
+    """0.2.17 documented `is_async_backend` but exported only its sibling."""
+    import pydantic_ai_backends as package
+
+    for name in ("ensure_async", "is_async_backend"):
+        assert name in package.__all__
+        assert getattr(package, name).__name__ == name
