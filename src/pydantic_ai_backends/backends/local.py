@@ -6,18 +6,18 @@ import asyncio
 import contextlib
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import uuid
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
+from pydantic_ai_backends._editing import Replacement, replace_in_content
+from pydantic_ai_backends._limits import DEFAULT_READ_LIMIT, MAX_EXECUTE_OUTPUT_BYTES
+from pydantic_ai_backends.backends._background import BackgroundProcesses
+from pydantic_ai_backends.backends._guard import PermissionGuard
 from pydantic_ai_backends.types import (
     BackgroundHandle,
     BackgroundOutput,
@@ -30,106 +30,84 @@ from pydantic_ai_backends.types import (
 )
 
 if TYPE_CHECKING:
-    from pydantic_ai_backends.permissions.checker import PermissionChecker
+    from pydantic_ai_backends.permissions.checker import (
+        AskCallback,
+        AskFallback,
+        PermissionChecker,
+    )
     from pydantic_ai_backends.permissions.types import (
         PermissionOperation,
         PermissionRuleset,
     )
 
-# Callback type for asking user permission
-AskCallback = Callable[["PermissionOperation", str, str], Awaitable[bool]]
+DEFAULT_EXECUTE_TIMEOUT = 120
 
-# Fallback behavior when ask_callback is not provided
-AskFallback = Literal["deny", "error"]
+MAX_READ_OUTPUT_CHARS = 200_000
+"""Character ceiling for one `read`.
 
-MAX_EXECUTE_OUTPUT = 100_000
+A default read that exceeds it is truncated to a page; an *explicit*
+offset/limit that still exceeds it errors, so the agent narrows its request
+instead of flooding the context.
+"""
 
-#: Char ceiling for a single `read` result. A default read (no explicit
-#: offset/limit) that exceeds this is truncated to a page; an *explicit*
-#: offset/limit that still exceeds it errors, so the agent narrows its request
-#: instead of flooding the context.
-MAX_READ_OUTPUT = 200_000
-#: The default `limit` for `read` — used to tell an explicit request apart from
-#: the default one (the tool always forwards this value when the caller didn't
-#: ask for a specific range).
-DEFAULT_READ_LIMIT = 2000
-
-#: Directories the Python grep fallback skips by default. ripgrep already honors
-#: .gitignore; this gives the fallback comparable "don't search build junk"
-#: behavior so a grep without ripgrep doesn't drown in node_modules/caches.
 GREP_SKIP_DIRS = frozenset(
     {
+        ".eggs",
         ".git",
-        "node_modules",
-        "__pycache__",
-        ".venv",
-        "venv",
         ".mypy_cache",
         ".pytest_cache",
         ".ruff_cache",
         ".tox",
-        "dist",
+        ".venv",
+        "__pycache__",
         "build",
-        ".eggs",
+        "dist",
+        "node_modules",
+        "venv",
     }
 )
+"""Directories the Python grep fallback skips.
+
+ripgrep already honors .gitignore; this gives the fallback comparable
+"don't search build junk" behavior so a grep without ripgrep does not drown in
+node_modules and caches.
+"""
+
+GREP_TIMEOUT_SECONDS = 30
 
 
-def _grep_path_ignored(parts: tuple[str, ...], ignore_hidden: bool) -> bool:
-    """True if a path should be skipped. With ``ignore_hidden`` (the default),
-    hidden and build/cache dirs are skipped; with ``ignore_hidden=False`` nothing
-    is skipped ("search everything", including node_modules/.venv)."""
+def is_ignored_path(parts: tuple[str, ...], ignore_hidden: bool) -> bool:
+    """Whether the Python grep fallback should skip a path.
+
+    With `ignore_hidden` (the default) hidden and build/cache directories are
+    skipped; without it nothing is, so "search everything" really does.
+    """
     if not ignore_hidden:
         return False
     return any(part in GREP_SKIP_DIRS or part.startswith(".") for part in parts)
 
 
-@dataclass
-class _BackgroundProcess:
-    """A long-lived process tracked by :class:`LocalBackend`.
-
-    stdout/stderr are streamed to files so output can be drained incrementally
-    (by byte offset) without blocking on a pipe.
-    """
-
-    shell_id: str
-    command: str
-    popen: subprocess.Popen[bytes]
-    stdout_path: Path
-    stderr_path: Path
-    stdout_pos: int = field(default=0)
-    stderr_pos: int = field(default=0)
-
-
-def _normalize_newlines(content: str) -> str:
-    """Collapse carriage returns so text-mode writes don't double them.
-
-    ``Path.write_text`` opens in text mode, where only ``\\n`` is translated to
-    ``os.linesep`` on write while existing ``\\r`` is left untouched. Content
-    that already contains ``\\r\\n`` would become ``\\r\\r\\n`` on Windows.
-    Stripping ``\\r`` lets text mode re-add clean platform-native endings.
-    """
-    return content.replace("\r", "")
+def shell_argv(command: str) -> list[str]:
+    """Wrap a command string for the platform's shell."""
+    return ["cmd", "/c", command] if sys.platform == "win32" else ["sh", "-c", command]
 
 
 class LocalBackend:
     """Local filesystem backend with optional shell execution.
 
-    Combines file operations (Python native) with optional shell command
-    execution (subprocess). File operations can be restricted to specific
-    directories using `allowed_directories`.
+    File operations are native Python; `execute` shells out. Both are confined
+    to `allowed_directories`, and can be narrowed further with a permission
+    ruleset.
 
     Example:
         ```python
         from pydantic_ai_backends import LocalBackend
 
-        # Full access with shell execution
         backend = LocalBackend(root_dir="/workspace")
         backend.write("/src/app.py", "print('hello')")
         result = backend.execute("python /src/app.py")
 
-        # Restricted directories, no shell
-        backend = LocalBackend(
+        readonly = LocalBackend(
             allowed_directories=["/home/user/project"],
             enable_execute=False,
         )
@@ -149,69 +127,45 @@ class LocalBackend:
         """Initialize the backend.
 
         Args:
-            root_dir: Base directory for file operations. If not provided,
-                uses first allowed_directory or current working directory.
-            allowed_directories: List of directories that file operations are
-                restricted to. If None, only root_dir is accessible.
-                Paths are resolved to absolute paths.
-            enable_execute: Whether shell execution is enabled. Default True.
+            root_dir: Base directory for file operations. Defaults to the first
+                allowed directory, or the current working directory.
+            allowed_directories: Directories file operations are confined to,
+                resolved to absolute paths and created when missing. When
+                omitted, only `root_dir` is reachable.
+            enable_execute: Whether shell execution is available.
             sandbox_id: Unique identifier for this backend instance.
-            permissions: Optional permission ruleset for fine-grained access control.
-                If provided, operations are checked against this ruleset after
-                the allowed_directories check passes.
-            ask_callback: Async callback for "ask" permission actions. Receives
-                (operation, target, reason) and returns True to allow.
-            ask_fallback: What to do when ask_callback is None but needed.
-                "deny" denies the operation, "error" raises PermissionError.
+            permissions: Optional ruleset applied after the allowed-directory
+                check passes.
+            ask_callback: Async callback for "ask" actions, receiving
+                `(operation, target, reason)` and returning whether to allow.
+            ask_fallback: What an unanswerable "ask" does — `"deny"` refuses the
+                operation, `"error"` raises.
         """
         self._id = sandbox_id or str(uuid.uuid4())
         self._enable_execute = enable_execute
         self._permissions = permissions
-        self._ask_callback = ask_callback
-        self._ask_fallback = ask_fallback
-        self._permission_checker: PermissionChecker | None = None
 
-        # Background (long-lived) process registry — see execute_background().
-        self._bg: dict[str, _BackgroundProcess] = {}
-        self._bg_counter = 0
-        self._bg_dir: Path | None = None
+        self._allowed_directories = [Path(d).resolve() for d in allowed_directories or []]
+        for directory in self._allowed_directories:
+            directory.mkdir(parents=True, exist_ok=True)
 
-        # Initialize permission checker if ruleset provided
-        if permissions is not None:
-            from pydantic_ai_backends.permissions.checker import PermissionChecker
-
-            self._permission_checker = PermissionChecker(
-                ruleset=permissions,
-                ask_callback=ask_callback,
-                ask_fallback=ask_fallback,
-            )
-
-        # Resolve allowed directories
-        self._allowed_directories: list[Path] | None = None
-        if allowed_directories is not None:
-            self._allowed_directories = [Path(d).resolve() for d in allowed_directories]
-            # Create directories if they don't exist
-            for d in self._allowed_directories:
-                d.mkdir(parents=True, exist_ok=True)
-
-        # Resolve root directory
         if root_dir is not None:
             self._root = Path(root_dir).resolve()
         elif self._allowed_directories:
             self._root = self._allowed_directories[0]
         else:
             self._root = Path.cwd()  # pragma: no cover
-
-        # Ensure root exists
         self._root.mkdir(parents=True, exist_ok=True)
 
-        # If no allowed_directories specified, restrict to root_dir only
-        if self._allowed_directories is None:
+        if not self._allowed_directories:
             self._allowed_directories = [self._root]
 
-    @staticmethod
-    def _shell_cmd(command: str) -> list[str]:
-        return ["cmd", "/c", command] if sys.platform == "win32" else ["sh", "-c", command]
+        self._guard = (
+            PermissionGuard(permissions, self._root, ask_callback, ask_fallback)
+            if permissions is not None
+            else None
+        )
+        self._background = BackgroundProcesses(self._root)
 
     @property
     def id(self) -> str:
@@ -220,7 +174,7 @@ class LocalBackend:
 
     @property
     def root_dir(self) -> Path:
-        """Get the root directory."""
+        """Directory relative paths resolve against, and commands run in."""
         return self._root
 
     @property
@@ -236,239 +190,94 @@ class LocalBackend:
     @property
     def permission_checker(self) -> PermissionChecker | None:
         """The permission checker for this backend, if any."""
-        return self._permission_checker
+        return self._guard.checker if self._guard else None
 
-    def _check_permission_sync(self, operation: PermissionOperation, target: str) -> str | None:
-        """Check permission synchronously.
+    def _denial_reason(self, operation: PermissionOperation, target: str) -> str | None:
+        return self._guard.denial_reason(operation, target) if self._guard else None
 
-        Returns None if allowed, or an error message if denied.
-        For "ask" actions, returns an error since this is sync.
-        """
-        if self._permission_checker is None:
-            return None
+    def _is_denied(self, operation: PermissionOperation, target: str) -> bool:
+        return self._guard is not None and self._guard.is_denied(operation, target)
 
-        from pydantic_ai_backends.permissions.checker import (
-            PermissionAskError,
-        )
-
-        action = self._permission_checker.check_sync(operation, target)
-        if action == "allow":
-            return None
-        if action == "deny":
-            rule = self._permission_checker._find_matching_rule(operation, target)
-            if rule and rule.description:
-                return f"Permission denied: {rule.description}"
-            return f"Permission denied for {operation} on '{target}'"
-        # action == "ask" - in sync context, we can't ask
-        if self._ask_fallback == "deny":
-            return f"Permission denied for {operation} on '{target}' (approval required)"
-        # ask_fallback == "error"
-        raise PermissionAskError(operation, target, "Approval required but no callback")
-
-    def _is_denied_sync(self, operation: PermissionOperation, target: str) -> bool:
-        """True when the ruleset explicitly resolves to "deny" for this target.
-
-        Used by listing/search operations (`ls`, `glob`, `grep`) where a sync
-        "ask" cannot be answered: those operations only hide explicitly denied
-        targets and treat "ask" as visible, so a ruleset whose global default
-        is "ask" doesn't blank out every listing.
-        """
-        if self._permission_checker is None:
-            return False
-        return self._permission_checker.check_sync(operation, target) == "deny"
-
-    def _grep_file_hidden(self, path: str) -> bool:
-        """True when a file must not contribute grep matches.
-
-        A file is hidden from grep when it is explicitly denied for "grep",
-        or denied for "read" — grep returns file content, so a read deny
-        must also stop content from leaking through search results.
-        """
-        return self._is_denied_sync("grep", path) or self._is_denied_sync("read", path)
-
-    def _command_path_targets(self, command: str) -> set[str]:
-        """Best-effort extraction of filesystem paths referenced by a command.
-
-        Tokenizes the command, expands `~`, and resolves each token (and the
-        value side of `--flag=value` tokens) against the backend root — the
-        cwd commands actually run in. Non-path tokens resolve to harmless
-        paths that simply won't match any deny rule.
-        """
-        try:
-            tokens = shlex.split(command, posix=True)
-        except ValueError:
-            # Unbalanced quotes etc. — fall back to whitespace splitting so a
-            # malformed command can't dodge the guard entirely.
-            tokens = [token.strip("\"'") for token in command.split()]
-
-        candidates: set[str] = set()
-        for token in tokens:
-            candidates.add(token)
-            if "=" in token:
-                candidates.add(token.split("=", 1)[1])
-
-        targets: set[str] = set()
-        for candidate in candidates:
-            if not candidate:
-                continue
-            expanded = os.path.expanduser(candidate)
-            p = Path(expanded)
-            resolved = p.resolve() if p.is_absolute() else (self._root / expanded).resolve()
-            targets.add(str(resolved))
-        return targets
-
-    def _check_execute_permission_sync(self, command: str) -> str | None:
-        """Check a command against execute rules plus a best-effort path guard.
-
-        After the command-pattern check, path-looking tokens in the command are
-        resolved and denied when one hits a "read" or "write" deny rule, so the
-        straightforward bypass (`cat restricted/secret.txt`) is caught. This is
-        defense-in-depth, not a security boundary — a shell can always reach a
-        file in ways command-string inspection cannot see. For enforced
-        isolation use a sandboxed backend (e.g. `DockerSandbox`).
-        """
-        perm_error = self._check_permission_sync("execute", command)
-        if perm_error:
-            return perm_error
-        if self._permission_checker is None:
-            return None
-
-        guarded_ops: tuple[PermissionOperation, ...] = ("read", "write")
-        for target in sorted(self._command_path_targets(command)):
-            for op in guarded_ops:
-                if self._is_denied_sync(op, target):
-                    return (
-                        f"Permission denied: command references '{target}', "
-                        f"which is denied for {op}"
-                    )
-        return None
-
-    def _validate_path(self, path: str) -> Path:
-        """Validate and resolve path within allowed directories.
+    def _resolve(self, path: str) -> Path:
+        """Resolve `path` inside the allowed directories.
 
         Args:
-            path: Path to validate (absolute or relative to root).
-
-        Returns:
-            Resolved absolute Path.
+            path: Absolute path, or one relative to the root directory.
 
         Raises:
-            PermissionError: If path is outside allowed directories.
+            PermissionError: If the resolved path escapes every allowed
+                directory — including via `..` or a symlink, since resolution
+                happens before the check.
         """
-        # Handle relative paths
-        if not Path(path).is_absolute():
-            resolved = (self._root / path).resolve()
-        else:
-            resolved = Path(path).resolve()
+        candidate = Path(path)
+        resolved = candidate.resolve() if candidate.is_absolute() else (self._root / path).resolve()
 
-        # Check against allowed directories
-        assert self._allowed_directories is not None
         for allowed in self._allowed_directories:
-            try:
-                resolved.relative_to(allowed)
+            if resolved == allowed or allowed in resolved.parents:
                 return resolved
-            except ValueError:
-                continue
 
-        # Path not in any allowed directory
         allowed_str = ", ".join(str(d) for d in self._allowed_directories)
         raise PermissionError(
             f"Access denied: '{path}' is outside allowed directories ({allowed_str})"
         )
 
+    # ── Files ──────────────────────────────────────────────────────────
+
     def exists(self, path: str) -> bool:
-        """Check whether a file exists on the filesystem.
+        """Whether `path` is a regular file inside the allowed directories.
 
-        Returns `False` for: missing files, directories, paths outside
-        the allowed directory set, and any other invalid path the
-        filesystem refuses to stat. The protocol contract is "invalid
-        paths, directories, and permission errors all return False" —
-        callers needing to distinguish those reasons should use
-        `ls_info()`.
-
-        Exception sources:
-        - `PermissionError` from `_validate_path` when the resolved
-          path escapes the allowed directory set.
-        - `ValueError` from `Path.is_file()` on paths the OS rejects
-          before it can stat them (notably embedded null bytes — POSIX
-          rejects them at the syscall boundary).
-        - `OSError` covers the remaining edge cases (filename too long,
-          ELOOP on a symlink cycle, etc.). `Path.is_file()` swallows
-          most of these already; the explicit catch is belt-and-braces.
+        Missing files, directories, paths outside the allowed set and paths the
+        filesystem refuses to stat at all (embedded null bytes, `ELOOP`, a name
+        that is too long) are all `False`. Use `ls_info` when the reason matters.
         """
         try:
-            validated = self._validate_path(path)
-            return validated.is_file()
+            return self._resolve(path).is_file()
         except (PermissionError, ValueError, OSError):
             return False
 
     def ls_info(self, path: str) -> list[FileInfo]:
-        """List files and directories at the given path.
+        """List one directory, omitting entries denied for "ls".
 
-        Entries (and the path itself) with an explicit "ls" deny rule are
-        omitted; "ask" is treated as visible (listings can't prompt).
+        An "ask" counts as visible, since a listing cannot prompt.
         """
         try:
-            full_path = self._validate_path(path)
+            full_path = self._resolve(path)
         except PermissionError:  # pragma: no cover
             return []
 
-        if self._is_denied_sync("ls", str(full_path)):
-            return []
-
-        if not full_path.exists():  # pragma: no cover
+        if self._is_denied("ls", str(full_path)) or not full_path.exists():
             return []
 
         if full_path.is_file():  # pragma: no cover
-            return [
-                FileInfo(
-                    name=full_path.name,
-                    path=str(full_path),
-                    is_dir=False,
-                    size=full_path.stat().st_size,
-                )
-            ]
+            return [_entry_info(full_path)]
 
         results: list[FileInfo] = []
         try:
             for entry in full_path.iterdir():
                 try:
-                    # Validate each entry is within allowed dirs
-                    self._validate_path(str(entry))
-                    if self._is_denied_sync("ls", str(entry)):
-                        continue
-                    results.append(
-                        FileInfo(
-                            name=entry.name,
-                            path=str(entry),
-                            is_dir=entry.is_dir(),
-                            size=entry.stat().st_size if entry.is_file() else None,
-                        )
-                    )
+                    self._resolve(str(entry))
                 except PermissionError:  # pragma: no cover
-                    continue  # Skip entries outside allowed directories
+                    continue
+                if not self._is_denied("ls", str(entry)):
+                    results.append(_entry_info(entry))
         except PermissionError:  # pragma: no cover
             return []
 
         return sorted(results, key=lambda x: (not x["is_dir"], x["name"]))
 
     def read_bytes(self, path: str) -> bytes:
-        """Read raw bytes from a file.
+        """Read a whole file as bytes, or `b""` when it cannot be read.
 
-        Applies the same "read" permission rules as `read` — a denied path
-        returns `b""`, matching the documented "empty bytes on failure"
-        contract (an "ask" that can't be answered follows `ask_fallback`,
-        exactly like `read`).
+        The same "read" rules as :meth:`read` apply; a denied path is `b""`.
         """
         try:
-            full_path = self._validate_path(path)
+            full_path = self._resolve(path)
         except PermissionError:
             return b""
 
-        if self._check_permission_sync("read", str(full_path)) is not None:
+        if self._denial_reason("read", str(full_path)) is not None:
             return b""
-
-        if not full_path.exists() or not full_path.is_file():
+        if not full_path.is_file():
             return b""
 
         try:
@@ -476,21 +285,19 @@ class LocalBackend:
         except (PermissionError, OSError):  # pragma: no cover
             return b""
 
-    def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
-        """Read file content with line numbers."""
+    def read(self, path: str, offset: int = 0, limit: int = DEFAULT_READ_LIMIT) -> str:
+        """Read a slice of a file with line numbers."""
         try:
-            full_path = self._validate_path(path)
+            full_path = self._resolve(path)
         except PermissionError as e:
             return f"Error: {e}"
 
-        # Check permissions
-        perm_error = self._check_permission_sync("read", str(full_path))
-        if perm_error:
-            return f"Error: {perm_error}"
+        denial = self._denial_reason("read", str(full_path))
+        if denial:
+            return f"Error: {denial}"
 
         if not full_path.exists():
             return f"Error: File '{path}' not found"
-
         if full_path.is_dir():  # pragma: no cover
             return f"Error: '{path}' is a directory"
 
@@ -502,65 +309,33 @@ class LocalBackend:
         except OSError as e:  # pragma: no cover
             return f"Error: {e}"
 
-        total_lines = len(lines)
+        if offset >= len(lines):  # pragma: no cover
+            return f"Error: Offset {offset} exceeds file length ({len(lines)} lines)"
 
-        if offset >= total_lines:  # pragma: no cover
-            return f"Error: Offset {offset} exceeds file length ({total_lines} lines)"
+        end = min(offset + limit, len(lines))
+        result = "\n".join(_numbered_line(i + 1, lines[i]) for i in range(offset, end))
+        if end < len(lines):
+            result += f"\n\n... ({len(lines) - end} more lines)"
 
-        end = min(offset + limit, total_lines)
-        result_lines = []
-
-        for i in range(offset, end):
-            line_num = i + 1
-            line = lines[i].rstrip("\n\r")
-            result_lines.append(f"{line_num:>6}\t{line}")
-
-        result = "\n".join(result_lines)
-
-        if end < total_lines:
-            result += f"\n\n... ({total_lines - end} more lines)"
-
-        # Guard against a single read flooding the context. A request is
-        # "explicit" when the caller asked for a specific range; in that case an
-        # over-large result errors so the agent narrows it. A default read just
-        # truncates to a page, so a plain `read_file(path)` never hard-fails.
-        if len(result) > MAX_READ_OUTPUT:
-            explicit = offset != 0 or limit != DEFAULT_READ_LIMIT
-            if explicit:
-                return (
-                    f"Error: The requested range is too large to return "
-                    f"({len(result):,} chars, limit {MAX_READ_OUTPUT:,}). "
-                    "Read a smaller slice with a lower `limit`, or use `grep` "
-                    "to locate the part you need."
-                )
-            result = (
-                result[:MAX_READ_OUTPUT]
-                + f"\n\n... (truncated at {MAX_READ_OUTPUT:,} chars — pass a smaller "
-                "`limit`/`offset` or use `grep` to read the rest)"
-            )
-
-        return result
+        return _within_read_ceiling(result, explicit=offset != 0 or limit != DEFAULT_READ_LIMIT)
 
     def write(self, path: str, content: str | bytes) -> WriteResult:
-        """Write content to a file."""
+        """Write a file, creating parent directories as needed."""
         try:
-            full_path = self._validate_path(path)
+            full_path = self._resolve(path)
         except PermissionError as e:
             return WriteResult(error=str(e))
 
-        # Check permissions
-        perm_error = self._check_permission_sync("write", str(full_path))
-        if perm_error:
-            return WriteResult(error=perm_error)
+        denial = self._denial_reason("write", str(full_path))
+        if denial:
+            return WriteResult(error=denial)
 
         try:
             full_path.parent.mkdir(parents=True, exist_ok=True)
-
             if isinstance(content, bytes):  # pragma: no cover
                 full_path.write_bytes(content)
             else:
                 full_path.write_text(_normalize_newlines(content), encoding="utf-8")
-
             return WriteResult(path=str(full_path))
         except PermissionError:  # pragma: no cover
             return WriteResult(error=f"Permission denied for '{path}'")
@@ -570,16 +345,15 @@ class LocalBackend:
     def edit(
         self, path: str, old_string: str, new_string: str, replace_all: bool = False
     ) -> EditResult:
-        """Edit a file by replacing strings."""
+        """Edit a file by replacing a string."""
         try:
-            full_path = self._validate_path(path)
+            full_path = self._resolve(path)
         except PermissionError as e:  # pragma: no cover
             return EditResult(error=str(e))
 
-        # Check permissions
-        perm_error = self._check_permission_sync("edit", str(full_path))
-        if perm_error:
-            return EditResult(error=perm_error)
+        denial = self._denial_reason("edit", str(full_path))
+        if denial:
+            return EditResult(error=denial)
 
         if not full_path.exists():
             return EditResult(error=f"File '{path}' not found")
@@ -591,75 +365,48 @@ class LocalBackend:
         except OSError as e:  # pragma: no cover
             return EditResult(error=str(e))
 
-        occurrences = content.count(old_string)
-
-        if occurrences == 0:  # pragma: no cover
-            return EditResult(error=f"String '{old_string}' not found in file")
-
-        if occurrences > 1 and not replace_all:  # pragma: no cover
-            return EditResult(
-                error=f"String '{old_string}' found {occurrences} times. "
-                "Use replace_all=True to replace all, or provide more context."
-            )
-
-        if replace_all:  # pragma: no cover
-            new_content = content.replace(old_string, new_string)
-        else:
-            new_content = content.replace(old_string, new_string, 1)
+        outcome = replace_in_content(content, old_string, new_string, replace_all)
+        if not isinstance(outcome, Replacement):
+            return EditResult(error=outcome)
 
         try:
-            full_path.write_text(_normalize_newlines(new_content), encoding="utf-8")
-            return EditResult(path=str(full_path), occurrences=occurrences if replace_all else 1)
+            full_path.write_text(_normalize_newlines(outcome.content), encoding="utf-8")
         except PermissionError:  # pragma: no cover
             return EditResult(error=f"Permission denied for '{path}'")
         except OSError as e:  # pragma: no cover
             return EditResult(error=str(e))
 
-    def glob_info(self, pattern: str, path: str = ".") -> list[FileInfo]:
-        """Find files matching a glob pattern.
+        return EditResult(path=str(full_path), occurrences=outcome.occurrences)
 
-        Matches (and the base path itself) with an explicit "glob" deny rule
-        are omitted; "ask" is treated as visible (listings can't prompt).
+    def glob_info(self, pattern: str, path: str = ".") -> list[FileInfo]:
+        """Match files by glob, most recently modified first.
+
+        That ordering matches ripgrep and Claude Code, and is usually what an
+        agent wants; the path breaks ties so the order is stable. Matches denied
+        for "glob" are omitted, and "ask" counts as visible.
         """
         try:
-            base_path = self._validate_path(path)
+            base_path = self._resolve(path)
         except PermissionError:  # pragma: no cover
             return []
 
-        if self._is_denied_sync("glob", str(base_path)):
+        if self._is_denied("glob", str(base_path)) or not base_path.exists():
             return []
 
-        if not base_path.exists():  # pragma: no cover
-            return []
-
-        # Collect (mtime, path, FileInfo) so results order by recency —
-        # most-recently-modified first, which is usually what an agent wants
-        # (matches ripgrep/Claude Code glob ordering). Path is the tie-break for
-        # a stable order when mtimes collide.
         collected: list[tuple[float, str, FileInfo]] = []
-
         try:
             for match in base_path.glob(pattern):  # pragma: no branch
-                if match.is_file():
-                    try:
-                        self._validate_path(str(match))
-                        if self._is_denied_sync("glob", str(match)):
-                            continue
-                        stat = match.stat()
-                        collected.append(
-                            (
-                                stat.st_mtime,
-                                str(match),
-                                FileInfo(
-                                    name=match.name,
-                                    path=str(match),
-                                    is_dir=False,
-                                    size=stat.st_size,
-                                ),
-                            )
-                        )
-                    except PermissionError:  # pragma: no cover
-                        continue
+                if not match.is_file():
+                    continue
+                try:
+                    self._resolve(str(match))
+                except PermissionError:  # pragma: no cover
+                    continue
+                if self._is_denied("glob", str(match)):
+                    continue
+                stat = match.stat()
+                info = FileInfo(name=match.name, path=str(match), is_dir=False, size=stat.st_size)
+                collected.append((stat.st_mtime, str(match), info))
         except (PermissionError, OSError):  # pragma: no cover
             pass
 
@@ -673,100 +420,65 @@ class LocalBackend:
         glob: str | None = None,
         ignore_hidden: bool = True,
     ) -> list[GrepMatch] | str:
-        """Search for pattern in files.
+        """Search file contents, using ripgrep when it is installed.
 
-        Uses ripgrep if available, falls back to Python regex.
-
-        Files denied for "grep" — or for "read", since matches leak file
-        content — never contribute results; an explicit "grep" deny on the
-        search path errors the whole search.
+        Files denied for "grep" — or for "read", since a match carries content —
+        never contribute results. An explicit "grep" deny on the search path
+        errors the whole search.
         """
         search_path = path or str(self._root)
 
         try:
-            validated_path = self._validate_path(search_path)
+            validated = self._resolve(search_path)
         except PermissionError as e:  # pragma: no cover
             return str(e)
 
-        if self._is_denied_sync("grep", str(validated_path)):
+        if self._is_denied("grep", str(validated)):
             return f"Error: Permission denied for grep on '{search_path}'"
 
-        # Try ripgrep first when searching directories for better performance
-        use_ripgrep = shutil.which("rg") is not None and not validated_path.is_file()
-        if use_ripgrep:  # pragma: no cover
-            return self._grep_ripgrep(pattern, validated_path, glob, ignore_hidden)
-
-        return self._grep_python(pattern, validated_path, glob, ignore_hidden)  # pragma: no cover
+        if shutil.which("rg") is not None and not validated.is_file():  # pragma: no cover
+            return self._grep_ripgrep(pattern, validated, glob, ignore_hidden)
+        return self._grep_python(pattern, validated, glob, ignore_hidden)  # pragma: no cover
 
     def _grep_ripgrep(  # pragma: no cover
-        self, pattern: str, search_path: Path, glob: str | None = None, ignore_hidden: bool = True
+        self, pattern: str, search_path: Path, glob: str | None, ignore_hidden: bool
     ) -> list[GrepMatch] | str:
-        """Use ripgrep for fast searching."""
-        cmd = ["rg", "--line-number", "--no-heading", pattern]
-
+        argv = ["rg", "--line-number", "--no-heading", pattern]
         if glob:
-            cmd.extend(["--glob", glob])
-
+            argv.extend(["--glob", glob])
         if not ignore_hidden:
-            cmd.append("--hidden")
-
-        cmd.append(".")
+            argv.append("--hidden")
+        argv.append(".")
 
         try:
             result = subprocess.run(
-                cmd,
+                argv,
                 cwd=search_path,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=GREP_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
             return "Error: Search timed out"
         except OSError as e:
             return f"Error: {e}"
 
-        results: list[GrepMatch] = []
-
-        for line in result.stdout.strip().split("\n"):
-            if not line:
+        base_path = search_path.parent if search_path.is_file() else search_path
+        matches: list[GrepMatch] = []
+        for relative_path, line_number, line in _parse_grep_lines(result.stdout):
+            full_path = (base_path / relative_path).resolve()
+            try:
+                self._resolve(str(full_path))
+            except PermissionError:
                 continue
-
-            parts = line.split(":", 2)
-            if len(parts) >= 3:
-                file_path = parts[0]
-                try:
-                    line_num = int(parts[1])
-                except ValueError:
-                    continue
-                content = parts[2]
-
-                # Convert to absolute path and validate
-                try:
-                    base_path = search_path.parent if search_path.is_file() else search_path
-                    full_path = (base_path / file_path).resolve()
-                    self._validate_path(str(full_path))
-                    if self._grep_file_hidden(str(full_path)):
-                        continue
-                    results.append(
-                        GrepMatch(
-                            path=str(full_path),
-                            line_number=line_num,
-                            line=content,
-                        )
-                    )
-                except PermissionError:
-                    continue
-
-        return results
+            if self._hidden_from_grep(str(full_path)):
+                continue
+            matches.append(GrepMatch(path=str(full_path), line_number=line_number, line=line))
+        return matches
 
     def _grep_python(  # pragma: no cover
-        self,
-        pattern: str,
-        search_path: Path,
-        glob_pattern: str | None = None,
-        ignore_hidden: bool = True,
+        self, pattern: str, search_path: Path, glob: str | None, ignore_hidden: bool
     ) -> list[GrepMatch] | str:
-        """Use Python regex for searching (fallback)."""
         try:
             regex = re.compile(pattern)
         except re.error as e:
@@ -775,36 +487,28 @@ class LocalBackend:
         if not search_path.exists():
             return f"Error: Path '{search_path}' not found"
 
-        results: list[GrepMatch] = []
-
         if search_path.is_file():
             files = [search_path]
         else:
-            if glob_pattern:
-                files = list(search_path.glob(glob_pattern))
-            else:
-                files = list(search_path.rglob("*"))
-            # Skip build/cache dirs (and hidden, when asked) so the fallback
-            # doesn't trawl node_modules/__pycache__ the way ripgrep wouldn't.
-            files = [f for f in files if not _grep_path_ignored(f.parts, ignore_hidden)]
+            candidates = search_path.glob(glob) if glob else search_path.rglob("*")
+            files = [f for f in candidates if not is_ignored_path(f.parts, ignore_hidden)]
 
+        matches: list[GrepMatch] = []
         for file_path in files:
             if not file_path.is_file():
                 continue
-
             try:
-                self._validate_path(str(file_path))
+                self._resolve(str(file_path))
             except PermissionError:
                 continue
-
-            if self._grep_file_hidden(str(file_path)):
+            if self._hidden_from_grep(str(file_path)):
                 continue
 
             try:
                 with open(file_path, encoding="utf-8", errors="replace") as f:
                     for i, line in enumerate(f):
                         if regex.search(line):
-                            results.append(
+                            matches.append(
                                 GrepMatch(
                                     path=str(file_path),
                                     line_number=i + 1,
@@ -814,281 +518,226 @@ class LocalBackend:
             except (PermissionError, OSError):
                 continue
 
-        return results
+        return matches
+
+    def _hidden_from_grep(self, path: str) -> bool:
+        return self._guard is not None and self._guard.hides_from_grep(path)
+
+    # ── Commands ───────────────────────────────────────────────────────
 
     def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
-        """Execute a shell command.
+        """Run a shell command in the root directory.
 
         Args:
             command: Command to execute.
-            timeout: Maximum execution time in seconds (default 120).
-
-        Returns:
-            ExecuteResponse with output, exit code, and truncation status.
+            timeout: Maximum execution time in seconds. Defaults to
+                `DEFAULT_EXECUTE_TIMEOUT`.
 
         Raises:
-            RuntimeError: If execute is disabled for this backend.
+            RuntimeError: If execution is disabled for this backend.
         """
-        if not self._enable_execute:
-            raise RuntimeError(
-                "Shell execution is disabled for this backend. "
-                "Initialize with enable_execute=True to enable."
-            )
-
-        # Check permissions
-        perm_error = self._check_execute_permission_sync(command)
-        if perm_error:
-            return ExecuteResponse(
-                output=f"Error: {perm_error}",
-                exit_code=1,
-                truncated=False,
-            )
+        denial = self._execute_denial(command)
+        if denial is not None:
+            return ExecuteResponse(output=f"Error: {denial}", exit_code=1, truncated=False)
 
         try:
             result = subprocess.run(
-                self._shell_cmd(command),
+                shell_argv(command),
                 cwd=self._root,
                 capture_output=True,
                 text=True,
-                timeout=timeout if timeout is not None else 120,
-            )
-
-            output = result.stdout + result.stderr
-
-            # Truncate if too long
-            truncated = len(output) > MAX_EXECUTE_OUTPUT
-            if truncated:  # pragma: no cover
-                output = output[:MAX_EXECUTE_OUTPUT]
-
-            return ExecuteResponse(
-                output=output,
-                exit_code=result.returncode,
-                truncated=truncated,
+                timeout=timeout if timeout is not None else DEFAULT_EXECUTE_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
             return ExecuteResponse(
-                output="Error: Command timed out",
-                exit_code=124,
-                truncated=False,
-            )
-        except Exception as e:  # pragma: no cover
-            return ExecuteResponse(
-                output=f"Error: {e}",
-                exit_code=1,
-                truncated=False,
-            )
-
-    async def async_execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
-        """Async, cancellable version of execute().
-
-        Uses `asyncio.create_subprocess_exec` so that cancelling the calling
-        task immediately kills the subprocess rather than waiting for a thread
-        to finish. On Unix, the subprocess runs in its own session so the entire
-        process tree (including any grandchildren the shell forked) is reaped
-        on cancellation or timeout. Defaults to a 120-second timeout when
-        `timeout` is `None`.
-        """
-        if not self._enable_execute:
-            raise RuntimeError(
-                "Shell execution is disabled for this backend. "
-                "Initialize with enable_execute=True to enable."
-            )
-
-        perm_error = self._check_execute_permission_sync(command)
-        if perm_error:
-            return ExecuteResponse(output=f"Error: {perm_error}", exit_code=1, truncated=False)
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *self._shell_cmd(command),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self._root,
-                # New session so we can kill the entire process group on Unix.
-                # Windows kills the process tree via the cmd /c lifecycle.
-                start_new_session=(sys.platform != "win32"),
-            )
-
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout if timeout is not None else 120
-                )
-            except asyncio.CancelledError:
-                self._kill_proc_tree(proc)
-                # Shield cleanup so a second cancel can't leave pipes dangling.
-                with contextlib.suppress(BaseException):
-                    await asyncio.shield(asyncio.ensure_future(proc.communicate()))
-                raise
-            except asyncio.TimeoutError:
-                self._kill_proc_tree(proc)
-                with contextlib.suppress(BaseException):
-                    await proc.communicate()
-                return ExecuteResponse(
-                    output="Error: Command timed out",
-                    exit_code=124,
-                    truncated=False,
-                )
-
-            output = stdout_b.decode("utf-8", errors="replace") + stderr_b.decode(
-                "utf-8", errors="replace"
-            )
-
-            truncated = len(output) > MAX_EXECUTE_OUTPUT
-            if truncated:  # pragma: no cover
-                output = output[:MAX_EXECUTE_OUTPUT]
-
-            return ExecuteResponse(
-                output=output,
-                exit_code=proc.returncode if proc.returncode is not None else 1,
-                truncated=truncated,
+                output="Error: Command timed out", exit_code=124, truncated=False
             )
         except Exception as e:  # pragma: no cover
             return ExecuteResponse(output=f"Error: {e}", exit_code=1, truncated=False)
 
-    @staticmethod
-    def _kill_proc_tree(proc: asyncio.subprocess.Process) -> None:
-        """Kill the subprocess and (on Unix) every grandchild it forked.
+        return _execute_response(result.stdout + result.stderr, result.returncode)
 
-        On Unix the process is launched with `start_new_session=True`, so we
-        can `killpg` the whole tree. On Windows `proc.kill()` is sufficient
-        because `cmd /c` already terminates child processes when it dies.
+    async def async_execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
+        """Cancellable version of :meth:`execute`.
+
+        Cancelling the calling task kills the subprocess immediately instead of
+        waiting for a thread to finish. On Unix the process gets its own session
+        so the whole tree — including grandchildren the shell forked — is reaped
+        on cancellation or timeout.
         """
-        if sys.platform == "win32":
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            return
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
+        denial = self._execute_denial(command)
+        if denial is not None:
+            return ExecuteResponse(output=f"Error: {denial}", exit_code=1, truncated=False)
 
-    # ── Background (long-lived) processes ────────────────────────────
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *shell_argv(command),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self._root,
+                # New session so the whole group can be killed on Unix; on
+                # Windows the `cmd /c` lifecycle already takes the tree down.
+                start_new_session=(sys.platform != "win32"),
+            )
 
-    @staticmethod
-    def _kill_popen_tree(popen: subprocess.Popen[bytes]) -> None:
-        """Kill a background `Popen` and (on Unix) its whole process group."""
-        if popen.poll() is not None:
-            return
-        if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
-            with contextlib.suppress(ProcessLookupError):
-                popen.kill()
-            return
-        with contextlib.suppress(ProcessLookupError, OSError):
-            os.killpg(os.getpgid(popen.pid), signal.SIGKILL)
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=timeout if timeout is not None else DEFAULT_EXECUTE_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                _kill_process_tree(process)
+                # Shielded so a second cancel cannot leave the pipes dangling.
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(asyncio.ensure_future(process.communicate()))
+                raise
+            except asyncio.TimeoutError:
+                _kill_process_tree(process)
+                with contextlib.suppress(BaseException):
+                    await process.communicate()
+                return ExecuteResponse(
+                    output="Error: Command timed out", exit_code=124, truncated=False
+                )
 
-    def execute_background(self, command: str) -> BackgroundHandle:
-        """Start `command` as a detached, long-lived process.
+            output = stdout.decode("utf-8", errors="replace")
+            output += stderr.decode("utf-8", errors="replace")
+            return _execute_response(output, process.returncode)
+        except Exception as e:  # pragma: no cover
+            return ExecuteResponse(output=f"Error: {e}", exit_code=1, truncated=False)
 
-        Returns immediately with a handle. The process keeps running after this
-        call (it is NOT reaped like `execute`); drain its output with
-        `read_background` and stop it with `kill_background`.
+    def _execute_denial(self, command: str) -> str | None:
+        """Why the command may not run, or `None` when it may.
+
+        Raises:
+            RuntimeError: If execution is disabled for this backend, which is a
+                misconfiguration rather than a refused command.
         """
         if not self._enable_execute:
             raise RuntimeError(
                 "Shell execution is disabled for this backend. "
                 "Initialize with enable_execute=True to enable."
             )
-        perm_error = self._check_execute_permission_sync(command)
-        if perm_error:
-            raise PermissionError(perm_error)
+        return self._guard.execute_denial_reason(command) if self._guard else None
 
-        if self._bg_dir is None:
-            self._bg_dir = Path(tempfile.mkdtemp(prefix="pad_bg_"))
-        self._bg_counter += 1
-        shell_id = f"bg_{self._bg_counter}"
-        stdout_path = self._bg_dir / f"{shell_id}.out"
-        stderr_path = self._bg_dir / f"{shell_id}.err"
+    # ── Background processes ───────────────────────────────────────────
 
-        # The child writes straight to these files; the parent's handles can be
-        # closed right after spawn (the child keeps its own dup'd descriptors).
-        with open(stdout_path, "wb") as out_fh, open(stderr_path, "wb") as err_fh:
-            popen = subprocess.Popen(
-                self._shell_cmd(command),
-                cwd=self._root,
-                stdout=out_fh,
-                stderr=err_fh,
-                stdin=subprocess.DEVNULL,
-                start_new_session=(sys.platform != "win32"),
-            )
-        self._bg[shell_id] = _BackgroundProcess(
-            shell_id=shell_id,
-            command=command,
-            popen=popen,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-        )
-        return BackgroundHandle(shell_id=shell_id, pid=popen.pid, command=command)
+    def execute_background(self, command: str) -> BackgroundHandle:
+        """Start `command` as a detached, long-lived process.
 
-    @staticmethod
-    def _drain(path: Path, pos: int) -> tuple[str, int]:
-        """Read new bytes from `path` starting at `pos`; return (text, new_pos)."""
-        try:
-            with open(path, "rb") as f:
-                f.seek(pos)
-                data = f.read()
-        except OSError:  # pragma: no cover - file removed mid-read
-            return "", pos
-        return data.decode("utf-8", errors="replace"), pos + len(data)
+        Returns immediately. The process keeps running after this call — drain
+        its output with :meth:`read_background` and stop it with
+        :meth:`kill_background`.
+
+        Raises:
+            RuntimeError: If execution is disabled for this backend.
+            PermissionError: If the ruleset refuses the command.
+        """
+        denial = self._execute_denial(command)
+        if denial is not None:
+            raise PermissionError(denial)
+        return self._background.start(shell_argv(command), command)
 
     def read_background(self, shell_id: str) -> BackgroundOutput:
         """Return output produced since the previous read, plus run status."""
-        proc = self._bg.get(shell_id)
-        if proc is None:
-            return BackgroundOutput(
-                shell_id=shell_id,
-                stdout="",
-                stderr=f"No such background shell: {shell_id}",
-                running=False,
-                exit_code=None,
-            )
-        exit_code = proc.popen.poll()
-        out, proc.stdout_pos = self._drain(proc.stdout_path, proc.stdout_pos)
-        err, proc.stderr_pos = self._drain(proc.stderr_path, proc.stderr_pos)
-        return BackgroundOutput(
-            shell_id=shell_id,
-            stdout=out,
-            stderr=err,
-            running=exit_code is None,
-            exit_code=exit_code,
-        )
+        return self._background.read(shell_id)
 
     def kill_background(self, shell_id: str) -> bool:
-        """Stop a background process. Returns True if it was still running."""
-        proc = self._bg.get(shell_id)
-        if proc is None:
-            return False
-        was_running = proc.popen.poll() is None
-        self._kill_popen_tree(proc.popen)
-        with contextlib.suppress(Exception):
-            proc.popen.wait(timeout=2)
-        return was_running
+        """Stop a background process. Returns whether it was still running."""
+        return self._background.kill(shell_id)
 
     def list_background(self) -> list[BackgroundProcessInfo]:
-        """Return status for every tracked background process."""
-        infos: list[BackgroundProcessInfo] = []
-        for proc in self._bg.values():
-            exit_code = proc.popen.poll()
-            infos.append(
-                BackgroundProcessInfo(
-                    shell_id=proc.shell_id,
-                    command=proc.command,
-                    pid=proc.popen.pid,
-                    running=exit_code is None,
-                    exit_code=exit_code,
-                )
-            )
-        return infos
+        """Status of every tracked background process."""
+        return self._background.list()
 
     def kill_all_background(self) -> None:
         """Stop every background process and remove its on-disk output."""
-        for proc in list(self._bg.values()):
-            self._kill_popen_tree(proc.popen)
-            with contextlib.suppress(Exception):
-                proc.popen.wait(timeout=2)
-        self._bg.clear()
-        if self._bg_dir is not None:
-            shutil.rmtree(self._bg_dir, ignore_errors=True)
-            self._bg_dir = None
+        self._background.kill_all()
 
     def __del__(self) -> None:  # pragma: no cover - best-effort GC cleanup
         with contextlib.suppress(Exception):
-            if self._bg:
-                self.kill_all_background()
+            if self._background:
+                self._background.kill_all()
+
+
+def _numbered_line(number: int, line: str) -> str:
+    """Render one `read` line, keeping trailing whitespace that is not a newline."""
+    stripped = line.rstrip("\n\r")
+    return f"{number:>6}\t{stripped}"
+
+
+def _entry_info(path: Path) -> FileInfo:
+    return FileInfo(
+        name=path.name,
+        path=str(path),
+        is_dir=path.is_dir(),
+        size=path.stat().st_size if path.is_file() else None,
+    )
+
+
+def _normalize_newlines(content: str) -> str:
+    r"""Drop carriage returns so text-mode writes do not double them.
+
+    `Path.write_text` opens in text mode, where only `\n` is translated to
+    `os.linesep` while an existing `\r` is left alone — content that already
+    holds `\r\n` would become `\r\r\n` on Windows.
+    """
+    return content.replace("\r", "")
+
+
+def _within_read_ceiling(result: str, *, explicit: bool) -> str:
+    """Keep one read from flooding the agent's context.
+
+    An explicit range that is still too large errors so the agent narrows it; a
+    default read is truncated to a page, so a plain `read_file(path)` never
+    hard-fails.
+    """
+    if len(result) <= MAX_READ_OUTPUT_CHARS:
+        return result
+
+    if explicit:
+        return (
+            f"Error: The requested range is too large to return "
+            f"({len(result):,} chars, limit {MAX_READ_OUTPUT_CHARS:,}). "
+            "Read a smaller slice with a lower `limit`, or use `grep` "
+            "to locate the part you need."
+        )
+    return (
+        result[:MAX_READ_OUTPUT_CHARS]
+        + f"\n\n... (truncated at {MAX_READ_OUTPUT_CHARS:,} chars — pass a smaller "
+        "`limit`/`offset` or use `grep` to read the rest)"
+    )
+
+
+def _execute_response(output: str, returncode: int | None) -> ExecuteResponse:
+    truncated = len(output) > MAX_EXECUTE_OUTPUT_BYTES
+    if truncated:  # pragma: no cover
+        output = output[:MAX_EXECUTE_OUTPUT_BYTES]
+    return ExecuteResponse(
+        output=output,
+        exit_code=returncode if returncode is not None else 1,
+        truncated=truncated,
+    )
+
+
+def _parse_grep_lines(stdout: str) -> list[tuple[str, int, str]]:  # pragma: no cover
+    """Parse ripgrep's `path:line:content` output, skipping malformed rows."""
+    rows: list[tuple[str, int, str]] = []
+    for line in stdout.strip().split("\n"):
+        parts = line.split(":", 2)
+        if len(parts) < 3:
+            continue
+        try:
+            rows.append((parts[0], int(parts[1]), parts[2]))
+        except ValueError:
+            continue
+    return rows
+
+
+def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+    """Kill the subprocess and, on Unix, every grandchild it forked."""
+    if sys.platform == "win32":
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)

@@ -1,0 +1,1988 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<meta name="description" content="Operator dashboard for the sandboxd sandbox execution service." />
+<title>sandboxd</title>
+<style>
+  @layer reset, base, components, views, utilities;
+
+  @layer reset {
+    *, *::before, *::after { box-sizing: border-box; }
+    :where(body, h1, h2, h3, p, dl, dd, figure) { margin: 0; }
+    :where(ul) { margin: 0; padding: 0; list-style: none; }
+    :where(button, input, select) { font: inherit; color: inherit; }
+    :where(button) { cursor: pointer; }
+  }
+
+  @layer base {
+    :root {
+      color-scheme: dark;
+
+      /* One hue drives the accent; change it and the whole page rethemes. */
+      --hue-accent: 250;
+      --hue-neutral: 250;
+      --chroma-accent: 0.16;
+
+      --color-canvas: oklch(17% 0.018 var(--hue-neutral));
+      --color-surface: oklch(21% 0.019 var(--hue-neutral));
+      --color-surface-raised: oklch(25% 0.021 var(--hue-neutral));
+      --color-inset: oklch(15% 0.017 var(--hue-neutral));
+      --color-void: oklch(11% 0.014 var(--hue-neutral));
+
+      --color-border: oklch(29% 0.02 var(--hue-neutral));
+      --color-border-strong: oklch(37% 0.025 var(--hue-neutral));
+
+      --color-text: oklch(95% 0.008 var(--hue-neutral));
+      --color-text-muted: oklch(70% 0.02 var(--hue-neutral));
+      --color-text-faint: oklch(56% 0.022 var(--hue-neutral));
+
+      --color-accent: oklch(64% var(--chroma-accent) var(--hue-accent));
+      --color-accent-hover: oklch(58% var(--chroma-accent) var(--hue-accent));
+      --color-accent-text: oklch(80% 0.11 var(--hue-accent));
+      --color-accent-tint: oklch(from var(--color-accent) l c h / 0.15);
+      --color-accent-glow: oklch(from var(--color-accent) l c h / 0.3);
+
+      --color-good: oklch(76% 0.15 158);
+      --color-good-tint: oklch(from var(--color-good) l c h / 0.14);
+      --color-warn: oklch(82% 0.14 82);
+      --color-warn-tint: oklch(from var(--color-warn) l c h / 0.14);
+      --color-bad: oklch(68% 0.18 22);
+      --color-bad-tint: oklch(from var(--color-bad) l c h / 0.14);
+
+      --font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+      --step--2: 0.6875rem;
+      --step--1: 0.78125rem;
+      --step-0: 0.875rem;
+      --step-1: 1rem;
+      --step-2: 1.375rem;
+      --step-3: clamp(1.5rem, 1.2rem + 1vw, 1.875rem);
+
+      --space-1: 0.25rem;
+      --space-2: 0.5rem;
+      --space-3: 0.75rem;
+      --space-4: 1rem;
+      --space-5: 1.5rem;
+      --space-6: 2rem;
+
+      --radius: 0.75rem;
+      --radius-sm: 0.5rem;
+      --radius-xs: 0.3125rem;
+      --radius-pill: 999px;
+
+      --shadow-raised: 0 1px 2px oklch(0% 0 0 / 0.3), 0 8px 24px oklch(0% 0 0 / 0.22);
+      --duration: 140ms;
+      --ease: cubic-bezier(0.3, 0, 0.2, 1);
+
+      --measure-page: 96rem;
+        }
+
+    body {
+      min-height: 100vh;
+      background-color: var(--color-canvas);
+      background-image:
+        radial-gradient(60rem 32rem at 8% -6%, oklch(from var(--color-accent) l c h / 0.1), transparent 62%),
+        radial-gradient(46rem 26rem at 92% -2%, oklch(from var(--color-good) l c h / 0.05), transparent 58%);
+      background-repeat: no-repeat;
+      color: var(--color-text);
+      font-family: var(--font-sans);
+      font-size: var(--step-0);
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    h1, h2, h3 { font-weight: 620; letter-spacing: -0.012em; line-height: 1.25; }
+    h1 { font-size: var(--step-2); }
+    h2 { font-size: var(--step-1); }
+    h3 { font-size: var(--step-0); }
+
+    :where(a) { color: var(--color-accent-text); text-decoration: none; }
+    :where(a):hover { text-decoration: underline; }
+
+    :where(:focus-visible) {
+      outline: 2px solid var(--color-accent);
+      outline-offset: 2px;
+      border-radius: var(--radius-xs);
+    }
+
+    .mono { font-family: var(--font-mono); }
+    .num { font-variant-numeric: tabular-nums; }
+  }
+
+  @layer components {
+    /* ---------- eyebrow / labels ---------- */
+
+    .eyebrow {
+      font-size: var(--step--2);
+      font-weight: 620;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--color-text-faint);
+    }
+
+    /* ---------- buttons ---------- */
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-2);
+      padding-block: var(--space-2);
+      padding-inline: var(--space-3);
+      font-size: var(--step--1);
+      font-weight: 600;
+      background: var(--color-surface-raised);
+      border: 1px solid var(--color-border-strong);
+      border-radius: var(--radius-sm);
+      transition: background var(--duration) var(--ease), border-color var(--duration) var(--ease);
+    }
+    .btn:hover:not(:disabled) { background: oklch(from var(--color-surface-raised) calc(l + 4%) c h); }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    .btn--primary {
+      background: var(--color-accent);
+      border-color: transparent;
+      color: oklch(99% 0 0);
+      box-shadow: 0 2px 12px var(--color-accent-glow);
+    }
+    .btn--primary:hover:not(:disabled) { background: var(--color-accent-hover); }
+
+    .btn--danger {
+      background: var(--color-bad-tint);
+      border-color: oklch(from var(--color-bad) l c h / 0.32);
+      color: var(--color-bad);
+    }
+    .btn--danger:hover:not(:disabled) { background: oklch(from var(--color-bad) l c h / 0.24); }
+
+    .btn--quiet { background: transparent; border-color: var(--color-border); }
+    .btn--quiet:hover:not(:disabled) { background: var(--color-surface-raised); }
+
+    .btn--small { padding-block: var(--space-1); padding-inline: var(--space-2); font-size: var(--step--2); }
+    .btn--icon { padding: var(--space-2); }
+    .btn svg { width: 0.875rem; height: 0.875rem; }
+
+    /* ---------- form controls ---------- */
+
+    .input, .select {
+      inline-size: 100%;
+      padding-block: var(--space-2);
+      padding-inline: var(--space-3);
+      font-size: var(--step--1);
+      background: var(--color-inset);
+      border: 1px solid var(--color-border-strong);
+      border-radius: var(--radius-sm);
+    }
+    .input::placeholder { color: var(--color-text-faint); }
+    .input:focus-visible, .select:focus-visible {
+      outline: none;
+      border-color: var(--color-accent);
+      box-shadow: 0 0 0 3px var(--color-accent-tint);
+    }
+
+    .field { display: grid; gap: var(--space-2); }
+    .field__hint { font-size: var(--step--2); color: var(--color-text-faint); }
+    .error { color: var(--color-bad); font-size: var(--step--1); min-block-size: 1.1em; }
+
+    .switch { display: inline-flex; align-items: center; gap: var(--space-2); user-select: none; }
+    .switch input { position: absolute; opacity: 0; pointer-events: none; }
+    .switch__track {
+      inline-size: 2rem;
+      block-size: 1.125rem;
+      border-radius: var(--radius-pill);
+      background: var(--color-inset);
+      border: 1px solid var(--color-border-strong);
+      position: relative;
+      flex-shrink: 0;
+      transition: background var(--duration) var(--ease), border-color var(--duration) var(--ease);
+    }
+    .switch__track::after {
+      content: "";
+      position: absolute;
+      inset-block-start: 0.125rem;
+      inset-inline-start: 0.125rem;
+      inline-size: 0.75rem;
+      block-size: 0.75rem;
+      border-radius: 50%;
+      background: var(--color-text-faint);
+      transition: transform var(--duration) var(--ease), background var(--duration) var(--ease);
+    }
+    .switch input:checked + .switch__track { background: var(--color-accent-tint); border-color: var(--color-accent); }
+    .switch input:checked + .switch__track::after {
+      transform: translateX(0.875rem);
+      background: var(--color-accent);
+    }
+    .switch input:focus-visible + .switch__track { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+    .switch__label { font-size: var(--step--1); color: var(--color-text-muted); }
+
+    /* ---------- pills ---------- */
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-1);
+      padding-block: 0.1875rem;
+      padding-inline: var(--space-2);
+      border-radius: var(--radius-pill);
+      border: 1px solid transparent;
+      font-size: var(--step--2);
+      font-weight: 620;
+      white-space: nowrap;
+    }
+    .pill--good { background: var(--color-good-tint); color: var(--color-good); border-color: oklch(from var(--color-good) l c h / 0.26); }
+    .pill--warn { background: var(--color-warn-tint); color: var(--color-warn); border-color: oklch(from var(--color-warn) l c h / 0.26); }
+    .pill--bad  { background: var(--color-bad-tint);  color: var(--color-bad);  border-color: oklch(from var(--color-bad) l c h / 0.26); }
+    .pill--info { background: var(--color-accent-tint); color: var(--color-accent-text); border-color: oklch(from var(--color-accent) l c h / 0.26); }
+    .pill--mute { background: oklch(from var(--color-text-muted) l c h / 0.12); color: var(--color-text-muted); border-color: var(--color-border-strong); }
+
+    .dot { inline-size: 0.375rem; block-size: 0.375rem; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+    .dot--live { animation: pulse 2s infinite; }
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0 oklch(from currentColor l c h / 0.6); }
+      70%  { box-shadow: 0 0 0 0.375rem oklch(from currentColor l c h / 0); }
+      100% { box-shadow: 0 0 0 0 oklch(from currentColor l c h / 0); }
+    }
+
+    /* ---------- cards ---------- */
+
+    .card {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-raised);
+      min-inline-size: 0;
+    }
+    .card__head {
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+      flex-wrap: wrap;
+      padding-block: var(--space-3);
+      padding-inline: var(--space-5);
+      border-block-end: 1px solid var(--color-border);
+    }
+    .card__body { padding: var(--space-5); }
+    .card__body--flush { padding: 0; }
+
+    .stack { display: grid; gap: var(--space-5); align-content: start; }
+    .cluster { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+    .spacer { flex: 1 1 auto; }
+
+    /* ---------- stats ---------- */
+
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: var(--space-4); }
+    .stat { padding-block: var(--space-4); padding-inline: var(--space-4); }
+    .stat__value {
+      display: flex;
+      align-items: baseline;
+      gap: var(--space-1);
+      margin-block-start: var(--space-2);
+      font-size: var(--step-3);
+      font-weight: 660;
+      letter-spacing: -0.02em;
+    }
+    .stat__value small { font-size: var(--step-1); font-weight: 500; color: var(--color-text-faint); }
+    .stat__value--text { font-size: var(--step-1); font-weight: 600; }
+    .stat__note { margin-block-start: var(--space-1); font-size: var(--step--2); color: var(--color-text-faint); }
+
+    /* ---------- table ---------- */
+
+    .table-wrap { overflow-x: auto; }
+    table { inline-size: 100%; border-collapse: collapse; min-inline-size: 46rem; }
+    th {
+      padding-block: var(--space-2);
+      padding-inline: var(--space-3);
+      text-align: start;
+      font-size: var(--step--2);
+      font-weight: 620;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--color-text-faint);
+      background: var(--color-inset);
+      border-block-end: 1px solid var(--color-border);
+      white-space: nowrap;
+    }
+    td {
+      padding-block: var(--space-3);
+      padding-inline: var(--space-3);
+      border-block-end: 1px solid var(--color-border);
+      vertical-align: middle;
+    }
+    :is(th, td):first-child { padding-inline-start: var(--space-5); }
+    :is(th, td):last-child { padding-inline-end: var(--space-5); }
+    tbody tr { cursor: pointer; transition: background var(--duration) var(--ease); }
+    tbody tr:hover { background: var(--color-surface-raised); }
+    tbody tr[aria-selected="true"] { background: var(--color-accent-tint); }
+    tbody tr:last-child td { border-block-end: none; }
+    .cell-id { white-space: nowrap; font-size: var(--step--1); }
+    .cell-end { text-align: end; }
+    .row-open {
+      inline-size: 100%;
+      background: none;
+      border: none;
+      padding: 0;
+      font: inherit;
+      color: var(--color-text);
+      text-align: start;
+      font-family: var(--font-mono);
+      font-size: var(--step--1);
+    }
+    .row-open:hover { color: var(--color-accent-text); }
+
+    /* A sandbox at 0.1% of its ceiling still has to read as "alive but idle", so
+       the track is visible on its own and the fill has a floor width. */
+    .meter {
+      inline-size: 3.5rem;
+      block-size: 0.375rem;
+      border-radius: var(--radius-pill);
+      background: var(--color-border);
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .meter__fill {
+      display: block;
+      block-size: 100%;
+      min-inline-size: 0.25rem;
+      border-radius: var(--radius-pill);
+      background: var(--color-accent);
+      transition: inline-size var(--duration) var(--ease);
+    }
+    .meter--hot .meter__fill { background: var(--color-warn); }
+    .meter--crit .meter__fill { background: var(--color-bad); }
+
+    /* ---------- empty states ---------- */
+
+    .empty {
+      display: grid;
+      justify-items: center;
+      gap: var(--space-2);
+      padding-block: var(--space-6);
+      padding-inline: var(--space-5);
+      text-align: center;
+      color: var(--color-text-faint);
+    }
+    .empty svg { inline-size: 2rem; block-size: 2rem; opacity: 0.4; }
+    .empty__hint { font-size: var(--step--1); }
+
+    /* ---------- tabs ---------- */
+
+    .tablist { display: flex; gap: var(--space-1); overflow-x: auto; }
+    .tab {
+      background: none;
+      border: none;
+      border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+      padding-block: var(--space-3);
+      padding-inline: var(--space-3);
+      font-size: var(--step--1);
+      font-weight: 620;
+      color: var(--color-text-faint);
+      border-block-end: 2px solid transparent;
+      white-space: nowrap;
+      transition: color var(--duration) var(--ease);
+    }
+    .tab:hover { color: var(--color-text-muted); }
+    .tab[aria-selected="true"] { color: var(--color-text); border-block-end-color: var(--color-accent); }
+    .tab__count {
+      margin-inline-start: var(--space-1);
+      padding-inline: var(--space-1);
+      border-radius: var(--radius-pill);
+      background: var(--color-accent-tint);
+      color: var(--color-accent-text);
+      font-size: var(--step--2);
+      font-variant-numeric: tabular-nums;
+    }
+    .tabpanel { display: none; }
+    .tabpanel[data-active] { display: block; }
+    .panel-note {
+      font-size: var(--step--1);
+      color: var(--color-text-faint);
+      margin-block-end: var(--space-3);
+    }
+
+    /* ---------- terminal ---------- */
+
+    .terminal {
+      display: grid;
+      grid-template-rows: 1fr auto;
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+      background: var(--color-void);
+    }
+    .terminal__out {
+      font-family: var(--font-mono);
+      font-size: var(--step--1);
+      line-height: 1.65;
+      padding: var(--space-4);
+      block-size: clamp(18rem, 52vh, 44rem);
+      overflow-y: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: oklch(88% 0.02 var(--hue-neutral));
+    }
+    .terminal__hint { color: var(--color-text-faint); font-style: italic; }
+    .terminal__cmd { color: var(--color-accent-text); margin-block-start: var(--space-3); }
+    .terminal__cmd::before { content: "$ "; color: var(--color-text-faint); }
+    .terminal__meta { font-size: var(--step--2); }
+    .terminal__meta--ok { color: var(--color-good); }
+    .terminal__meta--bad { color: var(--color-bad); }
+    .terminal__meta--pending { color: var(--color-warn); }
+
+    .terminal__form {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      padding-block: var(--space-2);
+      padding-inline: var(--space-3);
+      background: var(--color-inset);
+      border-block-start: 1px solid var(--color-border);
+    }
+    .terminal__form:focus-within { box-shadow: inset 0 0 0 1px var(--color-accent); }
+    .terminal__cwd { color: var(--color-text-faint); font-family: var(--font-mono); font-size: var(--step--1); white-space: nowrap; }
+    .terminal__input {
+      flex: 1 1 auto;
+      border: none;
+      background: none;
+      padding: 0;
+      font-family: var(--font-mono);
+      font-size: var(--step--1);
+      min-inline-size: 4rem;
+    }
+    .terminal__input:focus-visible { outline: none; }
+
+    /* ---------- files ---------- */
+
+    .files { container-type: inline-size; }
+    .files__split { display: grid; gap: var(--space-4); grid-template-columns: minmax(0, 1fr); }
+    @container (min-width: 52rem) {
+      .files__split { grid-template-columns: minmax(14rem, 22rem) minmax(0, 1fr); }
+    }
+
+    .crumbs {
+      display: flex;
+      align-items: center;
+      gap: var(--space-1);
+      flex-wrap: wrap;
+      font-family: var(--font-mono);
+      font-size: var(--step--1);
+    }
+    .crumbs button {
+      background: none;
+      border: none;
+      padding-block: 0.125rem;
+      padding-inline: var(--space-1);
+      border-radius: var(--radius-xs);
+      color: var(--color-accent-text);
+      font-family: var(--font-mono);
+      font-size: var(--step--1);
+    }
+    .crumbs button:hover { background: var(--color-accent-tint); }
+    .crumbs__sep { color: var(--color-text-faint); }
+
+    .file-list {
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-sm);
+      max-block-size: 26rem;
+      overflow-y: auto;
+    }
+    .file-row {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      inline-size: 100%;
+      padding-block: var(--space-2);
+      padding-inline: var(--space-3);
+      background: none;
+      border: none;
+      border-block-end: 1px solid var(--color-border);
+      font-family: var(--font-mono);
+      font-size: var(--step--1);
+      text-align: start;
+    }
+    .file-row:last-child { border-block-end: none; }
+    .file-row:hover { background: var(--color-surface-raised); }
+    .file-row svg { inline-size: 0.875rem; block-size: 0.875rem; flex-shrink: 0; color: var(--color-text-faint); }
+    .file-row--dir svg { color: var(--color-accent-text); }
+    .file-row__name { flex: 1 1 auto; min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-row__size { color: var(--color-text-faint); font-size: var(--step--2); font-variant-numeric: tabular-nums; }
+    .file-row__note { color: var(--color-text-faint); }
+
+    .viewer {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: var(--space-2);
+      min-inline-size: 0;
+    }
+    .viewer__head { display: flex; align-items: center; gap: var(--space-2); min-inline-size: 0; }
+    .viewer__name {
+      flex: 1 1 auto;
+      min-inline-size: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: var(--font-mono);
+      font-size: var(--step--1);
+    }
+    .viewer__body {
+      margin: 0;
+      padding: var(--space-4);
+      background: var(--color-inset);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-sm);
+      font-family: var(--font-mono);
+      font-size: var(--step--1);
+      line-height: 1.6;
+      block-size: clamp(14rem, 42vh, 36rem);
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    /* ---------- activity ---------- */
+
+    .events { max-block-size: 34rem; overflow-y: auto; }
+    .event {
+      display: flex;
+      align-items: baseline;
+      gap: var(--space-3);
+      padding-block: var(--space-2);
+      border-block-end: 1px solid var(--color-border);
+      font-size: var(--step--1);
+    }
+    .event:last-child { border-block-end: none; }
+    .event__at { color: var(--color-text-faint); font-family: var(--font-mono); font-size: var(--step--2); flex-shrink: 0; }
+    .event__op {
+      padding-block: 0.0625rem;
+      padding-inline: var(--space-1);
+      border-radius: var(--radius-xs);
+      background: oklch(from var(--color-text-muted) l c h / 0.14);
+      color: var(--color-text-muted);
+      font-family: var(--font-mono);
+      font-size: var(--step--2);
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .event--ok .event__op { background: var(--color-good-tint); color: var(--color-good); }
+    .event--bad .event__op { background: var(--color-bad-tint); color: var(--color-bad); }
+    .event__target {
+      flex: 1 1 auto;
+      min-inline-size: 0;
+      font-family: var(--font-mono);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .event__detail { color: var(--color-text-faint); font-size: var(--step--2); flex-shrink: 0; }
+    .event__ms {
+      color: var(--color-text-faint);
+      font-size: var(--step--2);
+      font-variant-numeric: tabular-nums;
+      flex-shrink: 0;
+      min-inline-size: 3.25rem;
+      text-align: end;
+    }
+
+    /* ---------- definition grids ---------- */
+
+    .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(12.5rem, 1fr)); gap: var(--space-4); }
+    .kv dt {
+      font-size: var(--step--2);
+      font-weight: 620;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--color-text-faint);
+      margin-block-end: var(--space-1);
+    }
+    .kv dd { font-family: var(--font-mono); font-size: var(--step--1); overflow-wrap: anywhere; }
+    .kv dd.is-off { color: var(--color-text-faint); }
+    .kv dd.is-good { color: var(--color-good); }
+
+    /* ---------- runtime catalogue ---------- */
+
+    .runtimes { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: var(--space-4); }
+    .runtime {
+      display: grid;
+      gap: var(--space-3);
+      align-content: start;
+      padding: var(--space-4);
+      background: var(--color-surface-raised);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-sm);
+    }
+    .runtime__head { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+    .runtime__alias { font-family: var(--font-mono); font-size: var(--step-0); font-weight: 620; }
+    .runtime__desc { font-size: var(--step--1); color: var(--color-text-muted); }
+    .runtime__image { font-family: var(--font-mono); font-size: var(--step--2); color: var(--color-text-faint); overflow-wrap: anywhere; }
+    .runtime__limits { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-1);
+      padding-block: 0.125rem;
+      padding-inline: var(--space-2);
+      border-radius: var(--radius-xs);
+      background: var(--color-inset);
+      border: 1px solid var(--color-border);
+      font-family: var(--font-mono);
+      font-size: var(--step--2);
+      color: var(--color-text-muted);
+    }
+    .chip--net { color: var(--color-warn); border-color: oklch(from var(--color-warn) l c h / 0.3); }
+    .chip--offline { color: var(--color-good); border-color: oklch(from var(--color-good) l c h / 0.3); }
+
+    .snippet {
+      margin: 0;
+      padding: var(--space-4);
+      background: var(--color-void);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-sm);
+      font-family: var(--font-mono);
+      font-size: var(--step--2);
+      line-height: 1.6;
+      overflow-x: auto;
+      color: oklch(88% 0.02 var(--hue-neutral));
+    }
+    .snippet__key { color: var(--color-accent-text); }
+    .snippet__str { color: var(--color-good); }
+    .snippet__note { color: var(--color-text-faint); }
+
+    /* ---------- notices ---------- */
+
+    .notice {
+      display: flex;
+      gap: var(--space-3);
+      padding-block: var(--space-3);
+      padding-inline: var(--space-4);
+      border-radius: var(--radius-sm);
+      font-size: var(--step--1);
+      background: var(--color-warn-tint);
+      border: 1px solid oklch(from var(--color-warn) l c h / 0.24);
+      color: oklch(88% 0.07 82);
+    }
+    .notice svg { inline-size: 1rem; block-size: 1rem; flex-shrink: 0; margin-block-start: 0.125rem; }
+
+    /* ---------- toasts ---------- */
+
+    .toasts {
+      position: fixed;
+      inset-block-end: var(--space-5);
+      inset-inline-end: var(--space-5);
+      z-index: 60;
+      display: grid;
+      gap: var(--space-2);
+      justify-items: end;
+    }
+    .toast {
+      padding-block: var(--space-3);
+      padding-inline: var(--space-4);
+      max-inline-size: 24rem;
+      background: var(--color-surface-raised);
+      border: 1px solid var(--color-border-strong);
+      border-inline-start: 3px solid var(--color-accent);
+      border-radius: var(--radius-sm);
+      box-shadow: var(--shadow-raised);
+      font-size: var(--step--1);
+      animation: slide-in var(--duration) var(--ease);
+    }
+    .toast--good { border-inline-start-color: var(--color-good); }
+    .toast--bad { border-inline-start-color: var(--color-bad); }
+    @keyframes slide-in { from { opacity: 0; transform: translateX(0.75rem); } to { opacity: 1; transform: none; } }
+  }
+
+  @layer views {
+    /* ---------- shell ---------- */
+
+    .topbar {
+      position: sticky;
+      inset-block-start: 0;
+      z-index: 30;
+      background: oklch(from var(--color-canvas) l c h / 0.85);
+      backdrop-filter: blur(0.75rem);
+    }
+
+    .banner {
+      display: flex;
+      align-items: center;
+      gap: var(--space-4);
+      flex-wrap: wrap;
+      padding-block: var(--space-3);
+      padding-inline: var(--space-5);
+      border-block-end: 1px solid var(--color-border);
+    }
+
+    .brand { display: flex; align-items: center; gap: var(--space-3); }
+    .brand__text { display: grid; }
+    .brand__mark {
+      display: grid;
+      place-items: center;
+      inline-size: 1.75rem;
+      block-size: 1.75rem;
+      border-radius: var(--radius-xs);
+      background: linear-gradient(140deg, var(--color-accent), oklch(45% 0.18 var(--hue-accent)));
+      box-shadow: 0 0 0 1px oklch(100% 0 0 / 0.08), 0 4px 14px var(--color-accent-glow);
+      flex-shrink: 0;
+    }
+    .brand__mark svg { inline-size: 0.9375rem; block-size: 0.9375rem; }
+    .brand__name { font-size: var(--step-1); font-weight: 640; letter-spacing: -0.015em; }
+    .brand__origin { font-size: var(--step--2); color: var(--color-text-faint); font-family: var(--font-mono); }
+
+    .viewnav {
+      padding-inline: var(--space-5);
+      border-block-end: 1px solid var(--color-border);
+    }
+    .viewnav__inner { display: flex; gap: var(--space-1); max-inline-size: var(--measure-page); margin-inline: auto; }
+
+    main { max-inline-size: var(--measure-page); margin-inline: auto; padding: var(--space-5); }
+    .view { display: none; }
+    .view[data-active] { display: grid; gap: var(--space-5); align-content: start; }
+
+    /* ---------- workspace header ---------- */
+
+    .worksheet__bar {
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+      flex-wrap: wrap;
+      padding-block: var(--space-3);
+      padding-inline: var(--space-5);
+      border-block-end: 1px solid var(--color-border);
+    }
+    .worksheet__id { font-family: var(--font-mono); font-size: var(--step-0); font-weight: 620; }
+
+    /* ---------- gate ---------- */
+
+    .gate { display: grid; place-items: start center; padding-block: 8vh; padding-inline: var(--space-5); }
+    .gate .card { max-inline-size: 27rem; inline-size: 100%; }
+    .gate__form { display: grid; gap: var(--space-4); }
+    .gate p { color: var(--color-text-muted); font-size: var(--step--1); }
+  }
+
+  @layer utilities {
+    .is-hidden { display: none; }
+    .spin { animation: rot 1s linear infinite; }
+    @keyframes rot { to { transform: rotate(360deg); } }
+    .text-muted { color: var(--color-text-muted); }
+    .text-faint { color: var(--color-text-faint); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+</style>
+</head>
+<body>
+
+<!-- ==================== token gate ==================== -->
+<div id="gate" class="gate is-hidden">
+  <div class="card">
+    <div class="card__body">
+      <div class="stack">
+        <div>
+          <h1>sandboxd</h1>
+          <p>Sandbox execution service for AI agents.</p>
+        </div>
+        <p class="notice">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+          </svg>
+          <span>The service token can start containers on the host, so treat it as a root
+          credential. Only use this page over localhost or a private network.</span>
+        </p>
+        <form id="gate-form" class="gate__form">
+          <div class="field">
+            <label class="eyebrow" for="token-input">Service token</label>
+            <input id="token-input" class="input mono" type="password" autocomplete="current-password"
+                   spellcheck="false" placeholder="X-Sandbox-Token" required />
+          </div>
+          <button class="btn btn--primary" type="submit" style="justify-content:center">Connect</button>
+          <p id="gate-error" class="error" role="alert"></p>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== app ==================== -->
+<div id="app" class="is-hidden">
+ <div class="topbar">
+  <header class="banner">
+    <div class="brand">
+      <span class="brand__mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="oklch(99% 0 0)" stroke-width="2.2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 7h16M4 12h16M4 17h10" />
+        </svg>
+      </span>
+      <span class="brand__text">
+        <span class="brand__name">sandboxd</span>
+        <span class="brand__origin" id="origin"></span>
+      </span>
+    </div>
+    <span id="health" class="pill pill--mute"><i class="dot"></i>connecting</span>
+    <div class="spacer"></div>
+    <label class="switch" title="Sampling costs a daemon round trip per sandbox">
+      <input type="checkbox" id="opt-usage" checked />
+      <span class="switch__track"></span>
+      <span class="switch__label">Resource sampling</span>
+    </label>
+    <label class="switch">
+      <input type="checkbox" id="opt-auto" checked />
+      <span class="switch__track"></span>
+      <span class="switch__label">Auto-refresh</span>
+    </label>
+    <button id="btn-refresh" class="btn btn--quiet btn--icon" type="button" aria-label="Refresh now">
+      <svg id="refresh-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+           stroke-linecap="round" aria-hidden="true">
+        <path d="M21 12a9 9 0 1 1-3-6.7" /><path d="M21 3v6h-6" />
+      </svg>
+    </button>
+    <button id="btn-signout" class="btn btn--quiet btn--small" type="button">Sign out</button>
+  </header>
+
+  <nav class="viewnav" aria-label="Views">
+   <div class="viewnav__inner" role="tablist">
+      <button class="tab" type="button" role="tab" data-view-tab="sessions"
+              aria-selected="true" aria-controls="view-sessions">
+        Sessions<span class="tab__count is-hidden" id="nav-session-count"></span>
+      </button>
+      <button class="tab" type="button" role="tab" data-view-tab="workspace"
+              aria-selected="false" aria-controls="view-workspace">Workspace</button>
+      <button class="tab" type="button" role="tab" data-view-tab="runtimes"
+              aria-selected="false" aria-controls="view-runtimes">Runtimes &amp; policy</button>
+   </div>
+  </nav>
+ </div>
+
+  <main>
+    <!-- ---------- sessions ---------- -->
+    <section class="view" data-view="sessions" id="view-sessions" role="tabpanel" aria-label="Sessions" data-active>
+      <ul class="stats">
+        <li class="card stat">
+          <p class="eyebrow">Sessions</p>
+          <p class="stat__value"><span id="stat-sessions">–</span><small id="stat-limit"></small></p>
+          <p class="stat__note" id="stat-live">&nbsp;</p>
+        </li>
+        <li class="card stat">
+          <p class="eyebrow">Memory in use</p>
+          <p class="stat__value" id="stat-memory">–</p>
+          <p class="stat__note" id="stat-memory-note">across live sandboxes</p>
+        </li>
+        <li class="card stat">
+          <p class="eyebrow">Processes</p>
+          <p class="stat__value" id="stat-pids">–</p>
+          <p class="stat__note">summed across sandboxes</p>
+        </li>
+        <li class="card stat">
+          <p class="eyebrow">Runtimes allowed</p>
+          <p class="stat__value" id="stat-runtimes">–</p>
+          <p class="stat__note">on the server-side allowlist</p>
+        </li>
+      </ul>
+
+      <div class="card">
+        <div class="card__head">
+          <h2>Open sessions</h2>
+          <span id="poll-note" class="eyebrow"></span>
+          <div class="spacer"></div>
+          <button id="btn-new" class="btn btn--primary btn--small" type="button"
+                  aria-expanded="false" aria-controls="new-panel">New session</button>
+        </div>
+
+        <div id="new-panel" class="card__body is-hidden" style="border-block-end:1px solid var(--color-border)">
+          <form id="new-form" class="stack" style="gap:var(--space-4)">
+            <div class="cluster" style="align-items:end;gap:var(--space-4)">
+              <div class="field" style="flex:1 1 12rem">
+                <label class="eyebrow" for="new-runtime">Runtime</label>
+                <select id="new-runtime" class="select"></select>
+              </div>
+              <div class="field" style="flex:1 1 12rem">
+                <label class="eyebrow" for="new-id">Session id</label>
+                <input id="new-id" class="input mono" placeholder="auto-generated" spellcheck="false" />
+              </div>
+              <div class="field" style="flex:1 1 10rem">
+                <label class="eyebrow" for="new-tenant">Tenant</label>
+                <input id="new-tenant" class="input mono" placeholder="optional" spellcheck="false" />
+              </div>
+              <label class="switch" style="padding-block:var(--space-2)"
+                     title="Attach to the session under this id when one is already open">
+                <input type="checkbox" id="new-reuse" />
+                <span class="switch__track"></span>
+                <span class="switch__label">Reuse if open</span>
+              </label>
+              <button class="btn btn--primary" type="submit" id="new-submit">Create</button>
+              <button class="btn btn--quiet" type="button" id="new-cancel">Cancel</button>
+            </div>
+            <p class="field__hint">
+              <span id="new-runtime-note"></span>
+              <span class="text-faint">— set per runtime by the operator, not per session.
+              Pick a different runtime to change them.</span>
+            </p>
+            <p id="new-error" class="error" role="alert"></p>
+          </form>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Session</th>
+                <th scope="col">Runtime</th>
+                <th scope="col">Tenant</th>
+                <th scope="col">State</th>
+                <th scope="col">Idle</th>
+                <th scope="col">Memory</th>
+                <th scope="col">PIDs</th>
+                <th scope="col"><span class="is-hidden">Actions</span></th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+
+        <div id="sessions-empty" class="empty is-hidden">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+            <rect x="3" y="3" width="18" height="18" rx="2" /><path d="M8 12h8" />
+          </svg>
+          <p>No open sessions.</p>
+          <p class="empty__hint">Create one here, or let an agent open its own.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- workspace ---------- -->
+    <section class="view" data-view="workspace" id="view-workspace" role="tabpanel" aria-label="Workspace">
+      <div id="workspace-empty" class="card">
+        <div class="empty">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+            <path d="M4 17h16M7 7l4 4-4 4" />
+          </svg>
+          <p>No session selected.</p>
+          <p class="empty__hint">Pick one on the Sessions tab to get a terminal, its files and its activity.</p>
+        </div>
+      </div>
+
+      <div id="workspace" class="card is-hidden">
+        <div class="worksheet__bar">
+          <span class="worksheet__id" id="ws-id"></span>
+          <span class="pill pill--info" id="ws-runtime"></span>
+          <span id="ws-state"></span>
+          <div class="spacer"></div>
+          <button class="btn btn--quiet btn--small" type="button" id="ws-back">All sessions</button>
+          <button class="btn btn--danger btn--small" type="button" id="ws-kill">Terminate</button>
+        </div>
+
+        <div class="card__head" style="padding-block:0">
+          <div class="tablist" role="tablist" aria-label="Session views">
+            <button class="tab" type="button" role="tab" data-pane-tab="terminal"
+                    aria-selected="true" aria-controls="pane-terminal">Terminal</button>
+            <button class="tab" type="button" role="tab" data-pane-tab="files"
+                    aria-selected="false" aria-controls="pane-files">Files</button>
+            <button class="tab" type="button" role="tab" data-pane-tab="activity"
+                    aria-selected="false" aria-controls="pane-activity">
+              Activity<span class="tab__count is-hidden" id="event-count"></span>
+            </button>
+            <button class="tab" type="button" role="tab" data-pane-tab="info"
+                    aria-selected="false" aria-controls="pane-info">Info</button>
+          </div>
+        </div>
+
+        <div class="card__body">
+          <!-- terminal -->
+          <div class="tabpanel" data-pane="terminal" id="pane-terminal" role="tabpanel"
+               aria-label="Terminal" data-active>
+            <div class="stack" style="gap:var(--space-3)">
+              <div class="cluster">
+                <p class="panel-note" style="margin:0">
+                  Each command is its own process — a <code class="mono">cd</code> does not carry to
+                  the next one. Chain with <code class="mono">&amp;&amp;</code> instead.
+                </p>
+                <div class="spacer"></div>
+                <button class="btn btn--quiet btn--small" type="button" id="term-clear">Clear</button>
+              </div>
+              <div class="terminal">
+                <div id="term" class="terminal__out" tabindex="0" role="log" aria-label="Command output"></div>
+                <form id="exec-form" class="terminal__form">
+                  <label class="terminal__cwd" for="exec-input" id="term-cwd">$</label>
+                  <input id="exec-input" class="terminal__input" spellcheck="false" autocomplete="off"
+                         placeholder="ls -la" />
+                  <button class="btn btn--primary btn--small" type="submit" id="exec-submit">Run</button>
+                </form>
+              </div>
+            </div>
+          </div>
+
+          <!-- files -->
+          <div class="tabpanel files" data-pane="files" id="pane-files" role="tabpanel" aria-label="Files">
+            <div class="stack" style="gap:var(--space-3)">
+              <div class="cluster">
+                <div class="crumbs" id="crumbs"></div>
+                <div class="spacer"></div>
+                <span class="eyebrow">Source</span>
+                <select id="files-source" class="select" style="inline-size:auto">
+                  <option value="live">Live sandbox</option>
+                  <option value="stored">Stored workspace</option>
+                </select>
+              </div>
+              <p class="panel-note" id="files-note" style="margin:0"></p>
+              <div class="files__split">
+                <div id="file-list" class="file-list"></div>
+                <div id="viewer" class="viewer is-hidden">
+                  <div class="viewer__head">
+                    <span class="viewer__name" id="viewer-name"></span>
+                    <button class="btn btn--quiet btn--small" type="button" id="viewer-close">Close</button>
+                  </div>
+                  <pre class="viewer__body" id="viewer-body"></pre>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- activity -->
+          <div class="tabpanel" data-pane="activity" id="pane-activity" role="tabpanel" aria-label="Activity">
+            <p class="panel-note">
+              Every operation on this sandbox, an agent's included. Payloads are never
+              recorded — only what was addressed and how it went. The service keeps the
+              most recent 200 entries per session.
+            </p>
+            <div id="events" class="events"></div>
+          </div>
+
+          <!-- info -->
+          <div class="tabpanel" data-pane="info" id="pane-info" role="tabpanel" aria-label="Session info">
+            <dl class="kv" id="session-kv"></dl>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- runtimes & policy ---------- -->
+    <section class="view" data-view="runtimes" id="view-runtimes" role="tabpanel" aria-label="Runtimes and policy">
+      <div class="card">
+        <div class="card__head">
+          <h2>Runtime allowlist</h2>
+          <div class="spacer"></div>
+          <span class="eyebrow">a request may name an alias, nothing else</span>
+        </div>
+        <div class="card__body">
+          <p class="panel-note">
+            A client picks one of these by name. The image, the ceilings and whether the
+            sandbox gets a network are the operator's decision, per runtime — which is what
+            stops a caller from running an image of its choosing.
+          </p>
+          <div class="runtimes" id="runtime-cards"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card__head">
+          <h2>Where these are set</h2>
+          <div class="spacer"></div>
+          <span class="eyebrow">read-only here, on purpose</span>
+        </div>
+        <div class="card__body stack" style="gap:var(--space-4)">
+          <p class="panel-note" style="margin:0">
+            Memory, CPU, processes and network come from <code class="mono">SandboxdConfig</code>
+            where the service is started — per runtime through
+            <code class="mono">SandboxRuntime</code>, and service-wide as the default any runtime
+            that names none inherits. Changing one is a config change and a restart, deliberately:
+            a ceiling edited in a browser would revert on the next restart with nobody able to say
+            why. This page shows what is in force, not a form.
+          </p>
+          <pre class="snippet"><code><span class="snippet__key">SandboxdConfig</span>(
+    token=...,
+    runtimes={
+        <span class="snippet__str">"python"</span>: <span class="snippet__key">SandboxRuntime</span>(
+            image=<span class="snippet__str">"python:3.12-slim"</span>,
+            mem_limit=<span class="snippet__str">"1g"</span>, cpus=<span class="snippet__str">1.0</span>, pids_limit=<span class="snippet__str">512</span>,
+        ),
+        <span class="snippet__str">"datascience"</span>: <span class="snippet__key">SandboxRuntime</span>(
+            runtime=<span class="snippet__str">"python-datascience"</span>,  <span class="snippet__note"># built on first use</span>
+            mem_limit=<span class="snippet__str">"4g"</span>, cpus=<span class="snippet__str">2.0</span>,
+        ),
+        <span class="snippet__str">"scraping"</span>: <span class="snippet__key">SandboxRuntime</span>(
+            runtime=<span class="snippet__str">"python-scraping"</span>,
+            network_mode=<span class="snippet__str">"bridge"</span>,   <span class="snippet__note"># the one runtime given the network</span>
+        ),
+    },
+    default_runtime=<span class="snippet__str">"python"</span>,
+    <span class="snippet__note"># Defaults for any runtime above that names none of its own.</span>
+    mem_limit=<span class="snippet__str">"1g"</span>, cpus=<span class="snippet__str">1.0</span>, network_mode=<span class="snippet__str">"none"</span>,
+    <span class="snippet__note"># What actually bounds the host: this times the largest runtime ceiling.</span>
+    max_sessions=<span class="snippet__str">20</span>,
+)</code></pre>
+          <p class="panel-note" style="margin:0">
+            A service-wide value is a <strong>default, not a maximum</strong> — a runtime may name
+            more. There is also <code class="mono">SUGGESTED_RUNTIMES</code>, a fuller catalogue to
+            adopt or copy from.
+          </p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card__head">
+          <h2>Service policy</h2>
+          <div class="spacer"></div>
+          <span class="eyebrow">defaults, and the limits nothing can raise</span>
+        </div>
+        <div class="card__body">
+          <dl class="kv" id="policy-kv"></dl>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+<script>
+(() => {
+  "use strict";
+
+  const TOKEN_HEADER = "X-Sandbox-Token";
+  const STORE_KEY = "sandboxd.token";
+  const POLL_MS = 3000;
+  const TOAST_MS = 4800;
+  const WORK_DIR_FALLBACK = "/workspace";
+  const FILE_READ_LINES = 500;
+
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    gate: $("gate"), gateForm: $("gate-form"), gateError: $("gate-error"), tokenInput: $("token-input"),
+    app: $("app"), origin: $("origin"), health: $("health"),
+    optUsage: $("opt-usage"), optAuto: $("opt-auto"),
+    btnRefresh: $("btn-refresh"), refreshIcon: $("refresh-icon"), btnSignout: $("btn-signout"),
+    navCount: $("nav-session-count"),
+    statSessions: $("stat-sessions"), statLimit: $("stat-limit"), statLive: $("stat-live"),
+    statMemory: $("stat-memory"), statMemoryNote: $("stat-memory-note"),
+    statPids: $("stat-pids"), statRuntimes: $("stat-runtimes"),
+    rows: $("rows"), sessionsEmpty: $("sessions-empty"), pollNote: $("poll-note"),
+    btnNew: $("btn-new"), newPanel: $("new-panel"), newForm: $("new-form"),
+    newRuntime: $("new-runtime"), newRuntimeNote: $("new-runtime-note"),
+    newId: $("new-id"), newTenant: $("new-tenant"), newReuse: $("new-reuse"),
+    newError: $("new-error"), newSubmit: $("new-submit"),
+    newCancel: $("new-cancel"),
+    workspaceEmpty: $("workspace-empty"), workspace: $("workspace"),
+    wsId: $("ws-id"), wsRuntime: $("ws-runtime"), wsState: $("ws-state"),
+    wsBack: $("ws-back"), wsKill: $("ws-kill"),
+    term: $("term"), termCwd: $("term-cwd"), termClear: $("term-clear"),
+    execForm: $("exec-form"), execInput: $("exec-input"), execSubmit: $("exec-submit"),
+    crumbs: $("crumbs"), fileList: $("file-list"), filesSource: $("files-source"), filesNote: $("files-note"),
+    viewer: $("viewer"), viewerName: $("viewer-name"), viewerBody: $("viewer-body"),
+    viewerClose: $("viewer-close"),
+    events: $("events"), eventCount: $("event-count"),
+    sessionKv: $("session-kv"),
+    runtimeCards: $("runtime-cards"), policyKv: $("policy-kv"),
+    toasts: $("toasts"),
+  };
+
+  const ICON_DIR =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">' +
+    '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+  const ICON_FILE =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">' +
+    '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
+
+  // sessionStorage, not localStorage: a root-equivalent credential should not
+  // outlive the browser session.
+  let token = sessionStorage.getItem(STORE_KEY) || "";
+  let view = "sessions";
+  let pane = "terminal";
+  let selected = null;
+  let sessions = [];
+  let policy = null;
+  let workDir = WORK_DIR_FALLBACK;
+  let cwd = WORK_DIR_FALLBACK;
+  let filesSource = "live";
+  let commandHistory = [];
+  let historyAt = -1;
+  let lastSeq = 0;
+  let eventTotal = 0;
+  let timer = null;
+  let inFlight = false;
+
+  // ---------- formatting ----------
+
+  const bytes = (value) => {
+    if (value === null || value === undefined) return "–";
+    if (value < 1024) return value + " B";
+    const units = ["KB", "MB", "GB", "TB"];
+    let scaled = value / 1024;
+    let unit = 0;
+    while (scaled >= 1024 && unit < units.length - 1) { scaled /= 1024; unit += 1; }
+    return scaled.toFixed(scaled < 10 ? 1 : 0) + " " + units[unit];
+  };
+
+  const duration = (seconds) => {
+    if (seconds === null || seconds === undefined) return "–";
+    if (seconds < 60) return seconds.toFixed(0) + "s";
+    if (seconds < 3600) return Math.floor(seconds / 60) + "m " + Math.floor(seconds % 60) + "s";
+    if (seconds < 86400) return Math.floor(seconds / 3600) + "h " + Math.floor((seconds % 3600) / 60) + "m";
+    return Math.floor(seconds / 86400) + "d " + Math.floor((seconds % 86400) / 3600) + "h";
+  };
+
+  const esc = (value) =>
+    String(value).replace(/[&<>"']/g, (char) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+
+  const stateBadge = (row) =>
+    row.alive
+      ? '<span class="pill pill--good"><i class="dot dot--live"></i>running</span>'
+      : '<span class="pill pill--bad"><i class="dot"></i>stopped</span>';
+
+  function toast(message, kind) {
+    const node = document.createElement("p");
+    node.className = "toast" + (kind ? " toast--" + kind : "");
+    node.textContent = message;
+    el.toasts.append(node);
+    setTimeout(() => node.remove(), TOAST_MS);
+  }
+
+  async function api(path, options) {
+    const opts = options || {};
+    const headers = { [TOKEN_HEADER]: token };
+    if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+    const response = await fetch(path, {
+      method: opts.method || "GET",
+      headers,
+      body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+    });
+    if (response.status === 401) {
+      signOut("Token rejected by the service.");
+      throw new Error("unauthorized");
+    }
+    if (!response.ok) {
+      let detail = "HTTP " + response.status;
+      try {
+        const body = await response.json();
+        if (body && body.detail) {
+          detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+        }
+      } catch (_) { /* non-JSON error body; the status is all we have */ }
+      const error = new Error(detail);
+      error.status = response.status;
+      throw error;
+    }
+    return response.status === 204 ? null : response.json();
+  }
+
+  // ---------- gate ----------
+
+  function showGate(message) {
+    el.app.classList.add("is-hidden");
+    el.gate.classList.remove("is-hidden");
+    el.gateError.textContent = message || "";
+    el.tokenInput.value = "";
+    el.tokenInput.focus();
+  }
+
+  function signOut(message) {
+    stopPolling();
+    token = "";
+    selected = null;
+    sessionStorage.removeItem(STORE_KEY);
+    showGate(message);
+  }
+
+  el.gateForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const candidate = el.tokenInput.value.trim();
+    if (!candidate) { el.gateError.textContent = "Enter the service token."; return; }
+    token = candidate;
+    el.gateError.textContent = "";
+    try {
+      await api("/sessions");                       // cheapest authenticated probe
+      sessionStorage.setItem(STORE_KEY, token);
+      enterApp();
+    } catch (error) {
+      token = "";
+      el.gateError.textContent =
+        error.message === "unauthorized" ? "Token rejected by the service." : error.message;
+    }
+  });
+
+  el.btnSignout.addEventListener("click", () => signOut(""));
+
+  // ---------- view routing ----------
+
+  function showView(name) {
+    view = name;
+    for (const tab of document.querySelectorAll("[data-view-tab]")) {
+      tab.setAttribute("aria-selected", String(tab.dataset.viewTab === name));
+    }
+    for (const section of document.querySelectorAll("[data-view]")) {
+      section.toggleAttribute("data-active", section.dataset.view === name);
+    }
+    if (name === "workspace" && selected) showPane(pane);
+    if (name === "runtimes") renderPolicy();
+  }
+
+  for (const tab of document.querySelectorAll("[data-view-tab]")) {
+    tab.addEventListener("click", () => showView(tab.dataset.viewTab));
+  }
+
+  function showPane(name) {
+    pane = name;
+    for (const tab of document.querySelectorAll("[data-pane-tab]")) {
+      tab.setAttribute("aria-selected", String(tab.dataset.paneTab === name));
+    }
+    for (const panel of document.querySelectorAll("[data-pane]")) {
+      panel.toggleAttribute("data-active", panel.dataset.pane === name);
+    }
+    if (name === "terminal") el.execInput.focus();
+    if (name === "files") loadDir(cwd);
+    if (name === "activity") pollEvents();
+  }
+
+  for (const tab of document.querySelectorAll("[data-pane-tab]")) {
+    tab.addEventListener("click", () => showPane(tab.dataset.paneTab));
+  }
+
+  el.wsBack.addEventListener("click", () => showView("sessions"));
+
+  // ---------- sessions ----------
+
+  function meterCell(used, limit) {
+    if (!used) return '<span class="text-faint">–</span>';
+    if (!limit) return '<span class="num text-muted">' + bytes(used) + "</span>";
+    const ratio = Math.min(1, used / limit);
+    const percent = ratio * 100;
+    const modifier = ratio > 0.9 ? " meter--crit" : ratio > 0.7 ? " meter--hot" : "";
+    const readable = bytes(used) + " of " + bytes(limit) +
+      " (" + (percent < 0.1 ? "<0.1" : percent.toFixed(1)) + "%)";
+    return (
+      '<span class="cluster" style="gap:var(--space-2)">' +
+        '<span class="meter' + modifier + '" title="' + esc(readable) + '">' +
+          '<i class="meter__fill" style="inline-size:' + percent.toFixed(1) + '%"></i></span>' +
+        '<span class="num text-muted">' + bytes(used) + "</span>" +
+      "</span>"
+    );
+  }
+
+  function renderRows() {
+    el.rows.textContent = "";
+    el.sessionsEmpty.classList.toggle("is-hidden", sessions.length > 0);
+    el.navCount.classList.toggle("is-hidden", sessions.length === 0);
+    el.navCount.textContent = sessions.length;
+
+    for (const row of sessions) {
+      const usage = row.usage || {};
+      const tr = document.createElement("tr");
+      if (row.session_id === selected) tr.setAttribute("aria-selected", "true");
+      tr.innerHTML =
+        '<td class="cell-id"><button class="row-open" type="button" data-open="' +
+          esc(row.session_id) + '">' + esc(row.session_id) + "</button></td>" +
+        '<td><span class="pill pill--info">' + esc(row.runtime) + "</span></td>" +
+        '<td class="mono text-muted">' + (row.tenant ? esc(row.tenant) : "–") + "</td>" +
+        "<td>" + stateBadge(row) + "</td>" +
+        '<td class="num text-muted">' + duration(row.idle_seconds) + "</td>" +
+        "<td>" + meterCell(usage.memory_bytes, usage.memory_limit_bytes) + "</td>" +
+        '<td class="num text-muted">' +
+          (usage.pids === null || usage.pids === undefined ? "–" : usage.pids) + "</td>" +
+        '<td class="cell-end"><button class="btn btn--danger btn--small" type="button" data-kill="' +
+          esc(row.session_id) + '">Terminate</button></td>';
+      // The whole row opens the session — the id alone is too small a target to
+      // find, and the only other way in is creating one. The button inside stays
+      // for keyboard and screen-reader users; this is a convenience on top of it.
+      tr.addEventListener("click", (event) => {
+        if (event.target.closest("[data-kill], [data-open]")) return;
+        openSession(row.session_id);
+      });
+      el.rows.append(tr);
+    }
+
+    for (const button of el.rows.querySelectorAll("[data-open]")) {
+      button.addEventListener("click", () => openSession(button.dataset.open));
+    }
+    for (const button of el.rows.querySelectorAll("[data-kill]")) {
+      button.addEventListener("click", () => terminate(button.dataset.kill, button));
+    }
+  }
+
+  function openSession(sessionId) {
+    if (selected !== sessionId) {
+      selected = sessionId;
+      resetSessionState();
+    }
+    el.wsKill.disabled = false;
+    renderRows();
+    renderWorkspace();
+    showView("workspace");
+  }
+
+  async function terminate(sessionId, button) {
+    button.disabled = true;
+    try {
+      await api("/sessions/" + encodeURIComponent(sessionId), { method: "DELETE" });
+      toast("Terminated " + sessionId, "good");
+      if (selected === sessionId) { selected = null; renderWorkspace(); }
+      await refresh();
+    } catch (error) {
+      toast(error.message, "bad");
+      button.disabled = false;
+    }
+  }
+
+  el.wsKill.addEventListener("click", () => {
+    if (selected) terminate(selected, el.wsKill);
+  });
+
+  // ---------- workspace ----------
+
+  function currentSession() {
+    return sessions.find((row) => row.session_id === selected) || null;
+  }
+
+  function renderWorkspace() {
+    const row = currentSession();
+    el.workspaceEmpty.classList.toggle("is-hidden", Boolean(row));
+    el.workspace.classList.toggle("is-hidden", !row);
+    if (!row) return;
+
+    el.wsId.textContent = row.session_id;
+    el.wsRuntime.textContent = row.runtime;
+    el.wsState.innerHTML = stateBadge(row);
+
+    const usage = row.usage || {};
+    const pairs = [
+      ["Session", row.session_id],
+      ["Runtime", row.runtime],
+      ["Tenant", row.tenant || "none declared"],
+      ["Created", new Date(row.created_at * 1000).toLocaleString()],
+      ["Last activity", new Date(row.last_activity * 1000).toLocaleTimeString()],
+      ["Idle", duration(row.idle_seconds)],
+      ["Memory", usage.memory_bytes
+        ? bytes(usage.memory_bytes) + " / " + bytes(usage.memory_limit_bytes)
+        : "not sampled"],
+      ["CPU", usage.cpu_percent === null || usage.cpu_percent === undefined
+        ? "not sampled" : usage.cpu_percent.toFixed(1) + " %"],
+      ["Processes", usage.pids === null || usage.pids === undefined ? "not sampled" : usage.pids],
+    ];
+    el.sessionKv.innerHTML = pairs
+      .map(([key, value]) => "<div><dt>" + key + "</dt><dd>" + esc(value) + "</dd></div>")
+      .join("");
+  }
+
+  function resetSessionState() {
+    commandHistory = [];
+    historyAt = -1;
+    lastSeq = 0;
+    eventTotal = 0;
+    cwd = workDir;
+    filesSource = "live";
+    el.filesSource.value = "live";
+    termReset();
+    el.events.innerHTML = '<p class="panel-note">No activity yet.</p>';
+    el.fileList.textContent = "";
+    el.viewer.classList.add("is-hidden");
+    updateEventCount();
+  }
+
+  // ---------- terminal ----------
+
+  function termWrite(html) {
+    const node = document.createElement("div");
+    node.innerHTML = html;
+    el.term.append(node);
+    el.term.scrollTop = el.term.scrollHeight;
+    return node;
+  }
+
+  function termReset() {
+    el.termCwd.textContent = workDir + " $";
+    el.term.innerHTML =
+      '<p class="terminal__hint">' +
+      (selected
+        ? "Connected to " + esc(selected) + ". ↑ / ↓ recalls history."
+        : "Select a session.") +
+      "</p>";
+  }
+
+  el.termClear.addEventListener("click", () => { termReset(); el.execInput.focus(); });
+
+  el.execForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const command = el.execInput.value.trim();
+    if (!command || !selected) return;
+
+    commandHistory = commandHistory.filter((entry) => entry !== command);
+    commandHistory.push(command);
+    historyAt = -1;
+
+    el.execInput.value = "";
+    el.execSubmit.disabled = true;
+    termWrite('<p class="terminal__cmd">' + esc(command) + "</p>");
+    const pending = termWrite('<p class="terminal__meta terminal__meta--pending">running…</p>');
+
+    try {
+      const result = await api("/sessions/" + encodeURIComponent(selected) + "/exec", {
+        method: "POST",
+        body: { command },
+      });
+      const modifier = result.exit_code === 0 ? "ok" : "bad";
+      pending.innerHTML =
+        (result.output ? "<div>" + esc(result.output.replace(/\n$/, "")) + "</div>" : "") +
+        '<p class="terminal__meta terminal__meta--' + modifier + '">exit ' + result.exit_code +
+        (result.truncated ? " · output truncated" : "") + "</p>";
+    } catch (error) {
+      pending.innerHTML =
+        '<p class="terminal__meta terminal__meta--bad">' + esc(error.message) + "</p>";
+    } finally {
+      el.execSubmit.disabled = false;
+      el.term.scrollTop = el.term.scrollHeight;
+      el.execInput.focus();
+      refresh();
+      pollEvents();
+    }
+  });
+
+  el.execInput.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    if (!commandHistory.length) return;
+    event.preventDefault();
+    if (event.key === "ArrowUp") {
+      historyAt = historyAt < 0 ? commandHistory.length - 1 : Math.max(0, historyAt - 1);
+    } else {
+      if (historyAt < 0) return;
+      historyAt += 1;
+      if (historyAt >= commandHistory.length) { historyAt = -1; el.execInput.value = ""; return; }
+    }
+    el.execInput.value = commandHistory[historyAt];
+    el.execInput.setSelectionRange(el.execInput.value.length, el.execInput.value.length);
+  });
+
+  // ---------- files ----------
+
+  const joinPath = (base, name) => (base.endsWith("/") ? base : base + "/") + name;
+
+  function parentOf(path) {
+    const trimmed = path.replace(/\/+$/, "");
+    const cut = trimmed.lastIndexOf("/");
+    return cut <= 0 ? "/" : trimmed.slice(0, cut);
+  }
+
+  const filesRoot = () => (filesSource === "stored" ? workDir : "/");
+
+  el.filesSource.addEventListener("change", () => {
+    filesSource = el.filesSource.value;
+    cwd = filesRoot();
+    loadDir(cwd);
+  });
+
+  function filesEndpoint(operation) {
+    const id = encodeURIComponent(selected);
+    return filesSource === "stored"
+      ? "/workspaces/" + id + "/" + operation
+      : "/sessions/" + id + "/" + operation;
+  }
+
+  function renderCrumbs(path) {
+    const root = filesRoot();
+    // In stored mode the archive cannot see above the work directory, so the
+    // trail starts there rather than at the filesystem root.
+    const relative = path.startsWith(root) ? path.slice(root.length) : "";
+    const parts = relative.split("/").filter(Boolean);
+    let built = root;
+    const chunks = ['<button type="button" data-path="' + esc(root) + '">' + esc(root) + "</button>"];
+    for (const part of parts) {
+      built = joinPath(built, part);
+      chunks.push(
+        '<span class="crumbs__sep">/</span>' +
+        '<button type="button" data-path="' + esc(built) + '">' + esc(part) + "</button>"
+      );
+    }
+    el.crumbs.innerHTML = chunks.join("");
+    for (const button of el.crumbs.querySelectorAll("button")) {
+      button.addEventListener("click", () => loadDir(button.dataset.path));
+    }
+  }
+
+  function sourceNote(row) {
+    if (filesSource === "stored") {
+      return "Reading the stored workspace off the host volume — no container is started, " +
+        "so this works for a session that has already been reaped. Only " + workDir + " is kept.";
+    }
+    return row && row.alive
+      ? "Reading the running sandbox, so the whole filesystem is visible."
+      : "This session is stopped: reading it live restarts its container. " +
+        "Switch to the stored workspace to browse without starting anything.";
+  }
+
+  async function loadDir(path) {
+    if (!selected) return;
+    cwd = path;
+    renderCrumbs(path);
+    el.filesNote.textContent = sourceNote(currentSession());
+    el.viewer.classList.add("is-hidden");
+    el.fileList.innerHTML = '<p class="file-row"><span class="file-row__note">loading…</span></p>';
+
+    let rows;
+    try {
+      rows = await api(filesEndpoint("ls"), { method: "POST", body: { path } });
+    } catch (error) {
+      el.fileList.innerHTML =
+        '<p class="file-row"><span class="file-row__note">' + esc(error.message) + "</span></p>";
+      return;
+    }
+
+    // A live listing returns absolute container paths; the archive returns paths
+    // relative to the work directory. Navigation works on absolute ones.
+    const absolute = (row) => (filesSource === "stored" ? joinPath(workDir, row.path) : row.path);
+
+    const chunks = [];
+    if (path !== filesRoot()) {
+      chunks.push(
+        '<button class="file-row file-row--dir" type="button" data-dir="' +
+        esc(parentOf(path)) + '">' + ICON_DIR + '<span class="file-row__name">..</span></button>'
+      );
+    }
+    for (const row of rows) {
+      chunks.push(
+        '<button class="file-row' + (row.is_dir ? " file-row--dir" : "") + '" type="button" ' +
+        (row.is_dir ? 'data-dir="' : 'data-file="') + esc(absolute(row)) + '">' +
+        (row.is_dir ? ICON_DIR : ICON_FILE) +
+        '<span class="file-row__name">' + esc(row.name) + "</span>" +
+        '<span class="file-row__size">' + (row.is_dir ? "" : bytes(row.size)) + "</span></button>"
+      );
+    }
+    el.fileList.innerHTML = chunks.join("") ||
+      '<p class="file-row"><span class="file-row__note">empty</span></p>';
+
+    for (const node of el.fileList.querySelectorAll("[data-dir]")) {
+      node.addEventListener("click", () => loadDir(node.dataset.dir));
+    }
+    for (const node of el.fileList.querySelectorAll("[data-file]")) {
+      node.addEventListener("click", () => openFile(node.dataset.file));
+    }
+    pollEvents();
+  }
+
+  async function openFile(path) {
+    el.viewer.classList.remove("is-hidden");
+    el.viewerName.textContent = path;
+    el.viewerBody.textContent = "loading…";
+    try {
+      const result = await api(filesEndpoint("read"), {
+        method: "POST",
+        body: { path, offset: 0, limit: FILE_READ_LINES },
+      });
+      el.viewerBody.textContent = result.content || "(empty)";
+    } catch (error) {
+      el.viewerBody.textContent = error.message;
+    }
+    pollEvents();
+  }
+
+  el.viewerClose.addEventListener("click", () => el.viewer.classList.add("is-hidden"));
+
+  // ---------- activity ----------
+
+  async function pollEvents() {
+    if (!selected) return;
+    let payload;
+    try {
+      payload = await api("/sessions/" + encodeURIComponent(selected) + "/events?after=" + lastSeq);
+    } catch (_) {
+      return;   // the session may have just gone; the next poll will notice
+    }
+    if (!payload.events.length && lastSeq) { updateEventCount(); return; }
+
+    if (!lastSeq) el.events.textContent = "";
+    for (const event of payload.events) {
+      const node = document.createElement("div");
+      node.className = "event " + (event.ok ? "event--ok" : "event--bad");
+      node.innerHTML =
+        '<span class="event__at">' + new Date(event.at * 1000).toLocaleTimeString() + "</span>" +
+        '<span class="event__op">' + esc(event.op) + "</span>" +
+        '<span class="event__target" title="' + esc(event.target) + '">' + esc(event.target) + "</span>" +
+        '<span class="event__detail">' + esc(event.detail) + "</span>" +
+        '<span class="event__ms">' + event.duration_ms.toFixed(0) + " ms</span>";
+      el.events.append(node);
+      eventTotal += 1;
+    }
+    lastSeq = payload.latest_seq;
+    el.events.scrollTop = el.events.scrollHeight;
+    updateEventCount();
+  }
+
+  function updateEventCount() {
+    el.eventCount.classList.toggle("is-hidden", eventTotal === 0);
+    el.eventCount.textContent = eventTotal;
+  }
+
+  // ---------- runtimes & policy ----------
+
+  const plural = (count, noun) => count + " " + noun + (Math.abs(count) === 1 ? "" : "s");
+
+  const orUnlimited = (value, suffix) =>
+    value === null || value === undefined
+      ? '<dd class="is-off">unlimited</dd>'
+      : "<dd>" + esc(value) + (suffix || "") + "</dd>";
+
+  function renderRuntimeCards() {
+    if (!policy) return;
+    el.runtimeCards.innerHTML = policy.runtimes
+      .map((runtime) => {
+        const isDefault = runtime.alias === policy.default_runtime;
+        const offline = runtime.network_mode === "none" || runtime.network_mode === null;
+        const chips = [
+          '<span class="chip">' + (runtime.mem_limit ? esc(runtime.mem_limit) : "∞") + " memory</span>",
+          '<span class="chip">' +
+            (runtime.cpus === null ? "∞ CPU" : esc(plural(runtime.cpus, "core"))) + "</span>",
+          runtime.cpu_shares === null || runtime.cpu_shares === undefined
+            ? ""
+            : '<span class="chip">weight ' + esc(runtime.cpu_shares) + "</span>",
+          '<span class="chip">' + (runtime.pids_limit === null ? "∞" : esc(runtime.pids_limit)) +
+            " procs</span>",
+          '<span class="chip ' + (offline ? "chip--offline" : "chip--net") + '">' +
+            (offline ? "no network" : esc(runtime.network_mode)) + "</span>",
+        ];
+        return (
+          '<article class="runtime">' +
+            '<header class="runtime__head">' +
+              '<span class="runtime__alias">' + esc(runtime.alias) + "</span>" +
+              (isDefault ? '<span class="pill pill--info">default</span>' : "") +
+              (runtime.builds ? '<span class="pill pill--warn">builds on first use</span>' : "") +
+            "</header>" +
+            (runtime.description && runtime.description !== runtime.image
+              ? '<p class="runtime__desc">' + esc(runtime.description) + "</p>"
+              : "") +
+            '<p class="runtime__image">' + esc(runtime.image) + "</p>" +
+            '<div class="runtime__limits">' + chips.join("") + "</div>" +
+          "</article>"
+        );
+      })
+      .join("");
+  }
+
+  function renderPolicy() {
+    if (!policy) return;
+    const entries = [
+      ["Default memory", orUnlimited(policy.mem_limit)],
+      ["Default CPU", policy.cpus === null || policy.cpus === undefined
+        ? '<dd class="is-off">unlimited</dd>'
+        : "<dd>" + plural(policy.cpus, "core") + "</dd>"],
+      ["Default CPU weight", policy.cpu_shares === null || policy.cpu_shares === undefined
+        ? '<dd class="is-off">not set — the hard ceiling applies</dd>'
+        : "<dd>" + esc(policy.cpu_shares) + "</dd>"],
+      ["Default processes", orUnlimited(policy.pids_limit)],
+      ["Default network", policy.network_mode === "none"
+        ? '<dd class="is-good">none</dd>'
+        : orUnlimited(policy.network_mode)],
+      ["Sessions ceiling", orUnlimited(policy.max_sessions)],
+      ["Per tenant", orUnlimited(policy.max_sessions_per_tenant)],
+      ["Idle eviction", policy.evict_idle_after === null || policy.evict_idle_after === undefined
+        ? '<dd class="is-off">off — a full pool refuses with 429</dd>'
+        : "<dd>after " + duration(policy.evict_idle_after) + " idle</dd>"],
+      ["Idle reap", "<dd>" + duration(policy.idle_timeout) + "</dd>"],
+      ["Command timeout", "<dd>" + duration(policy.execute_timeout) + "</dd>"],
+      ["Max file read", "<dd>" + bytes(policy.max_read_bytes) + "</dd>"],
+      ["Working directory", "<dd>" + esc(policy.work_dir) + "</dd>"],
+      ["Container reuse", policy.persist_containers
+        ? '<dd class="is-good">kept between sessions</dd>'
+        : '<dd class="is-off">discarded on stop</dd>'],
+      ["Files retention", policy.workspace_ttl === null
+        ? '<dd class="is-good">kept for ever</dd>'
+        : "<dd>swept " + duration(policy.workspace_ttl) + " after last use</dd>"],
+      ["Build retention", policy.container_ttl === null || policy.container_ttl === undefined
+        ? '<dd class="is-off">kept with the container</dd>'
+        : "<dd>reclaimed " + duration(policy.container_ttl) + " after stop</dd>"],
+      ["In-memory /tmp", policy.tmpfs_size
+        ? '<dd class="is-good">' + esc(policy.tmpfs_size) + "</dd>"
+        : '<dd class="is-off">on the overlay</dd>'],
+      ["Runtimes warmed at startup", policy.prewarm
+        ? '<dd class="is-good">yes</dd>'
+        : '<dd class="is-off">no — the first session builds</dd>'],
+      ["Isolation", policy.oci_runtime
+        ? '<dd class="is-good">' + esc(policy.oci_runtime) + ", own syscall or kernel boundary</dd>"
+        : '<dd class="is-off">daemon default — shares the host kernel</dd>'],
+      ["Image builder", policy.buildkit
+        ? '<dd class="is-good">BuildKit, caches kept between builds</dd>'
+        : '<dd class="is-off">classic, no cache mounts</dd>'],
+    ];
+    el.policyKv.innerHTML = entries
+      .map(([label, dd]) => "<div><dt>" + label + "</dt>" + dd + "</div>")
+      .join("");
+    renderRuntimeCards();
+  }
+
+  function renderRuntimeOptions() {
+    if (!policy) return;
+    const wanted = policy.runtimes.map((runtime) => runtime.alias).join("|");
+    if (el.newRuntime.dataset.aliases === wanted) return;
+    el.newRuntime.dataset.aliases = wanted;
+    el.newRuntime.innerHTML = policy.runtimes
+      .map((runtime) =>
+        '<option value="' + esc(runtime.alias) + '"' +
+        (runtime.alias === policy.default_runtime ? " selected" : "") + ">" +
+        esc(runtime.alias) + (runtime.description ? " — " + esc(runtime.description) : "") +
+        "</option>")
+      .join("");
+    describeChosenRuntime();
+  }
+
+  function describeChosenRuntime() {
+    if (!policy) return;
+    const chosen = policy.runtimes.find((runtime) => runtime.alias === el.newRuntime.value);
+    if (!chosen) { el.newRuntimeNote.textContent = ""; return; }
+    const parts = [
+      chosen.image,
+      (chosen.mem_limit || "unlimited") + " memory",
+      chosen.cpus === null ? "unlimited CPU" : plural(chosen.cpus, "core"),
+      chosen.network_mode === "none" || chosen.network_mode === null
+        ? "no network" : chosen.network_mode + " network",
+    ];
+    if (chosen.builds) parts.push("first session builds the image");
+    el.newRuntimeNote.textContent = parts.join(" · ");
+  }
+
+  el.newRuntime.addEventListener("change", describeChosenRuntime);
+
+  async function loadPolicy() {
+    try {
+      policy = await api("/policy");
+    } catch (error) {
+      el.policyKv.innerHTML =
+        '<div><dt>unavailable</dt><dd class="is-off">' + esc(error.message) + "</dd></div>";
+      return;
+    }
+    workDir = policy.work_dir || WORK_DIR_FALLBACK;
+    if (!selected) cwd = workDir;
+    el.statRuntimes.textContent = policy.runtimes.length;
+    renderRuntimeOptions();
+    renderPolicy();
+  }
+
+  // ---------- new session ----------
+
+  el.btnNew.addEventListener("click", () => {
+    const opening = el.newPanel.classList.contains("is-hidden");
+    el.newPanel.classList.toggle("is-hidden", !opening);
+    el.btnNew.setAttribute("aria-expanded", String(opening));
+    if (opening) el.newId.focus();
+  });
+
+  el.newCancel.addEventListener("click", () => {
+    el.newPanel.classList.add("is-hidden");
+    el.btnNew.setAttribute("aria-expanded", "false");
+    el.newError.textContent = "";
+  });
+
+  el.newForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    el.newError.textContent = "";
+    el.newSubmit.disabled = true;
+    const body = { runtime: el.newRuntime.value };
+    const id = el.newId.value.trim();
+    const tenant = el.newTenant.value.trim();
+    if (id) body.session_id = id;
+    if (tenant) body.tenant = tenant;
+    if (el.newReuse.checked) body.reuse = true;
+    try {
+      const created = await api("/sessions", { method: "POST", body });
+      toast("Opened " + created.session.session_id, "good");
+      el.newId.value = "";
+      el.newPanel.classList.add("is-hidden");
+      el.btnNew.setAttribute("aria-expanded", "false");
+      await refresh();
+      openSession(created.session.session_id);
+    } catch (error) {
+      el.newError.textContent = error.message;
+    } finally {
+      el.newSubmit.disabled = false;
+    }
+  });
+
+  // ---------- polling ----------
+
+  async function refresh() {
+    if (inFlight) return;
+    inFlight = true;
+    el.refreshIcon.classList.add("spin");
+    try {
+      const wantUsage = el.optUsage.checked;
+      const [health, listing] = await Promise.all([
+        fetch("/healthz").then((response) => response.json()),
+        api("/sessions?usage=" + (wantUsage ? "true" : "false")),
+      ]);
+
+      el.health.className = "pill pill--good";
+      el.health.innerHTML = '<i class="dot dot--live"></i>' + esc(health.status);
+
+      sessions = listing.sessions || [];
+      const live = sessions.filter((row) => row.alive).length;
+      const stopped = sessions.length - live;
+      el.statSessions.textContent = sessions.length;
+      el.statLimit.textContent = listing.limit === null ? "/ ∞" : "/ " + listing.limit;
+      el.statLive.textContent = live + " running" + (stopped ? ", " + stopped + " stopped" : "");
+
+      if (wantUsage) {
+        const memory = sessions.reduce(
+          (sum, row) => sum + ((row.usage && row.usage.memory_bytes) || 0), 0);
+        const pids = sessions.reduce((sum, row) => sum + ((row.usage && row.usage.pids) || 0), 0);
+        el.statMemory.textContent = sessions.length ? bytes(memory) : "–";
+        el.statPids.textContent = sessions.length ? pids : "–";
+        el.statMemoryNote.textContent = "across live sandboxes";
+      } else {
+        el.statMemory.textContent = "off";
+        el.statPids.textContent = "off";
+        el.statMemoryNote.textContent = "enable resource sampling";
+      }
+
+      if (selected && !currentSession()) { selected = null; resetSessionState(); }
+      renderRows();
+      renderWorkspace();
+      if (view === "workspace" && pane === "activity") pollEvents();
+      el.pollNote.textContent = "updated " + new Date().toLocaleTimeString();
+    } catch (error) {
+      if (error.message !== "unauthorized") {
+        el.health.className = "pill pill--bad";
+        el.health.innerHTML = '<i class="dot"></i>unreachable';
+        el.pollNote.textContent = error.message;
+      }
+    } finally {
+      inFlight = false;
+      el.refreshIcon.classList.remove("spin");
+    }
+  }
+
+  function startPolling() {
+    stopPolling();
+    if (el.optAuto.checked) timer = setInterval(refresh, POLL_MS);
+  }
+
+  function stopPolling() {
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+
+  el.optAuto.addEventListener("change", startPolling);
+  el.optUsage.addEventListener("change", refresh);
+  el.btnRefresh.addEventListener("click", refresh);
+  document.addEventListener("visibilitychange", () => {
+    // Do not keep sampling a service nobody is looking at.
+    if (document.hidden) stopPolling();
+    else if (token) { refresh(); startPolling(); }
+  });
+
+  function enterApp() {
+    el.gate.classList.add("is-hidden");
+    el.app.classList.remove("is-hidden");
+    el.origin.textContent = location.host;
+    showView("sessions");
+    // The policy is fixed for the life of the process, so it is fetched once
+    // rather than on every poll.
+    loadPolicy();
+    refresh();
+    startPolling();
+  }
+
+  if (token) enterApp(); else showGate("");
+})();
+</script>
+</body>
+</html>

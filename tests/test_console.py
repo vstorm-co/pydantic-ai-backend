@@ -12,17 +12,17 @@ from pydantic_ai_backends import (
     create_console_toolset,
     get_console_system_prompt,
 )
-from pydantic_ai_backends.toolsets.console import (
+from pydantic_ai_backends.toolsets._content import (
     DEFAULT_MAX_DOCUMENT_BYTES,
     DEFAULT_MAX_IMAGE_BYTES,
     DOCUMENT_EXTENSIONS,
     DOCUMENT_MEDIA_TYPES,
     IMAGE_EXTENSIONS,
     IMAGE_MEDIA_TYPES,
-    ConsoleDeps,
-    _maybe_document_content,
-    _maybe_image_content,
+    document_content,
+    image_content,
 )
+from pydantic_ai_backends.toolsets.console import ConsoleDeps
 
 # Minimal valid-ish PDF payload (header + EOF marker).
 PDF_DATA = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\n%%EOF\n"
@@ -400,7 +400,7 @@ class TestMaybeDocumentContent:
         (tmp_path / "report.pdf").write_bytes(PDF_DATA)
         backend = LocalBackend(root_dir=tmp_path)
 
-        result = await _maybe_document_content(
+        result = await document_content(
             backend, "report.pdf", max_document_bytes=DEFAULT_MAX_DOCUMENT_BYTES
         )
 
@@ -414,7 +414,7 @@ class TestMaybeDocumentContent:
         (tmp_path / "huge.pdf").write_bytes(PDF_DATA)
         backend = LocalBackend(root_dir=tmp_path)
 
-        result = await _maybe_document_content(backend, "huge.pdf", max_document_bytes=1)
+        result = await document_content(backend, "huge.pdf", max_document_bytes=1)
 
         assert result == (
             f"Error: Document 'huge.pdf' too large "
@@ -425,7 +425,7 @@ class TestMaybeDocumentContent:
         """A missing/empty .pdf returns the not-found error string."""
         backend = StateBackend()
 
-        result = await _maybe_document_content(
+        result = await document_content(
             backend, "missing.pdf", max_document_bytes=DEFAULT_MAX_DOCUMENT_BYTES
         )
 
@@ -437,7 +437,7 @@ class TestMaybeDocumentContent:
         (tmp_path / "test.png").write_bytes(png_data)
         backend = LocalBackend(root_dir=tmp_path)
 
-        result = await _maybe_document_content(
+        result = await document_content(
             backend, "test.png", max_document_bytes=DEFAULT_MAX_DOCUMENT_BYTES
         )
 
@@ -448,7 +448,7 @@ class TestMaybeDocumentContent:
         (tmp_path / "notes.txt").write_text("hello")
         backend = LocalBackend(root_dir=tmp_path)
 
-        result = await _maybe_document_content(
+        result = await document_content(
             backend, "notes.txt", max_document_bytes=DEFAULT_MAX_DOCUMENT_BYTES
         )
 
@@ -459,7 +459,7 @@ class TestMaybeDocumentContent:
         (tmp_path / "Makefile").write_text("all:\n")
         backend = LocalBackend(root_dir=tmp_path)
 
-        result = await _maybe_document_content(
+        result = await document_content(
             backend, "Makefile", max_document_bytes=DEFAULT_MAX_DOCUMENT_BYTES
         )
 
@@ -475,9 +475,7 @@ class TestMaybeImageContent:
         (tmp_path / "test.png").write_bytes(png_data)
         backend = LocalBackend(root_dir=tmp_path)
 
-        result = await _maybe_image_content(
-            backend, "test.png", max_image_bytes=DEFAULT_MAX_IMAGE_BYTES
-        )
+        result = await image_content(backend, "test.png", max_image_bytes=DEFAULT_MAX_IMAGE_BYTES)
 
         assert isinstance(result, BinaryContent)
         assert result.media_type == "image/png"
@@ -487,7 +485,7 @@ class TestMaybeImageContent:
         """Image not-found error message is preserved verbatim."""
         backend = StateBackend()
 
-        result = await _maybe_image_content(
+        result = await image_content(
             backend, "missing.png", max_image_bytes=DEFAULT_MAX_IMAGE_BYTES
         )
 
@@ -499,7 +497,7 @@ class TestMaybeImageContent:
         (tmp_path / "test.png").write_bytes(png_data)
         backend = LocalBackend(root_dir=tmp_path)
 
-        result = await _maybe_image_content(backend, "test.png", max_image_bytes=1)
+        result = await image_content(backend, "test.png", max_image_bytes=1)
 
         assert result == (
             f"Error: Image 'test.png' too large ({len(png_data) / (1024 * 1024):.1f}MB, max 0.0MB)"
@@ -510,9 +508,7 @@ class TestMaybeImageContent:
         (tmp_path / "report.pdf").write_bytes(PDF_DATA)
         backend = LocalBackend(root_dir=tmp_path)
 
-        result = await _maybe_image_content(
-            backend, "report.pdf", max_image_bytes=DEFAULT_MAX_IMAGE_BYTES
-        )
+        result = await image_content(backend, "report.pdf", max_image_bytes=DEFAULT_MAX_IMAGE_BYTES)
 
         assert result is None
 
@@ -609,3 +605,37 @@ class TestReadFilePdfIntegration:
 
         assert isinstance(result, str)
         assert "Hello, world!" in result
+
+
+class TestGrepOutputTruncation:
+    """Long result sets are summarised rather than dumped in full."""
+
+    def _backend(self, file_count: int) -> StateBackend:
+        backend = StateBackend()
+        for i in range(file_count):
+            backend.write(f"/f{i:03d}.txt", "needle here")
+        return backend
+
+    async def _grep(self, backend: StateBackend, **kwargs) -> str:
+        toolset = create_console_toolset()
+        return await toolset._console_grep_impl(  # type: ignore[attr-defined]
+            _make_ctx(MockDeps(backend=backend)), "needle", **kwargs
+        )
+
+    async def test_file_list_is_capped_and_counted(self):
+        out = await self._grep(self._backend(60))
+
+        assert out.startswith("Files containing 'needle':")
+        assert "... and 10 more files" in out
+
+    async def test_short_file_list_is_shown_in_full(self):
+        out = await self._grep(self._backend(3))
+
+        assert "more files" not in out
+        assert out.count("/f") == 3
+
+    async def test_content_mode_is_capped_and_counted(self):
+        out = await self._grep(self._backend(60), output_mode="content")
+
+        assert out.startswith("Matches for 'needle':")
+        assert "... and 10 more matches" in out

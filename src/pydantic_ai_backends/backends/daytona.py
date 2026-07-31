@@ -24,10 +24,12 @@ import time
 from pathlib import PurePosixPath
 from typing import Any
 
+from pydantic_ai_backends._editing import Replacement, replace_in_content
+from pydantic_ai_backends._limits import MAX_EXECUTE_OUTPUT_BYTES
 from pydantic_ai_backends.backends.base import BaseSandbox
 from pydantic_ai_backends.types import EditResult, ExecuteResponse, WriteResult
 
-_MAX_OUTPUT = 100_000
+DEFAULT_EXEC_TIMEOUT = 30 * 60
 
 
 class DaytonaSandbox(BaseSandbox):  # pragma: no cover
@@ -73,10 +75,6 @@ class DaytonaSandbox(BaseSandbox):  # pragma: no cover
 
         super().__init__(sandbox_id or self._sandbox.id)
 
-    # ------------------------------------------------------------------
-    # Lifecycle helpers
-    # ------------------------------------------------------------------
-
     def _wait_until_ready(self, timeout: int) -> None:
         """Poll until the sandbox responds to a simple command."""
         deadline = time.monotonic() + timeout
@@ -95,10 +93,6 @@ class DaytonaSandbox(BaseSandbox):  # pragma: no cover
         finally:
             raise RuntimeError(f"Daytona sandbox failed to start within {timeout} seconds")
 
-    # ------------------------------------------------------------------
-    # SandboxProtocol — execute
-    # ------------------------------------------------------------------
-
     def start(self) -> None:
         """No-op — Daytona sandboxes start automatically on creation."""
 
@@ -112,16 +106,16 @@ class DaytonaSandbox(BaseSandbox):  # pragma: no cover
         Returns:
             :class:`ExecuteResponse` with output, exit code, and truncation flag.
         """
-        self._last_activity = time.time()
-        effective_timeout = timeout if timeout is not None else 30 * 60
+        self.touch()
+        effective_timeout = timeout if timeout is not None else DEFAULT_EXEC_TIMEOUT
         try:
             result = self._sandbox.process.exec(
                 command, cwd=self._work_dir, timeout=effective_timeout
             )
             output = result.result
-            truncated = len(output) > _MAX_OUTPUT
+            truncated = len(output) > MAX_EXECUTE_OUTPUT_BYTES
             if truncated:
-                output = output[:_MAX_OUTPUT]
+                output = output[:MAX_EXECUTE_OUTPUT_BYTES]
             return ExecuteResponse(
                 output=output,
                 exit_code=result.exit_code,
@@ -129,10 +123,6 @@ class DaytonaSandbox(BaseSandbox):  # pragma: no cover
             )
         except Exception as e:
             return ExecuteResponse(output=f"Error: {e}", exit_code=1, truncated=False)
-
-    # ------------------------------------------------------------------
-    # File I/O — native Daytona APIs
-    # ------------------------------------------------------------------
 
     def exists(self, path: str) -> bool:
         """Check existence via Daytona's native file API.
@@ -185,56 +175,25 @@ class DaytonaSandbox(BaseSandbox):  # pragma: no cover
         except Exception as e:
             return WriteResult(error=f"Failed to write file: {e}")
 
-    # ------------------------------------------------------------------
-    # Edit — read → Python replace → write (same pattern as DockerSandbox)
-    # ------------------------------------------------------------------
-
     def edit(
         self, path: str, old_string: str, new_string: str, replace_all: bool = False
     ) -> EditResult:
-        """Edit a file by replacing strings.
-
-        Reads the file, performs replacement in Python, writes back.
-
-        Args:
-            path: File path to edit.
-            old_string: String to find.
-            new_string: Replacement string.
-            replace_all: Replace all occurrences (default: first only).
-
-        Returns:
-            :class:`EditResult` with path and occurrence count, or error.
-        """
+        """Edit a file by downloading it, replacing in Python and uploading it back."""
         try:
             if not self.exists(path):
                 return EditResult(error=f"File not found: {path}")
 
-            file_bytes = self.read_bytes(path)
-            content = file_bytes.decode("utf-8", errors="replace")
-            occurrences = content.count(old_string)
+            content = self.read_bytes(path).decode("utf-8", errors="replace")
+            outcome = replace_in_content(content, old_string, new_string, replace_all)
+            if not isinstance(outcome, Replacement):
+                return EditResult(error=outcome)
 
-            if occurrences == 0:
-                return EditResult(error="String not found in file")
-
-            if occurrences > 1 and not replace_all:
-                return EditResult(
-                    error=f"String found {occurrences} times. "
-                    "Use replace_all=True to replace all, or provide more context."
-                )
-
-            new_content = content.replace(old_string, new_string)
-            write_result = self.write(path, new_content)
-
-            if write_result.error:
-                return EditResult(error=write_result.error)
-
-            return EditResult(path=path, occurrences=occurrences)
+            written = self.write(path, outcome.content)
+            if written.error:
+                return EditResult(error=written.error)
+            return EditResult(path=path, occurrences=outcome.occurrences)
         except Exception as e:
             return EditResult(error=f"Failed to edit file: {e}")
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
 
     def is_alive(self) -> bool:
         """Check if the sandbox is responsive."""

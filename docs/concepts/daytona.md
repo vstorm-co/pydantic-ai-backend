@@ -15,9 +15,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import DaytonaSandbox, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: DaytonaSandbox
+
 
 # Create cloud sandbox (starts automatically)
 sandbox = DaytonaSandbox(api_key="dtna_...")
@@ -43,6 +45,7 @@ Daytona requires an API key. You can provide it in two ways:
 ```python
 # Option 1: Environment variable (recommended)
 import os
+
 os.environ["DAYTONA_API_KEY"] = "dtna_..."
 sandbox = DaytonaSandbox()
 
@@ -54,9 +57,9 @@ sandbox = DaytonaSandbox(api_key="dtna_...")
 
 ```python
 sandbox = DaytonaSandbox(
-    api_key="dtna_...",           # API key (or DAYTONA_API_KEY env var)
-    work_dir="/home/daytona",     # Working directory (default)
-    startup_timeout=180,          # Max seconds to wait for sandbox ready
+    api_key="dtna_...",  # API key (or DAYTONA_API_KEY env var)
+    work_dir="/home/daytona",  # Working directory (default)
+    startup_timeout=180,  # Max seconds to wait for sandbox ready
 )
 ```
 

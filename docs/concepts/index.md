@@ -11,9 +11,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 # Create toolset with file + execution tools
 toolset = create_console_toolset()
@@ -61,9 +63,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import DockerSandbox, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: DockerSandbox
+
 
 # Safe sandbox with data science packages
 sandbox = DockerSandbox(runtime="python-datascience")
@@ -116,4 +120,5 @@ Available presets: `DEFAULT_RULESET`, `PERMISSIVE_RULESET`, `READONLY_RULESET`, 
 | Unit tests | `StateBackend` | Testing agent behavior |
 | Safe code execution | `DockerSandbox` | Code interpreter |
 | Multi-user web apps | `SessionManager` | SaaS product |
+| App itself runs in a container | [`RemoteSandbox`](remote.md) | Self-hosted SaaS, no docker-in-docker |
 | Mixed (project + temp) | `CompositeBackend` | Complex workflows |

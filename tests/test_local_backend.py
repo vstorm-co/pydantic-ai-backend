@@ -404,16 +404,16 @@ class TestLocalBackendAsyncExecute:
 
 
 class TestKillProcTree:
-    """Test _kill_proc_tree platform branches."""
+    """Test _kill_process_tree platform branches."""
 
     def test_kill_proc_tree_windows_calls_proc_kill(self, monkeypatch: pytest.MonkeyPatch):
-        """On Windows, _kill_proc_tree delegates to proc.kill() directly."""
+        """On Windows, _kill_process_tree delegates to proc.kill() directly."""
 
         import pydantic_ai_backends.backends.local as local_mod
 
         monkeypatch.setattr(local_mod.sys, "platform", "win32")
         proc = MagicMock()
-        LocalBackend._kill_proc_tree(proc)
+        local_mod._kill_process_tree(proc)
         proc.kill.assert_called_once_with()
 
     def test_kill_proc_tree_windows_swallows_process_lookup_error(
@@ -427,32 +427,32 @@ class TestKillProcTree:
         proc = MagicMock()
         proc.kill.side_effect = ProcessLookupError
         # Must not raise.
-        LocalBackend._kill_proc_tree(proc)
+        local_mod._kill_process_tree(proc)
 
 
 class TestShellCmd:
-    """Test _shell_cmd platform selection."""
+    """Test shell_argv platform selection."""
 
     def test_shell_cmd_unix(self, monkeypatch: pytest.MonkeyPatch):
         """On non-Windows platforms, returns sh -c."""
         import pydantic_ai_backends.backends.local as local_mod
 
         monkeypatch.setattr(local_mod.sys, "platform", "linux")
-        assert LocalBackend._shell_cmd("ls -la") == ["sh", "-c", "ls -la"]
+        assert local_mod.shell_argv("ls -la") == ["sh", "-c", "ls -la"]
 
     def test_shell_cmd_windows(self, monkeypatch: pytest.MonkeyPatch):
         """On Windows, returns cmd /c."""
         import pydantic_ai_backends.backends.local as local_mod
 
         monkeypatch.setattr(local_mod.sys, "platform", "win32")
-        assert LocalBackend._shell_cmd("dir") == ["cmd", "/c", "dir"]
+        assert local_mod.shell_argv("dir") == ["cmd", "/c", "dir"]
 
     def test_shell_cmd_darwin(self, monkeypatch: pytest.MonkeyPatch):
         """On macOS, returns sh -c (non-Windows branch)."""
         import pydantic_ai_backends.backends.local as local_mod
 
         monkeypatch.setattr(local_mod.sys, "platform", "darwin")
-        assert LocalBackend._shell_cmd("echo hi") == ["sh", "-c", "echo hi"]
+        assert local_mod.shell_argv("echo hi") == ["sh", "-c", "echo hi"]
 
 
 class TestLocalBackendPathResolution:

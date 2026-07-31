@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from pydantic_ai_backends import (
     AsyncBackendAdapter,
     AsyncCompositeBackend,
@@ -360,3 +362,59 @@ async def test_ensure_async_on_composite_backend() -> None:
     async_adapter = ensure_async(sync_composite)
     content = await async_adapter.read("/tmp/file.txt")
     assert "data" in content
+
+
+class _RecordingExecutor(ThreadPoolExecutor):
+    """Thread pool that records how many calls it was handed."""
+
+    def __init__(self) -> None:
+        super().__init__(max_workers=2)
+        self.submissions = 0
+
+    def submit(self, fn, /, *args, **kwargs):  # type: ignore[override]
+        self.submissions += 1
+        return super().submit(fn, *args, **kwargs)
+
+
+async def test_adapter_uses_the_supplied_executor() -> None:
+    """A dedicated pool keeps long sandbox commands off asyncio's shared one."""
+    executor = _RecordingExecutor()
+    try:
+        adapter = AsyncBackendAdapter(StateBackend(), executor=executor)
+        await adapter.write("/f.txt", "hello")
+        assert await adapter.read("/f.txt") == "     1\thello"
+        assert executor.submissions == 2
+    finally:
+        executor.shutdown(wait=True)
+
+
+async def test_adapter_falls_back_to_the_default_executor() -> None:
+    executor = _RecordingExecutor()
+    try:
+        adapter = AsyncBackendAdapter(StateBackend())
+        await adapter.write("/f.txt", "hello")
+        assert executor.submissions == 0
+    finally:
+        executor.shutdown(wait=True)
+
+
+async def test_ensure_async_passes_the_executor_to_a_new_adapter() -> None:
+    executor = _RecordingExecutor()
+    try:
+        backend = ensure_async(StateBackend(), executor=executor)
+        await backend.write("/f.txt", "hi")
+        assert executor.submissions == 1
+    finally:
+        executor.shutdown(wait=True)
+
+
+async def test_ensure_async_keeps_an_existing_adapter_and_its_executor() -> None:
+    """Idempotency is what lets one pool serve every call site."""
+    executor = _RecordingExecutor()
+    try:
+        adapter = AsyncSandboxAdapter(SandboxBackend(), executor=executor)
+        assert ensure_async(adapter, executor=None) is adapter
+        await adapter.execute("echo hi")
+        assert executor.submissions == 1
+    finally:
+        executor.shutdown(wait=True)

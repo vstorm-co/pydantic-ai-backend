@@ -21,9 +21,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 # Backend for local development
 backend = LocalBackend(root_dir="./workspace")
@@ -119,9 +121,11 @@ from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
 from pydantic_ai_backends import StateBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: StateBackend
+
 
 def test_agent_creates_file():
     """Test that agent can create files."""
@@ -167,12 +171,17 @@ Route operations to different backends based on path prefix.
 from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import (
-    CompositeBackend, StateBackend, LocalBackend, create_console_toolset
+    CompositeBackend,
+    StateBackend,
+    LocalBackend,
+    create_console_toolset,
 )
+
 
 @dataclass
 class Deps:
     backend: CompositeBackend
+
 
 # LocalBackend as default (real filesystem), StateBackend for ephemeral space
 backend = CompositeBackend(
@@ -339,9 +348,9 @@ All backends validate paths to prevent directory traversal:
 
 ```python
 # These will fail:
-backend.read("../etc/passwd")      # Parent directory
-backend.read("~/secrets")          # Home expansion
-backend.read("C:\\Windows\\...")   # Windows paths
+backend.read("../etc/passwd")  # Parent directory
+backend.read("~/secrets")  # Home expansion
+backend.read("C:\\Windows\\...")  # Windows paths
 ```
 
 ## Next Steps

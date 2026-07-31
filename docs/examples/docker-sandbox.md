@@ -15,9 +15,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import DockerSandbox, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: DockerSandbox
+
 
 # Create sandbox with data science packages
 sandbox = DockerSandbox(runtime="python-datascience")
@@ -46,13 +48,13 @@ Build a code interpreter for data analysis:
 ```python
 from dataclasses import dataclass
 from pydantic_ai import Agent
-from pydantic_ai_backends import (
-    DockerSandbox, create_console_toolset, get_console_system_prompt
-)
+from pydantic_ai_backends import DockerSandbox, create_console_toolset, get_console_system_prompt
+
 
 @dataclass
 class Deps:
     backend: DockerSandbox
+
 
 sandbox = DockerSandbox(runtime="python-datascience")
 
@@ -84,13 +86,25 @@ finally:
 
 ## Pre-configured Runtimes
 
-| Runtime | Packages | Use Case |
-|---------|----------|----------|
-| `python-minimal` | Clean Python 3.12 | General scripting |
-| `python-datascience` | pandas, numpy, matplotlib, scikit-learn, seaborn | Data analysis |
-| `python-web` | FastAPI, SQLAlchemy, httpx | Web development |
-| `node-minimal` | Clean Node.js 20 | JavaScript |
-| `node-react` | TypeScript, Vite, React | Frontend |
+| Runtime | Image | What it adds |
+|---|---|---|
+| `python-minimal` | python:3.12-slim | standard library only |
+| `python-datascience` | built on python:3.12-slim | pandas, numpy, matplotlib, scikit-learn, seaborn |
+| `python-analytics` | built on python:3.12-slim | duckdb, polars, pyarrow |
+| `python-web` | built on python:3.12-slim | fastapi, uvicorn, sqlalchemy, httpx |
+| `python-scraping` | built on python:3.12-slim | httpx, beautifulsoup4, lxml, markdownify |
+| `python-documents` | built on python:3.12-slim | pypdf, python-docx, openpyxl, pillow |
+| `node-minimal` | node:20-slim | nothing |
+| `node-typescript` | built on node:20-slim | typescript, tsx, vitest |
+| `node-react` | built on node:20-slim | typescript, vite, react, react-dom, @types/react |
+| `bun` | oven/bun:1-slim | Bun's own bundler, test runner and package manager |
+| `deno` | denoland/deno:alpine | TypeScript with no install step |
+| `go` | golang:1.23-alpine | Go toolchain |
+| `rust` | rust:1-slim | Rust toolchain with cargo |
+
+A runtime naming an `image` starts as fast as a pull. One naming a `base_image`
+plus `packages` builds an image on first use and hits the cache afterwards, which
+is worth it when installing them per session would dominate.
 
 ## Custom Runtime
 
@@ -116,9 +130,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import DockerSandbox, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: DockerSandbox
+
 
 # Mount host directory for persistence
 sandbox = DockerSandbox(

@@ -1,7 +1,8 @@
-"""Permission checker for validating operations against rulesets."""
+"""Evaluating operations against a permission ruleset."""
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Awaitable, Callable
 from typing import Literal
@@ -15,19 +16,27 @@ from pydantic_ai_backends.permissions.types import (
     PermissionRuleset,
 )
 
-# Callback type for asking user permission
 AskCallback = Callable[[PermissionOperation, str, str], Awaitable[bool]]
+"""Approval callback: `(operation, target, reason)` -> whether to allow."""
 
-# Fallback behavior when ask_callback is not provided or returns None
 AskFallback = Literal["deny", "error"]
+"""What an "ask" does when no callback can answer it."""
+
+PATTERN_CACHE_SIZE = 512
+"""Compiled patterns kept around. Every check walks a ruleset's rules, so
+recompiling them per call showed up in profiles of read-heavy agent runs."""
 
 
 class PermissionAskError(Exception):
-    """Raised when a permission check fails with ask_fallback="error".
+    """Raised when an operation needs approval and `ask_fallback="error"`.
 
-    Named `PermissionAskError` (not `PermissionError`) so it does not
-    shadow the builtin `PermissionError` (an `OSError` subclass) for
-    importers of this module.
+    Named `PermissionAskError` so it does not shadow the builtin
+    `PermissionError` (an `OSError` subclass) for importers of this module.
+
+    Attributes:
+        operation: The operation that needed approval.
+        target: The path or command it addressed.
+        reason: Why approval was being sought.
     """
 
     def __init__(
@@ -47,15 +56,17 @@ class PermissionAskError(Exception):
 
 @deprecated("Use `PermissionAskError` instead; this name shadows the builtin PermissionError.")
 class PermissionError(PermissionAskError):
-    """Deprecated alias for :class:`PermissionAskError`.
-
-    Retained for backward compatibility. Prefer `PermissionAskError` to
-    avoid shadowing the builtin `PermissionError`.
-    """
+    """Deprecated alias for :class:`PermissionAskError`."""
 
 
 class PermissionDeniedError(Exception):
-    """Raised when a permission is explicitly denied."""
+    """Raised when an operation is explicitly denied.
+
+    Attributes:
+        operation: The operation that was denied.
+        target: The path or command it addressed.
+        rule: The rule that denied it, when a rule rather than a default did.
+    """
 
     def __init__(
         self,
@@ -72,118 +83,80 @@ class PermissionDeniedError(Exception):
         super().__init__(message)
 
 
-def _glob_to_regex(pattern: str) -> re.Pattern[str]:
-    """Convert a glob pattern to a regex pattern.
+@functools.lru_cache(maxsize=PATTERN_CACHE_SIZE)
+def glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a glob pattern to an anchored regex.
 
-    Supports:
-    - `*` matches any characters except `/`
-    - `**` matches any characters including `/` (recursive)
-    - `?` matches any single character except `/`
-    - `[seq]` matches any character in seq
+    Supports `*` (anything but `/`), `**` (anything, including `/`), `?` (one
+    character but `/`) and `[seq]` character classes with `!` or `^` negation.
     """
-    # Process the pattern character by character
-    regex_parts: list[str] = []
-    i = 0
-    n = len(pattern)
+    parts: list[str] = []
+    index = 0
 
-    while i < n:
-        c = pattern[i]
-
-        if c == "*":
-            if i + 1 < n and pattern[i + 1] == "*":
-                # ** - match anything including /
-                # Check if followed by /
-                if i + 2 < n and pattern[i + 2] == "/":
-                    # **/ - match zero or more directories
-                    regex_parts.append("(?:.*/)?")
-                    i += 3
-                else:
-                    # ** at end or before non-/
-                    regex_parts.append(".*")
-                    i += 2
-            else:
-                # Single * - match anything except /
-                regex_parts.append("[^/]*")
-                i += 1
-        elif c == "?":
-            # ? - match any single character except /
-            regex_parts.append("[^/]")
-            i += 1
-        elif c == "[":
-            # Character class - find the end
-            j = i + 1
-            negated = False
-            if j < n and pattern[j] in "!^":
-                # Glob negation uses '!'; regex negation uses '^'.
-                negated = True
-                j += 1
-            if j < n and pattern[j] == "]":
-                j += 1
-            while j < n and pattern[j] != "]":
-                j += 1
-            if j < n:
-                # Valid character class. Emit '[^...]' for a negated class so
-                # glob '[!a]' becomes regex '[^a]' (any char except 'a') rather
-                # than the literal-matching '[!a]'.
-                if negated:
-                    inner = pattern[i + 2 : j]
-                    regex_parts.append("[^" + inner + "]")
-                else:
-                    regex_parts.append(pattern[i : j + 1])
-                i = j + 1
-            else:
-                # No closing bracket, treat as literal
-                regex_parts.append(re.escape(c))
-                i += 1
+    while index < len(pattern):
+        if pattern.startswith("**/", index):
+            parts.append("(?:.*/)?")  # Zero or more directories.
+            index += 3
+        elif pattern.startswith("**", index):
+            parts.append(".*")
+            index += 2
+        elif pattern[index] == "*":
+            parts.append("[^/]*")
+            index += 1
+        elif pattern[index] == "?":
+            parts.append("[^/]")
+            index += 1
+        elif pattern[index] == "[":
+            rendered, index = _character_class(pattern, index)
+            parts.append(rendered)
         else:
-            # Escape other characters
-            regex_parts.append(re.escape(c))
-            i += 1
+            parts.append(re.escape(pattern[index]))
+            index += 1
 
-    regex_str = "^" + "".join(regex_parts) + "$"
-    return re.compile(regex_str)
+    return re.compile("^" + "".join(parts) + "$")
 
 
-def _matches_pattern(target: str, pattern: str) -> bool:
-    """Check if target matches the glob pattern.
+def _character_class(pattern: str, start: int) -> tuple[str, int]:
+    """Render the character class starting at `start`, and where it ends."""
+    end = start + 1
+    # Glob negates with '!', regex with '^'.
+    negated = end < len(pattern) and pattern[end] in "!^"
+    if negated:
+        end += 1
+    if end < len(pattern) and pattern[end] == "]":
+        end += 1
+    while end < len(pattern) and pattern[end] != "]":
+        end += 1
 
-    Args:
-        target: The path or command to check.
-        pattern: Glob pattern with optional ** support.
+    if end >= len(pattern):
+        # No closing bracket, so the '[' is a literal.
+        return re.escape("["), start + 1
+    if negated:
+        return f"[^{pattern[start + 2 : end]}]", end + 1
+    return pattern[start : end + 1], end + 1
 
-    Returns:
-        True if target matches pattern.
-    """
-    regex = _glob_to_regex(pattern)
-    return bool(regex.match(target))
+
+def matches_pattern(target: str, pattern: str) -> bool:
+    """Whether a path or command matches a glob pattern."""
+    return bool(glob_to_regex(pattern).match(target))
 
 
 class PermissionChecker:
     """Checks operations against a permission ruleset.
 
-    The checker evaluates rules in order and uses the first matching rule's
-    action. If no rule matches, the operation's default action is used.
-    If no operation-specific permissions exist, the global default is used.
+    Rules are evaluated in order and the first match wins. With no match the
+    operation's default applies, falling back to the ruleset's global default.
 
     Example:
         ```python
-        from pydantic_ai_backends.permissions import (
-            PermissionChecker,
-            DEFAULT_RULESET,
-        )
+        from pydantic_ai_backends.permissions import DEFAULT_RULESET, PermissionChecker
 
         async def ask_user(op: str, target: str, reason: str) -> bool:
             return input(f"Allow {op} on {target}? ").lower() == "y"
 
-        checker = PermissionChecker(
-            ruleset=DEFAULT_RULESET,
-            ask_callback=ask_user,
-        )
+        checker = PermissionChecker(ruleset=DEFAULT_RULESET, ask_callback=ask_user)
 
-        # Synchronous check (returns action without asking)
         action = checker.check_sync("read", "/path/to/file")
-
-        # Async check (handles "ask" via callback)
         allowed = await checker.check("write", "/path/to/file", "Save changes")
         ```
     """
@@ -194,14 +167,13 @@ class PermissionChecker:
         ask_callback: AskCallback | None = None,
         ask_fallback: AskFallback = "error",
     ):
-        """Initialize the permission checker.
+        """Initialize the checker.
 
         Args:
-            ruleset: The permission ruleset to check against.
-            ask_callback: Async callback for "ask" actions. Receives
-                (operation, target, reason) and returns True to allow.
-            ask_fallback: What to do when ask_callback is None or needed
-                but not available. "deny" returns False, "error" raises.
+            ruleset: The ruleset to check against.
+            ask_callback: Async callback for "ask" actions.
+            ask_fallback: What an unanswerable "ask" does — `"deny"` returns
+                False, `"error"` raises.
         """
         self._ruleset = ruleset
         self._ask_callback = ask_callback
@@ -209,58 +181,30 @@ class PermissionChecker:
 
     @property
     def ruleset(self) -> PermissionRuleset:
-        """The permission ruleset being used."""
+        """The ruleset being checked against."""
         return self._ruleset
 
-    def check_sync(
-        self,
-        operation: PermissionOperation,
-        target: str,
-    ) -> PermissionAction:
-        """Check permission synchronously without invoking callbacks.
-
-        This method evaluates rules and returns the action without
-        executing any callbacks. Use this when you need to know what
-        action would be taken.
-
-        Args:
-            operation: The operation type (read, write, etc.).
-            target: The path or command being accessed.
-
-        Returns:
-            The permission action: "allow", "deny", or "ask".
-        """
-        op_perms = self._ruleset.get_operation_permissions(operation)
-
-        # Check rules in order - first match wins
-        for rule in op_perms.rules:
-            if _matches_pattern(target, rule.pattern):
-                return rule.action
-
-        # No rule matched, use default
-        return op_perms.default
-
-    def _find_matching_rule(
-        self,
-        operation: PermissionOperation,
-        target: str,
-    ) -> PermissionRule | None:
-        """Find the first matching rule for an operation and target.
+    def check_sync(self, operation: PermissionOperation, target: str) -> PermissionAction:
+        """Resolve the action for an operation without invoking any callback.
 
         Args:
             operation: The operation type.
-            target: The path or command.
-
-        Returns:
-            The matching rule, or None if no rule matches.
+            target: The path or command being accessed.
         """
-        op_perms = self._ruleset.get_operation_permissions(operation)
+        rule = self.find_matching_rule(operation, target)
+        if rule is not None:
+            return rule.action
+        return self._ruleset.get_operation_permissions(operation).default
 
-        for rule in op_perms.rules:
-            if _matches_pattern(target, rule.pattern):
-                return rule
-
-        return None
+    def find_matching_rule(
+        self, operation: PermissionOperation, target: str
+    ) -> PermissionRule | None:
+        """The first rule matching this operation and target, if any."""
+        permissions = self._ruleset.get_operation_permissions(operation)
+        return next(
+            (rule for rule in permissions.rules if matches_pattern(target, rule.pattern)),
+            None,
+        )
 
     async def check(
         self,
@@ -268,22 +212,20 @@ class PermissionChecker:
         target: str,
         reason: str = "",
     ) -> bool:
-        """Check permission asynchronously with callback support.
-
-        Evaluates rules and handles "ask" actions via the callback.
-        For "allow" returns True, for "deny" raises PermissionDeniedError.
+        """Resolve an operation, asking for approval when the rules say so.
 
         Args:
-            operation: The operation type (read, write, etc.).
+            operation: The operation type.
             target: The path or command being accessed.
-            reason: Human-readable reason for the operation.
+            reason: Human-readable reason, passed to the callback.
 
         Returns:
-            True if the operation is allowed.
+            True when the operation is allowed.
 
         Raises:
-            PermissionDeniedError: If the operation is explicitly denied.
-            PermissionAskError: If ask_fallback="error" and callback unavailable.
+            PermissionDeniedError: If it is denied, or approval was refused.
+            PermissionAskError: If approval is needed, no callback can give it
+                and `ask_fallback="error"`.
         """
         action = self.check_sync(operation, target)
 
@@ -291,70 +233,27 @@ class PermissionChecker:
             return True
 
         if action == "deny":
-            rule = self._find_matching_rule(operation, target)
-            raise PermissionDeniedError(operation, target, rule)
+            raise PermissionDeniedError(
+                operation, target, self.find_matching_rule(operation, target)
+            )
 
-        # Action is "ask"
         if self._ask_callback is not None:
-            allowed = await self._ask_callback(operation, target, reason)
-            if allowed:
+            if await self._ask_callback(operation, target, reason):
                 return True
             raise PermissionDeniedError(operation, target)
 
-        # No callback available
         if self._ask_fallback == "error":
             raise PermissionAskError(operation, target, reason)
-
-        # ask_fallback == "deny"
         raise PermissionDeniedError(operation, target)
 
-    def is_allowed(
-        self,
-        operation: PermissionOperation,
-        target: str,
-    ) -> bool:
-        """Check if an operation would be immediately allowed.
-
-        This is a convenience method that returns True only if the
-        operation would be allowed without needing to ask.
-
-        Args:
-            operation: The operation type.
-            target: The path or command.
-
-        Returns:
-            True if action is "allow", False otherwise.
-        """
+    def is_allowed(self, operation: PermissionOperation, target: str) -> bool:
+        """Whether the operation would proceed without asking."""
         return self.check_sync(operation, target) == "allow"
 
-    def is_denied(
-        self,
-        operation: PermissionOperation,
-        target: str,
-    ) -> bool:
-        """Check if an operation would be immediately denied.
-
-        Args:
-            operation: The operation type.
-            target: The path or command.
-
-        Returns:
-            True if action is "deny", False otherwise.
-        """
+    def is_denied(self, operation: PermissionOperation, target: str) -> bool:
+        """Whether the operation would be refused outright."""
         return self.check_sync(operation, target) == "deny"
 
-    def requires_approval(
-        self,
-        operation: PermissionOperation,
-        target: str,
-    ) -> bool:
-        """Check if an operation would require user approval.
-
-        Args:
-            operation: The operation type.
-            target: The path or command.
-
-        Returns:
-            True if action is "ask", False otherwise.
-        """
+    def requires_approval(self, operation: PermissionOperation, target: str) -> bool:
+        """Whether the operation would need user approval."""
         return self.check_sync(operation, target) == "ask"

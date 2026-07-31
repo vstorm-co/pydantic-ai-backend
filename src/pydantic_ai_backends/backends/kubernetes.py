@@ -30,11 +30,12 @@ import time
 import uuid
 from typing import Any, Literal
 
+from pydantic_ai_backends._editing import Replacement, replace_in_content
+from pydantic_ai_backends._limits import MAX_EXECUTE_OUTPUT_BYTES
 from pydantic_ai_backends.backends.base import BaseSandbox
 from pydantic_ai_backends.types import EditResult, ExecuteResponse, FileInfo, WriteResult
 
-OUTPUT_CAP = 100_000
-DEFAULT_EXEC_TIMEOUT = 30 * 60  # 30 min, matches DaytonaSandbox
+DEFAULT_EXEC_TIMEOUT = 30 * 60  # Matches DaytonaSandbox.
 DEFAULT_STARTUP_TIMEOUT = 60
 DEFAULT_PORT = 8080
 
@@ -117,10 +118,10 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
         service_account_name: str = "default",
     ) -> None:
         try:
-            from kubernetes import client as k8s_client  # noqa: WPS433
-            from kubernetes import config as k8s_config  # noqa: WPS433
-            from kubernetes.client import ApiClient as _ApiClient  # noqa: F401, WPS433
-            from kubernetes.client.rest import ApiException as _ApiException  # noqa: F401, WPS433
+            from kubernetes import client as k8s_client
+            from kubernetes import config as k8s_config
+            from kubernetes.client import ApiClient as _ApiClient  # noqa: F401
+            from kubernetes.client.rest import ApiException as _ApiException  # noqa: F401
         except ImportError as exc:  # pragma: no cover
             raise ImportError(
                 "kubernetes SDK is required. Install with: "
@@ -132,7 +133,7 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
 
         if mode == "http":
             try:
-                import httpx as _httpx  # noqa: WPS433
+                import httpx as _httpx
             except ImportError as exc:  # pragma: no cover
                 raise ImportError(
                     "httpx is required for mode='http'. Install with: "
@@ -161,7 +162,6 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
             super().__init__(uuid.uuid4().hex)
         self._pod_name = _sanitize_pod_name(self._id, prefix="pab-sandbox-")
 
-        # Lazy: load config, build clients
         if in_cluster is None:
             in_cluster = _detect_in_cluster()
         try:
@@ -178,8 +178,6 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
         self._pod_ip: str | None = None
         self._http: Any = None
         self._stopped = False
-
-    # -------------------- BaseSandbox lifecycle --------------------
 
     def start(self) -> None:
         """Create the pod and wait for it to be Ready."""
@@ -261,10 +259,8 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
                 propagation_policy="Background",
             )
 
-    # -------------------- BaseSandbox abstract methods ---------------
-
     def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
-        self._last_activity = time.time()
+        self.touch()
         timeout_seconds = timeout if timeout is not None else DEFAULT_EXEC_TIMEOUT
 
         if self._mode == "http":
@@ -274,42 +270,20 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
     def edit(
         self, path: str, old_string: str, new_string: str, replace_all: bool = False
     ) -> EditResult:
-        # Mirror DockerSandbox / DaytonaSandbox: read, str.replace, write.
-        # Errors: 0 occurrences → "String not found in file";
-        #         >1 without replace_all → "String found N times. Use replace_all=True ..."
-        self._last_activity = time.time()
-        file_bytes = self.read_bytes(path)
-        # mode="api" delegates to BaseSandbox.read_bytes, which encodes a
-        # failed `cat` as a b"[Error: ...]" sentinel (not b""). Surface it
-        # rather than treating the error text as file content — matches
-        # DaytonaSandbox.edit().
-        if file_bytes.startswith(b"[Error:"):
-            return EditResult(error=file_bytes.decode("utf-8", errors="replace"))
-        content = file_bytes.decode("utf-8", errors="replace")
+        """Edit a file by fetching it, replacing in Python and writing it back."""
+        self.touch()
+        content = self.read_bytes(path).decode("utf-8", errors="replace")
         if not content:
             return EditResult(error=f"File '{path}' not found")
 
-        occurrences = content.count(old_string)
-        if occurrences == 0:
-            return EditResult(error="String not found in file")
-        if occurrences > 1 and not replace_all:
-            return EditResult(
-                error=(
-                    f"String found {occurrences} times. Use replace_all=True "
-                    "to replace all occurrences."
-                ),
-            )
-        new_content = (
-            content.replace(old_string, new_string)
-            if replace_all
-            else content.replace(old_string, new_string, 1)
-        )
-        write_result = self.write(path, new_content)
-        if write_result.error is not None:
-            return EditResult(error=write_result.error)
-        return EditResult(path=path, occurrences=occurrences)
+        outcome = replace_in_content(content, old_string, new_string, replace_all)
+        if not isinstance(outcome, Replacement):
+            return EditResult(error=outcome)
 
-    # -------------------- HTTP path ----------------------------------
+        written = self.write(path, outcome.content)
+        if written.error is not None:
+            return EditResult(error=written.error)
+        return EditResult(path=path, occurrences=outcome.occurrences)
 
     def _execute_http(self, command: str, timeout_seconds: int) -> ExecuteResponse:
         try:
@@ -324,12 +298,10 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
 
         body = r.json()
         return ExecuteResponse(
-            output=body.get("output", "")[:OUTPUT_CAP],
+            output=body.get("output", "")[:MAX_EXECUTE_OUTPUT_BYTES],
             exit_code=body.get("exit_code"),
             truncated=bool(body.get("truncated")),
         )
-
-    # -------------------- pods/exec path -----------------------------
 
     def _execute_api(self, command: str, timeout_seconds: int) -> ExecuteResponse:
         from kubernetes.stream import stream  # WPS433: lazy
@@ -351,7 +323,7 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
                 _preload_content=False,
             )
             output = bytearray()
-            while resp.is_open() and len(output) < OUTPUT_CAP:
+            while resp.is_open() and len(output) < MAX_EXECUTE_OUTPUT_BYTES:
                 resp.update(timeout=1)
                 if resp.peek_stdout():
                     output.extend(resp.read_stdout().encode("utf-8", errors="replace"))
@@ -359,16 +331,14 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
                     output.extend(resp.read_stderr().encode("utf-8", errors="replace"))
             exit_code = resp.returncode if resp.returncode is not None else 0
             resp.close()
-            truncated = len(output) >= OUTPUT_CAP
+            truncated = len(output) >= MAX_EXECUTE_OUTPUT_BYTES
             return ExecuteResponse(
-                output=bytes(output[:OUTPUT_CAP]).decode("utf-8", errors="replace"),
+                output=bytes(output[:MAX_EXECUTE_OUTPUT_BYTES]).decode("utf-8", errors="replace"),
                 exit_code=exit_code,
                 truncated=truncated,
             )
         except Exception as exc:
             return ExecuteResponse(output=f"Error: {exc}", exit_code=1, truncated=False)
-
-    # -------------------- file ops (override BaseSandbox) ------------
 
     def read_bytes(self, path: str) -> bytes:
         # Match LocalBackend semantics: return b"" on missing / transport /
@@ -376,7 +346,7 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
         # well-known paths (/AGENTS.md, /SOUL.md, ...) on every turn; if we
         # encoded the error as bytes here, the probe would treat the error
         # string as legit file content and inject it into the system prompt.
-        self._last_activity = time.time()
+        self.touch()
         if self._mode == "http":
             try:
                 r = self._http.post("/read", json={"path": path, "offset": 0, "limit": 10**9})
@@ -393,7 +363,7 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
         # The upstream read_file tool wrapper (str_replace edit_format) does
         # not catch exceptions; anything raised here propagates through the
         # capability layer and kills the agent run.
-        self._last_activity = time.time()
+        self.touch()
         if self._mode == "http":
             try:
                 r = self._http.post("/read", json={"path": path, "offset": offset, "limit": limit})
@@ -410,7 +380,7 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
     def ls_info(self, path: str) -> list[FileInfo]:
         # LocalBackend.ls_info returns [] on missing / out-of-workspace; mirror
         # so the run survives a model probing a bogus path.
-        self._last_activity = time.time()
+        self.touch()
         if self._mode == "http":
             try:
                 r = self._http.post("/ls", json={"path": path})
@@ -422,7 +392,7 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
         return super().ls_info(path)
 
     def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
-        self._last_activity = time.time()
+        self.touch()
         if self._mode == "http":
             try:
                 r = self._http.post("/glob", json={"pattern": pattern, "path": path})
@@ -434,7 +404,7 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
         return super().glob_info(pattern, path)
 
     def write(self, path: str, content: str) -> WriteResult:
-        self._last_activity = time.time()
+        self.touch()
         if self._mode == "http":
             try:
                 payload = base64.b64encode(content.encode("utf-8")).decode("ascii")
@@ -444,9 +414,6 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
                 return WriteResult(error=f"Error: {exc}")
             return WriteResult(path=path)
         return super().write(path, content)
-
-
-# ---------- helpers ---------------------------------------------------
 
 
 def _detect_in_cluster() -> bool:

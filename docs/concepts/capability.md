@@ -35,14 +35,20 @@ from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_backends.permissions import READONLY_RULESET, PERMISSIVE_RULESET
 
 # Read-only — write/edit/execute tools hidden from model entirely
-agent = Agent("openai:gpt-4.1", capabilities=[
-    ConsoleCapability(permissions=READONLY_RULESET),
-])
+agent = Agent(
+    "openai:gpt-4.1",
+    capabilities=[
+        ConsoleCapability(permissions=READONLY_RULESET),
+    ],
+)
 
 # Permissive — everything allowed except secrets
-agent = Agent("openai:gpt-4.1", capabilities=[
-    ConsoleCapability(permissions=PERMISSIVE_RULESET),
-])
+agent = Agent(
+    "openai:gpt-4.1",
+    capabilities=[
+        ConsoleCapability(permissions=PERMISSIVE_RULESET),
+    ],
+)
 ```
 
 ## How Permissions Work
@@ -57,10 +63,11 @@ agent = Agent("openai:gpt-4.1", capabilities=[
 ## Constructor Parameters
 
 [`ConsoleCapability`][pydantic_ai_backends.ConsoleCapability] is a dataclass with
-three fields:
+four fields:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `backend` | `BackendProtocol \| AsyncBackendProtocol \| None` | `None` | Backend the tools operate on. When `None`, each call reads `ctx.deps.backend`. See [Where the Backend Comes From](#where-the-backend-comes-from). |
 | `include_execute` | `bool` | `True` | Whether to register the `execute` shell tool. |
 | `edit_format` | `"str_replace" \| "hashline"` | `"str_replace"` | File-editing format. `"hashline"` registers `hashline_edit` instead of `edit_file` and changes the injected instructions. See [Hashline Edit Format](console-toolset.md#hashline-edit-format). |
 | `permissions` | `PermissionRuleset \| None` | `None` | Ruleset controlling which operations are allowed, asked, or denied. When `None`, all tools are exposed and no permission checks run. |
@@ -93,22 +100,28 @@ prompt to your agent manually.
 
 ## Where the Backend Comes From
 
-`ConsoleCapability` does not take a backend. The console tools read
-`ctx.deps.backend` at runtime, so your dependencies object must satisfy the
+Two ways, and the choice is about who owns the deps type.
+
+### From the agent's deps (default)
+
+With no `backend`, the console tools read `ctx.deps.backend` at runtime, so your
+dependencies object must satisfy the
 [`ConsoleDeps`](console-toolset.md#consoledeps-protocol) protocol (any class
-exposing a `backend` attribute). This lets a single agent serve different
-backends per run — for example a different
+exposing a `backend` attribute). One agent then serves a different backend per
+run — a different
 [`DockerSandbox`][pydantic_ai_backends.backends.docker.sandbox.DockerSandbox]
-per user — without rebuilding the agent.
+per user, say — without rebuilding the agent.
 
 ```python
 from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import ConsoleCapability, LocalBackend
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 agent = Agent("openai:gpt-4.1", deps_type=Deps, capabilities=[ConsoleCapability()])
 
@@ -117,6 +130,29 @@ result = agent.run_sync(
     deps=Deps(backend=LocalBackend(root_dir="/workspace")),
 )
 ```
+
+### A capability-owned backend
+
+Pass `backend=` and the capability carries it, leaving your deps type alone. Use
+this when the deps type is not yours to change — a platform assembling agents
+from configuration will have its own — or when this agent is meant to hold one
+particular sandbox.
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai_backends import ConsoleCapability
+from pydantic_ai_backends.remote import RemoteSandbox
+
+sandbox = RemoteSandbox("http://sandboxd:8080", token=token, session_id=session_id)
+sandbox.start()
+
+# Deps can be anything, including None — the tools never look at them.
+agent = Agent("openai:gpt-4.1", capabilities=[ConsoleCapability(backend=sandbox)])
+```
+
+The same applies to
+[`create_console_toolset(backend=...)`][pydantic_ai_backends.create_console_toolset]
+if you are using the toolset directly.
 
 ## Relationship to Other Features
 

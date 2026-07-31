@@ -44,13 +44,27 @@ kubernetes = [
     "kubernetes>=29.0.0",
     "httpx>=0.28.0",
 ]
+remote = [
+    "httpx>=0.28.0",
+]
+server = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "httpx>=0.28.0",
+    "docker>=7.0",
+    "pypdf>=5.1.0",
+    "chardet>=5.2.0",
+]
 dev = [
     "pydantic-ai-slim>=1.74.0",
     "pytest>=9.0.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=7.0.0",
     "coverage>=7.0.0",
-    "ruff>=0.8.0",
+    # Pinned: the formatter's output is a CI gate, so a ruff release must not be
+    # able to fail a PR that changed nothing. 0.16 began formatting fenced code
+    # blocks inside Markdown, which reformatted docs overnight.
+    "ruff==0.16.1",
     "pyright>=1.1.400",
     "mypy>=1.0.0",
     "pre-commit>=4.0.0",
@@ -58,6 +72,7 @@ dev = [
     "kubernetes>=29.0.0",
     "httpx>=0.28.0",
     "pillow>=10.0.0",
+    "fastapi>=0.115.0",
 ]
 
 [project.urls]
@@ -130,7 +145,6 @@ exclude_lines = [
     "raise NotImplementedError",
     "if __name__ == '__main__':",
     "except ImportError:",
-    "pass",
     "\\.\\.\\.",
 ]
 

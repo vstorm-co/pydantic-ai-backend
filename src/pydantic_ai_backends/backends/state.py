@@ -7,60 +7,30 @@ from datetime import datetime, timezone
 
 from wcmatch import glob as wcglob
 
+from pydantic_ai_backends._editing import Replacement, replace_in_content
+from pydantic_ai_backends._paths import normalize_path, unsafe_path_reason
 from pydantic_ai_backends.types import EditResult, FileData, FileInfo, GrepMatch, WriteResult
 
 
-def _validate_path(path: str) -> str | None:
-    """Validate path for security issues.
-
-    Returns error message if invalid, None if valid.
-    """
-    if ".." in path:
-        return "Path cannot contain '..'"
-    if path.startswith("~"):
-        return "Path cannot start with '~'"
-    if len(path) > 1 and path[1] == ":":
-        return "Windows absolute paths are not allowed"
-    return None
-
-
-def _normalize_path(path: str) -> str:
-    """Normalize path to consistent format."""
-    if not path.startswith("/"):
-        path = "/" + path
-    # Remove trailing slash except for root
-    if len(path) > 1 and path.endswith("/"):
-        path = path.rstrip("/")
-    return path
-
-
-def _is_not_hidden_path(path: str) -> bool:
-    """Check if path is not hidden.
-
-    Hidden paths is a path where any directory name or the file name itself start with '.'"""
-    return not path.startswith(".") and "/." not in path
+def is_hidden_path(path: str) -> bool:
+    """Whether any directory or the filename itself starts with a dot."""
+    return path.startswith(".") or "/." in path
 
 
 class StateBackend:
     """In-memory file storage backend.
 
-    Files are stored in a dictionary and are ephemeral (lost when the
-    process ends). Useful for testing and temporary file operations.
+    Files live in a dictionary and are ephemeral — lost when the process ends.
+    Useful for testing and for scratch space alongside a real backend.
 
     Example:
         ```python
         from pydantic_ai_backends import StateBackend
 
         backend = StateBackend()
-
-        # Write a file
         backend.write("/src/app.py", "print('hello')")
-
-        # Read it back
         content = backend.read("/src/app.py")
         print(content)  # "     1\\tprint('hello')"
-
-        # Search files
         matches = backend.grep_raw("print")
         ```
     """
@@ -74,217 +44,130 @@ class StateBackend:
         self._files: dict[str, FileData] = files if files is not None else {}
 
     @property
-    def _files_not_hidden(self) -> dict[str, FileData]:
-        return {path: data for path, data in self._files.items() if _is_not_hidden_path(path)}
-
-    @property
     def files(self) -> dict[str, FileData]:
-        """Get the internal files dictionary."""
+        """The internal files dictionary."""
         return self._files
 
-    def _get_timestamp(self) -> str:
-        """Get current ISO 8601 timestamp."""
-        return datetime.now(timezone.utc).isoformat()
-
     def exists(self, path: str) -> bool:
-        """Check whether a file exists in the in-memory store."""
-        if _validate_path(path) is not None:
+        """Whether a file is stored at `path`."""
+        if unsafe_path_reason(path) is not None:
             return False
-        return _normalize_path(path) in self._files
+        return normalize_path(path) in self._files
 
     def ls_info(self, path: str) -> list[FileInfo]:
-        """List files and directories at the given path."""
-        error = _validate_path(path)
-        if error:
+        """List the files and directories directly under `path`."""
+        if unsafe_path_reason(path) is not None:
             return []
 
-        path = _normalize_path(path)
-
-        # Collect all entries at this level
-        entries: dict[str, FileInfo] = {}
+        path = normalize_path(path)
         prefix = path if path == "/" else path + "/"
+        entries: dict[str, FileInfo] = {}
 
         for file_path, file_data in self._files.items():
-            if not file_path.startswith(prefix) and file_path != path:
-                continue  # pragma: no cover
-
-            # Get the relative path from the directory
             if file_path == path:
-                # This is a file, not a directory
-                name = file_path.split("/")[-1]
-                entries[name] = FileInfo(
-                    name=name,
-                    path=file_path,
-                    is_dir=False,
-                    size=sum(len(line) for line in file_data["content"]),
-                )
-            else:  # pragma: no cover
-                rel_path = file_path[len(prefix) :]
-                parts = rel_path.split("/")
-                name = parts[0]
+                name = file_path.rsplit("/", 1)[-1]
+                entries[name] = _file_entry(name, file_path, file_data)
+                continue
+            if not file_path.startswith(prefix):
+                continue
 
-                if name not in entries:
-                    if len(parts) == 1:
-                        # Direct child file
-                        entries[name] = FileInfo(
-                            name=name,
-                            path=file_path,
-                            is_dir=False,
-                            size=sum(len(line) for line in file_data["content"]),
-                        )
-                    else:
-                        # Directory (has more parts)
-                        entries[name] = FileInfo(
-                            name=name,
-                            path=prefix + name,
-                            is_dir=True,
-                            size=None,
-                        )
+            name, _, rest = file_path[len(prefix) :].partition("/")
+            if name in entries:
+                continue
+            if rest:
+                entries[name] = FileInfo(name=name, path=prefix + name, is_dir=True, size=None)
+            else:
+                entries[name] = _file_entry(name, file_path, file_data)
 
         return sorted(entries.values(), key=lambda x: (not x["is_dir"], x["name"]))
 
     def read_bytes(self, path: str) -> bytes:
-        """Read raw bytes from a file.
-
-        Args:
-            path: File path to read.
-
-        Returns:
-            File content as bytes.
-        """
-        error = _validate_path(path)
-        if error:  # pragma: no cover
-            return f"Error: {error}".encode()
-
-        path = _normalize_path(path)
-
-        if path not in self._files:
+        """Read a whole file as bytes, or `b""` when there is none at `path`."""
+        if unsafe_path_reason(path) is not None:
             return b""
 
-        content = "\n".join(self._files[path]["content"])
-        return content.encode("utf-8", errors="replace")  # pragma: no cover
+        stored = self._files.get(normalize_path(path))
+        if stored is None:
+            return b""
+        return "\n".join(stored["content"]).encode("utf-8", errors="replace")
 
     def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
-        """Read file content with line numbers."""
-        error = _validate_path(path)
-        if error:  # pragma: no cover
-            return f"Error: {error}"
+        """Read a slice of a file with line numbers."""
+        reason = unsafe_path_reason(path)
+        if reason is not None:
+            return f"Error: {reason}"
 
-        path = _normalize_path(path)
-
-        if path not in self._files:
+        path = normalize_path(path)
+        stored = self._files.get(path)
+        if stored is None:
             return f"Error: File '{path}' not found"
 
-        lines = self._files[path]["content"]
-        total_lines = len(lines)
+        lines = stored["content"]
+        if offset >= len(lines):
+            return f"Error: Offset {offset} exceeds file length ({len(lines)} lines)"
 
-        if offset >= total_lines:
-            return f"Error: Offset {offset} exceeds file length ({total_lines} lines)"
-
-        end = min(offset + limit, total_lines)
-        result_lines = []
-
-        for i in range(offset, end):
-            line_num = i + 1  # 1-indexed
-            result_lines.append(f"{line_num:>6}\t{lines[i]}")
-
-        result = "\n".join(result_lines)
-
-        if end < total_lines:
-            result += f"\n\n... ({total_lines - end} more lines)"
-
-        return result
+        end = min(offset + limit, len(lines))
+        numbered = "\n".join(f"{i + 1:>6}\t{lines[i]}" for i in range(offset, end))
+        if end < len(lines):
+            return f"{numbered}\n\n... ({len(lines) - end} more lines)"
+        return numbered
 
     def write(self, path: str, content: str | bytes) -> WriteResult:
-        """Write content to a file."""
-        error = _validate_path(path)
-        if error:
-            return WriteResult(error=error)
+        """Write a file, replacing any existing content."""
+        reason = unsafe_path_reason(path)
+        if reason is not None:
+            return WriteResult(error=reason)
 
-        path = _normalize_path(path)
-        now = self._get_timestamp()
-
-        # Convert bytes to string if needed
+        path = normalize_path(path)
         if isinstance(content, bytes):
             content = content.decode("utf-8", errors="replace")
 
-        # Split content into lines, preserving empty lines
-        lines = content.split("\n")
-
+        now = _timestamp()
         existing = self._files.get(path)
-        created_at = existing["created_at"] if existing else now
         self._files[path] = FileData(
-            content=lines,
-            created_at=created_at,
+            content=content.split("\n"),
+            created_at=existing["created_at"] if existing else now,
             modified_at=now,
         )
-
         return WriteResult(path=path)
 
     def edit(
         self, path: str, old_string: str, new_string: str, replace_all: bool = False
     ) -> EditResult:
-        """Edit a file by replacing strings."""
-        error = _validate_path(path)
-        if error:
-            return EditResult(error=error)
+        """Edit a file by replacing a string."""
+        reason = unsafe_path_reason(path)
+        if reason is not None:
+            return EditResult(error=reason)
 
-        path = _normalize_path(path)
+        path = normalize_path(path)
+        stored = self._files.get(path)
+        if stored is None:
+            return EditResult(error=f"File '{path}' not found")
 
-        if path not in self._files:
-            return EditResult(error=f"File '{path}' not found")  # pragma: no cover
+        outcome = replace_in_content(
+            "\n".join(stored["content"]), old_string, new_string, replace_all
+        )
+        if not isinstance(outcome, Replacement):
+            return EditResult(error=outcome)
 
-        content = "\n".join(self._files[path]["content"])
-        occurrences = content.count(old_string)
-
-        if occurrences == 0:
-            return EditResult(error=f"String '{old_string}' not found in file")  # pragma: no cover
-
-        if occurrences > 1 and not replace_all:
-            return EditResult(
-                error=f"String '{old_string}' found {occurrences} times. "
-                "Use replace_all=True to replace all, or provide more context."
-            )
-
-        if replace_all:
-            new_content = content.replace(old_string, new_string)
-        else:
-            new_content = content.replace(old_string, new_string, 1)
-
-        self._files[path]["content"] = new_content.split("\n")
-        self._files[path]["modified_at"] = self._get_timestamp()
-
-        return EditResult(path=path, occurrences=occurrences if replace_all else 1)
+        stored["content"] = outcome.content.split("\n")
+        stored["modified_at"] = _timestamp()
+        return EditResult(path=path, occurrences=outcome.occurrences)
 
     def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
-        """Find files matching a glob pattern."""
-        error = _validate_path(path)
-        if error:
+        """Match stored paths against a glob pattern."""
+        if unsafe_path_reason(path) is not None:
             return []
 
-        path = _normalize_path(path)
+        path = normalize_path(path)
+        root = "" if path == "/" else path
+        full_pattern = f"{root}/{pattern.lstrip('/')}"
 
-        # Combine path and pattern
-        if path == "/":
-            full_pattern = "/" + pattern.lstrip("/")
-        else:
-            full_pattern = path + "/" + pattern.lstrip("/")
-
-        results: list[FileInfo] = []
-
-        for file_path, file_data in self._files.items():
-            # Use wcmatch for glob matching
-            if wcglob.globmatch(file_path, full_pattern, flags=wcglob.GLOBSTAR):
-                name = file_path.split("/")[-1]
-                results.append(
-                    FileInfo(
-                        name=name,
-                        path=file_path,
-                        is_dir=False,
-                        size=sum(len(line) for line in file_data["content"]),
-                    )
-                )
-
+        results = [
+            _file_entry(file_path.rsplit("/", 1)[-1], file_path, file_data)
+            for file_path, file_data in self._files.items()
+            if wcglob.globmatch(file_path, full_pattern, flags=wcglob.GLOBSTAR)
+        ]
         return sorted(results, key=lambda x: x["path"])
 
     def grep_raw(
@@ -294,57 +177,60 @@ class StateBackend:
         glob: str | None = None,
         ignore_hidden: bool = True,
     ) -> list[GrepMatch] | str:
-        """Search for pattern in files."""
+        """Search stored file contents for a regex."""
         try:
             regex = re.compile(pattern)
         except re.error as e:
             return f"Error: Invalid regex pattern: {e}"
 
-        results: list[GrepMatch] = []
-        files = self._files_not_hidden if ignore_hidden else self._files
-        # Determine which files to search
-        files_to_search: list[str] = []
+        searchable = self._searchable_paths(path, ignore_hidden)
+        if isinstance(searchable, str):
+            return searchable
 
-        if path:
-            error = _validate_path(path)
-            if error:
-                return f"Error: {error}"
-            path = _normalize_path(path)
-
-            # An explicitly named file is searched even when hidden: look it up
-            # in the full file set, not the ignore_hidden-filtered view. The
-            # filter only applies to directory walks below.
-            if path in self._files:
-                files_to_search = [path]
-            else:
-                # Path is a directory - search all files under it
-                prefix = path if path == "/" else path + "/"
-                files_to_search = [f for f in files if f.startswith(prefix)]
-        else:
-            files_to_search = list(files.keys())
-
-        # Filter by glob if provided
         if glob:
             glob_pattern = "/" + glob.lstrip("/")
-            files_to_search = [
-                f
-                for f in files_to_search
-                if wcglob.globmatch(f, glob_pattern, flags=wcglob.GLOBSTAR)
+            searchable = [
+                p for p in searchable if wcglob.globmatch(p, glob_pattern, flags=wcglob.GLOBSTAR)
             ]
 
-        # Search each file. Index into the full file set so an explicitly
-        # named hidden file (added to files_to_search above) is found even
-        # when ignore_hidden filtered it out of the directory-walk view.
-        for file_path in files_to_search:
-            lines = self._files[file_path]["content"]
-            for i, line in enumerate(lines):
-                if regex.search(line):
-                    results.append(
-                        GrepMatch(
-                            path=file_path,
-                            line_number=i + 1,
-                            line=line,
-                        )
-                    )
+        return [
+            GrepMatch(path=file_path, line_number=i + 1, line=line)
+            for file_path in searchable
+            for i, line in enumerate(self._files[file_path]["content"])
+            if regex.search(line)
+        ]
 
-        return results
+    def _searchable_paths(self, path: str | None, ignore_hidden: bool) -> list[str] | str:
+        """Paths grep should walk, or an error message when `path` is invalid.
+
+        A file named outright is searched even when hidden; `ignore_hidden` only
+        filters the directory walk.
+        """
+        visible = [p for p in self._files if not ignore_hidden or not is_hidden_path(p)]
+
+        if path is None:
+            return visible
+
+        reason = unsafe_path_reason(path)
+        if reason is not None:
+            return f"Error: {reason}"
+
+        path = normalize_path(path)
+        if path in self._files:
+            return [path]
+
+        prefix = path if path == "/" else path + "/"
+        return [p for p in visible if p.startswith(prefix)]
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _file_entry(name: str, path: str, data: FileData) -> FileInfo:
+    return FileInfo(
+        name=name,
+        path=path,
+        is_dir=False,
+        size=sum(len(line) for line in data["content"]),
+    )

@@ -15,9 +15,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import DockerSandbox, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: DockerSandbox
+
 
 # Create sandbox with pre-configured runtime
 sandbox = DockerSandbox(runtime="python-datascience")
@@ -60,13 +62,25 @@ sandbox = DockerSandbox(runtime=runtime)
 
 ### Built-in Runtimes
 
-| Runtime | Description | Use Case |
-|---------|-------------|----------|
-| `python-minimal` | Clean Python 3.12 | General scripting |
-| `python-datascience` | pandas, numpy, matplotlib, scikit-learn, seaborn | Data analysis |
-| `python-web` | FastAPI, SQLAlchemy, httpx | Web development |
-| `node-minimal` | Clean Node.js 20 | JavaScript/TypeScript |
-| `node-react` | TypeScript, Vite, React | Frontend development |
+| Runtime | Image | What it adds |
+|---|---|---|
+| `python-minimal` | python:3.12-slim | standard library only |
+| `python-datascience` | built on python:3.12-slim | pandas, numpy, matplotlib, scikit-learn, seaborn |
+| `python-analytics` | built on python:3.12-slim | duckdb, polars, pyarrow |
+| `python-web` | built on python:3.12-slim | fastapi, uvicorn, sqlalchemy, httpx |
+| `python-scraping` | built on python:3.12-slim | httpx, beautifulsoup4, lxml, markdownify |
+| `python-documents` | built on python:3.12-slim | pypdf, python-docx, openpyxl, pillow |
+| `node-minimal` | node:20-slim | nothing |
+| `node-typescript` | built on node:20-slim | typescript, tsx, vitest |
+| `node-react` | built on node:20-slim | typescript, vite, react, react-dom, @types/react |
+| `bun` | oven/bun:1-slim | Bun's own bundler, test runner and package manager |
+| `deno` | denoland/deno:alpine | TypeScript with no install step |
+| `go` | golang:1.23-alpine | Go toolchain |
+| `rust` | rust:1-slim | Rust toolchain with cargo |
+
+A runtime naming an `image` starts as fast as a pull. One naming a `base_image`
+plus `packages` builds an image on first use and hits the cache afterwards, which
+is worth it when installing them per session would dominate.
 
 ## SessionManager for Multi-User
 
@@ -77,16 +91,19 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import SessionManager, DockerSandbox, create_console_toolset
 
+
 @dataclass
 class UserDeps:
     backend: DockerSandbox
     user_id: str
+
 
 # Create session manager
 manager = SessionManager(
     default_runtime="python-datascience",
     workspace_root="/app/workspaces",  # Persistent storage per user
 )
+
 
 async def handle_user_request(user_id: str, message: str):
     # Get or create sandbox for this user
@@ -102,6 +119,7 @@ async def handle_user_request(user_id: str, message: str):
         deps=UserDeps(backend=sandbox, user_id=user_id),
     )
     return result.output
+
 
 # Each user's code runs in isolated container
 # User A cannot see User B's files
@@ -166,8 +184,10 @@ backend (Daytona, custom implementations, etc.):
 ```python
 from pydantic_ai_backends import SessionManager, DaytonaSandbox
 
+
 def daytona_factory(session_id: str) -> DaytonaSandbox:
     return DaytonaSandbox(sandbox_id=session_id)
+
 
 manager = SessionManager(sandbox_factory=daytona_factory)
 sandbox = await manager.get_or_create("user-123")

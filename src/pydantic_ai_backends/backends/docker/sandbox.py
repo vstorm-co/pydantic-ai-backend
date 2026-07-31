@@ -1,179 +1,87 @@
-"""Sandbox backends for isolated command execution."""
+"""Sandbox that runs commands and holds files inside a Docker container."""
 
 from __future__ import annotations
 
-import hashlib
+import contextlib
 import io
-import mimetypes
-import re
 import shlex
 import tarfile
 import time
-from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-from pydantic_ai_backends.backends.base import (
-    CODE_EXT,
-    TEXT_EXT,
-    BaseSandbox,
-    _get_chardet,
-    _get_pypdf,
+from pydantic_ai_backends._editing import Replacement, replace_in_content
+from pydantic_ai_backends._limits import (
+    DEFAULT_MAX_READ_BYTES,
+    MAX_EXECUTE_OUTPUT_BYTES,
+    READ_LIMIT_HINT,
 )
+from pydantic_ai_backends._text import bytes_to_text
+from pydantic_ai_backends.backends.base import BaseSandbox
+from pydantic_ai_backends.backends.docker._client import docker_client
+from pydantic_ai_backends.backends.docker._image import resolve_image
+from pydantic_ai_backends.backends.docker._stats import parse_usage
 from pydantic_ai_backends.types import (
     EditResult,
     ExecuteResponse,
     RuntimeConfig,
+    SandboxUsage,
     WriteResult,
 )
 
 if TYPE_CHECKING:
-    pass
+    from collections.abc import Generator
+
+    from docker import DockerClient
+    from docker.models.containers import Container
+
+ALIVE_CACHE_SECONDS = 5.0
+"""How long a liveness answer is trusted before the daemon is asked again.
+
+`SessionManager.get_or_create` calls `is_alive()` on every request, so an
+uncached check bills a daemon round trip to each agent turn.
+"""
+
+DEFAULT_PIDS_LIMIT = 512
+"""Process ceiling per container. No ordinary workload approaches it, but it
+bounds a runaway `fork` loop that would otherwise exhaust host PIDs."""
+
+REATTACHABLE_STATUSES = ("created", "exited", "paused")
+"""Statuses a named container can be started from instead of recreated."""
+
+TMPFS_OPTIONS = "exec"
+"""Docker mounts a tmpfs `noexec` by default, which breaks any `pip install` of a
+source distribution — pip unpacks into `/tmp` and runs the build from there."""
 
 
-# Package names may only contain these characters. This is deliberately strict:
-# it covers pip (PEP 508 names, extras, version specifiers), npm (including
-# scoped @scope/name), apt and cargo package names, while rejecting shell
-# metacharacters and whitespace that could break out of the RUN instruction.
-_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9@][A-Za-z0-9._@/+=<>~!\[\]-]*$")
+class ReadLimitExceeded(Exception):
+    """Raised when a file is too large to pull out of the container.
 
-# Environment variable names follow the POSIX portable character set.
-_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-# Characters that must never appear unescaped in a generated Dockerfile line
-# because they would let a value break out into its own shell command.
-_SHELL_METACHARACTERS = set(";&|`$()<>\n\r")
-
-
-def _reject_metacharacters(value: str, *, what: str) -> None:
-    """Reject values containing shell metacharacters or newlines.
-
-    Args:
-        value: The value to validate.
-        what: Human-readable description for the error message.
-
-    Raises:
-        ValueError: If the value contains a shell metacharacter or newline.
+    Distinct from the empty-bytes result used for a missing file: callers turn
+    this into a message explaining what to do instead (read a slice), which an
+    empty `bytes` return could not convey.
     """
-    bad = _SHELL_METACHARACTERS.intersection(value)
-    if bad:
-        rendered = ", ".join(sorted(repr(c) for c in bad))
-        raise ValueError(f"{what} contains disallowed shell metacharacters: {rendered}")
 
 
-def _validate_package_name(name: str) -> str:
-    """Validate a package name against a strict allowlist.
-
-    Args:
-        name: The package name to validate.
-
-    Returns:
-        The validated package name.
-
-    Raises:
-        ValueError: If the name is empty or contains disallowed characters.
-    """
-    if not name or not _PACKAGE_NAME_RE.match(name):
-        raise ValueError(f"Invalid package name: {name!r}")
-    return name
-
-
-def _validate_env_var(key: str, value: str) -> tuple[str, str]:
-    """Validate an environment variable name and quote its value.
-
-    Args:
-        key: The environment variable name.
-        value: The environment variable value.
-
-    Returns:
-        A `(key, quoted_value)` tuple safe for an `ENV` instruction.
-
-    Raises:
-        ValueError: If the key is invalid or the value contains a newline.
-    """
-    if not _ENV_KEY_RE.match(key):
-        raise ValueError(f"Invalid environment variable name: {key!r}")
-    if "\n" in value or "\r" in value:
-        raise ValueError(f"Environment variable {key!r} value contains a newline")
-    return key, shlex.quote(value)
-
-
-def _build_dockerfile(runtime: RuntimeConfig) -> str:
-    """Build Dockerfile content for a runtime, validating untrusted values.
-
-    Package names, environment variable names/values and the work directory
-    are all validated or quoted before interpolation so that values containing
-    shell metacharacters cannot inject commands during the image build.
-
-    Args:
-        runtime: Runtime configuration with a resolved `base_image`.
-
-    Returns:
-        Dockerfile content as a string.
-
-    Raises:
-        ValueError: If any package name, env var or work_dir is unsafe.
-    """
-    assert runtime.base_image is not None
-    lines = [f"FROM {runtime.base_image}"]
-
-    # Setup commands are author-controlled shell snippets; reject newlines so a
-    # single command cannot smuggle extra RUN lines into the Dockerfile.
-    for cmd in runtime.setup_commands:
-        if "\n" in cmd or "\r" in cmd:
-            raise ValueError("setup command contains a newline")
-        lines.append(f"RUN {cmd}")
-
-    # Install packages
-    if runtime.packages:
-        packages = [_validate_package_name(p) for p in runtime.packages]
-        packages_str = " ".join(packages)
-        if runtime.package_manager == "pip":
-            lines.append(f"RUN pip install --no-cache-dir {packages_str}")
-        elif runtime.package_manager == "npm":
-            # Install into the work_dir's node_modules (not -g) so application
-            # libraries like react/react-dom are resolvable from user code.
-            lines.append(f"WORKDIR {shlex.quote(runtime.work_dir)}")
-            lines.append(f"RUN npm install {packages_str}")
-        elif runtime.package_manager == "apt":
-            lines.append(f"RUN apt-get update && apt-get install -y {packages_str}")
-        elif runtime.package_manager == "cargo":  # pragma: no branch
-            lines.append(f"RUN cargo install {packages_str}")
-
-    # Environment variables
-    for key, value in runtime.env_vars.items():
-        safe_key, safe_value = _validate_env_var(key, value)
-        lines.append(f"ENV {safe_key}={safe_value}")
-
-    # Work directory
-    _reject_metacharacters(runtime.work_dir, what="work_dir")
-    lines.append(f"WORKDIR {shlex.quote(runtime.work_dir)}")
-
-    return "\n".join(lines)
-
-
-class DockerSandbox(BaseSandbox):  # pragma: no cover
+class DockerSandbox(BaseSandbox):
     """Docker-based sandbox for isolated command execution.
 
-    Creates a Docker container for running commands in an isolated environment.
-    Requires the docker Python package to be installed.
-
-    Supports RuntimeConfig for pre-configured environments with packages pre-installed.
+    The container starts lazily on the first operation. File transfers use
+    Docker's archive API rather than shell heredocs, so content with quotes,
+    newlines or arbitrary bytes survives a round trip intact.
 
     Example:
         ```python
         from pydantic_ai_backends import DockerSandbox, RuntimeConfig
 
-        # Use a simple image
         sandbox = DockerSandbox(image="python:3.12-slim")
 
-        # Or use a custom runtime with packages
-        custom_runtime = RuntimeConfig(
+        ml_runtime = RuntimeConfig(
             name="ml-env",
             base_image="python:3.12-slim",
             packages=["torch", "transformers"],
         )
-        sandbox = DockerSandbox(runtime=custom_runtime)
+        sandbox = DockerSandbox(runtime=ml_runtime)
         ```
     """
 
@@ -189,53 +97,102 @@ class DockerSandbox(BaseSandbox):  # pragma: no cover
         volumes: dict[str, str] | None = None,
         network_mode: str | None = None,
         container_name: str | None = None,
+        mem_limit: str | None = None,
+        cpus: float | None = None,
+        cpu_shares: int | None = None,
+        pids_limit: int | None = DEFAULT_PIDS_LIMIT,
+        tmpfs: dict[str, str] | None = None,
+        max_read_bytes: int = DEFAULT_MAX_READ_BYTES,
+        oci_runtime: str | None = None,
     ):
-        """Initialize Docker sandbox.
+        """Initialize the sandbox without starting its container.
 
         Args:
-            image: Docker image to use (ignored if runtime is provided).
+            image: Docker image to use. Ignored when `runtime` is given.
             sandbox_id: Unique identifier for this sandbox.
-            work_dir: Working directory inside container (ignored if runtime is provided).
-            auto_remove: Remove container when stopped. Forced to `False`
-                when `container_name` is set (reusable containers).
-            runtime: RuntimeConfig or name of built-in runtime.
-            session_id: Alias for sandbox_id (for session management).
-            idle_timeout: Timeout in seconds for idle cleanup (default: 1 hour).
-            volumes: Host-to-container volume mappings for persistent storage.
-                     Format: {"/host/path": "/container/path"}
-            network_mode: Docker network mode ("bridge", "none", "host",
-                         "container:<name|id>"). None uses Docker default.
-            container_name: Stable Docker container name for reuse across
-                restarts. When set, `_ensure_container()` looks for an existing
-                container with this name and reattaches (or starts it if stopped)
-                instead of creating a new one. Implies `auto_remove=False`.
+            work_dir: Working directory inside the container. Ignored when
+                `runtime` is given.
+            auto_remove: Remove the container when it stops. Forced to `False`
+                when `container_name` is set, since a named container exists to
+                be reused.
+            runtime: `RuntimeConfig`, or the name of a built-in runtime.
+            session_id: Alias for `sandbox_id`, for session management.
+            idle_timeout: Idle seconds after which `SessionManager` may reap it.
+            volumes: Host-to-container mounts, as `{"/host": "/container"}`.
+            network_mode: Docker network mode (`"bridge"`, `"none"`, `"host"`,
+                `"container:<name|id>"`). Pass `"none"` for sandboxes that must
+                not reach the network; it also skips per-container veth and
+                firewall setup, so containers start measurably faster.
+            container_name: Stable name to reattach to across restarts, which
+                preserves installed packages and other filesystem state.
+                Implies `auto_remove=False`.
+            mem_limit: Memory ceiling in Docker syntax (`"512m"`, `"2g"`). Swap
+                is pinned to the same value, so a container over its ceiling is
+                stopped rather than left swapping against the host.
+            cpus: Hard CPU ceiling in cores, e.g. `1.5`. A container never
+                exceeds it, which also means it cannot use cores that are sitting
+                idle — on a small host that is often the wrong trade.
+            cpu_shares: Relative CPU weight (Docker's default is 1024). Unlike
+                `cpus` this only applies under contention, so one active sandbox
+                may use the whole machine and several are still divided fairly.
+                Composes with `cpus` when both are set.
+            pids_limit: Maximum number of processes. `None` disables the limit.
+            tmpfs: In-memory mounts, as `{"/tmp": "size=64m"}`. Writes to a
+                tmpfs never reach the container's write layer, so scratch files
+                are both faster and free of disk growth. `exec` is added to the
+                options because Docker mounts a tmpfs `noexec`, which breaks
+                installing any package that builds from source.
+
+                Its pages count against `mem_limit`, not on top of it: a sandbox
+                that fills a 64m `/tmp` has that much less left for its own
+                processes, and one that tries to exceed the limit through `/tmp`
+                is killed by its own cgroup rather than troubling the host.
+            max_read_bytes: Largest file `read`/`read_bytes`/`edit` will pull
+                out of the container. Oversized files are refused instead of
+                being buffered into the host's memory.
+            oci_runtime: Low-level runtime the daemon starts this container
+                with — Docker's `--runtime`. `None` takes the daemon's default,
+                normally `runc`.
+
+                This is the one knob that changes the *isolation boundary*
+                rather than a resource ceiling, which is why it is per sandbox:
+                `"runsc"` (gVisor) moves syscall handling into userspace and
+                `"kata"` gives the container its own kernel in a microVM, while
+                a container under plain `runc` shares the host's. Untrusted
+                model-written code is exactly the workload that argues for one
+                of them.
+
+                The runtime must already be registered with the daemon in
+                `/etc/docker/daemon.json`; naming an unregistered one makes the
+                daemon refuse to start the container. See the installation docs
+                for the host side, including `crun` as a faster drop-in default.
         """
-        # session_id is an alias for sandbox_id
-        effective_id = session_id or sandbox_id
-        super().__init__(effective_id)
+        super().__init__(session_id or sandbox_id)
 
         self._container_name = container_name
-        # Named containers must not be auto-removed (they're meant to be reused)
         self._auto_remove = False if container_name else auto_remove
-        self._container = None
+        self._container: Container | None = None
         self._idle_timeout = idle_timeout
         self._last_activity = time.time()
         self._volumes = volumes or {}
         self._network_mode = network_mode
+        self._mem_limit = mem_limit
+        self._cpus = cpus
+        self._cpu_shares = cpu_shares
+        self._pids_limit = pids_limit
+        self._tmpfs = tmpfs or {}
+        self._max_read_bytes = max_read_bytes
+        self._oci_runtime = oci_runtime
+        self._alive = False
+        self._alive_checked_at: float | None = None
 
-        # Handle runtime configuration
-        if runtime is not None:
-            if isinstance(runtime, str):
-                from pydantic_ai_backends.backends.docker.runtimes import get_runtime
+        if isinstance(runtime, str):
+            from pydantic_ai_backends.backends.docker.runtimes import get_runtime
 
-                runtime = get_runtime(runtime)
-            self._runtime: RuntimeConfig | None = runtime
-            self._work_dir = runtime.work_dir
-            self._image = image  # Will be overridden by _ensure_runtime_image()
-        else:
-            self._runtime = None
-            self._work_dir = work_dir
-            self._image = image
+            runtime = get_runtime(runtime)
+        self._runtime = runtime
+        self._image = image
+        self._work_dir = runtime.work_dir if runtime is not None else work_dir
 
     @property
     def runtime(self) -> RuntimeConfig | None:
@@ -244,572 +201,402 @@ class DockerSandbox(BaseSandbox):  # pragma: no cover
 
     @property
     def session_id(self) -> str:
-        """Alias for sandbox id, used for session management."""
+        """Alias for the sandbox id, used for session management."""
         return self._id
 
+    @property
+    def idle_timeout(self) -> int:
+        """Idle seconds after which `SessionManager` may reap this sandbox."""
+        return self._idle_timeout
+
     def _resolve_path(self, path: str) -> str:
-        """Resolve relative paths against the container's working directory."""
+        """Resolve a relative path against the container's working directory."""
         if not PurePosixPath(path).is_absolute():
             return str(PurePosixPath(self._work_dir) / path)
         return path
 
-    def _ensure_container(self) -> None:
-        """Ensure Docker container is running.
+    # ── Container lifecycle ────────────────────────────────────────────
 
-        When `container_name` is set, looks for an existing container with
-        that name and reattaches.  Stopped containers are restarted so that
-        installed packages, caches, and other filesystem state are preserved
-        across CLI sessions.
-        """
+    def start(self) -> None:
+        """Start the container now instead of on the first operation."""
+        self._ensure_container()
+
+    def _ensure_container(self) -> None:
+        """Attach to or create the container backing this sandbox."""
         if self._container is not None:
             return
 
-        try:
-            import docker
-            import docker.errors
-        except ImportError as e:
-            raise ImportError(
-                "Docker package not installed. "
-                "Install with: pip install pydantic-ai-backend[docker]"
-            ) from e
+        # Everything below attaches or creates a container, so any cached
+        # liveness answer belongs to a container that is no longer ours.
+        self._alive_checked_at = None
 
-        client = docker.from_env()
+        # Resolved before the submodule import so a missing optional dependency
+        # surfaces the install hint instead of a bare ImportError.
+        client = docker_client()
 
-        # Try to reattach to an existing named container
-        if self._container_name:
-            try:
-                existing = client.containers.get(self._container_name)
-                status = existing.status
-                if status == "running":
-                    self._container = existing
-                    return
-                if status in ("created", "exited", "paused"):
-                    existing.start()
-                    self._container = existing
-                    return
-                # Other statuses (dead, removing) — fall through to create
-            except docker.errors.NotFound:
-                pass  # Will create a new container below
+        existing = self._reattach(client)
+        if existing is not None:
+            self._container = existing
+            return
 
-        # Get the appropriate image (build if needed for runtime)
-        image = self._ensure_runtime_image(client)
+        image = resolve_image(client, self._runtime, self._image)
+        self._container = client.containers.run(image, **self._run_kwargs())
 
-        # Prepare environment variables from runtime
-        env_vars = {}
-        if self._runtime and self._runtime.env_vars:
-            env_vars = self._runtime.env_vars
+    def _reattach(self, client: DockerClient) -> Container | None:
+        """Return the running named container for this sandbox, if there is one.
 
-        # Convert simple volume format to Docker SDK format
-        # {"/host": "/container"} -> {"/host": {"bind": "/container", "mode": "rw"}}
-        docker_volumes: dict[str, dict[str, str]] = {}
-        for host_path, container_path in self._volumes.items():
-            docker_volumes[host_path] = {"bind": container_path, "mode": "rw"}
-
-        run_kwargs: dict[str, Any] = dict(
-            command="sleep infinity",
-            detach=True,
-            working_dir=self._work_dir,
-            auto_remove=self._auto_remove,
-            environment=env_vars,
-            volumes=docker_volumes if docker_volumes else None,
-        )
-        if self._container_name is not None:
-            run_kwargs["name"] = self._container_name
-        if self._network_mode is not None:
-            run_kwargs["network_mode"] = self._network_mode
-
-        self._container = client.containers.run(image, **run_kwargs)
-
-    def _ensure_runtime_image(self, client: object) -> str:
-        """Ensure runtime image exists and return its name.
-
-        Args:
-            client: Docker client instance.
-
-        Returns:
-            Docker image name/tag to use.
-        """
-        if self._runtime is None:
-            return self._image
-
-        # If ready-to-use image is specified
-        if self._runtime.image:
-            return self._runtime.image
-
-        # If base_image + packages - need to build
-        if self._runtime.base_image:
-            return self._build_runtime_image(client)
-
-        # Fallback to default image
-        return self._image
-
-    def _build_runtime_image(self, client: object) -> str:
-        """Build a custom image with packages installed.
-
-        Args:
-            client: Docker client instance.
-
-        Returns:
-            Docker image tag for the built image.
+        A stopped container is started rather than replaced, so installed
+        packages, caches and other filesystem state survive a restart.
         """
         import docker.errors
 
-        runtime = self._runtime
-        assert runtime is not None
-        assert runtime.base_image is not None
-
-        # Generate unique tag based on config
-        config_hash = hashlib.md5(runtime.model_dump_json().encode()).hexdigest()[:12]
-        image_tag = f"pydantic-ai-backend-runtime:{runtime.name}-{config_hash}"
-
-        # Check if image exists (cache)
-        if runtime.cache_image:
-            try:
-                client.images.get(image_tag)  # type: ignore[attr-defined]
-                return image_tag
-            except docker.errors.ImageNotFound:
-                pass
-
-        # Build Dockerfile
-        dockerfile = self._generate_dockerfile(runtime)
-
-        # Build image
-        client.images.build(  # type: ignore[attr-defined]
-            fileobj=io.BytesIO(dockerfile.encode()),
-            tag=image_tag,
-            rm=True,
-        )
-
-        return image_tag
-
-    def _generate_dockerfile(self, runtime: RuntimeConfig) -> str:
-        """Generate Dockerfile content for runtime.
-
-        Args:
-            runtime: Runtime configuration.
-
-        Returns:
-            Dockerfile content as string.
-        """
-        assert runtime.base_image is not None
-        return _build_dockerfile(runtime)
-
-    def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
-        """Execute command in Docker container."""
-        self._ensure_container()
-        self._last_activity = time.time()  # Update activity timestamp
-        assert self._container is not None  # Ensured by _ensure_container()
+        if not self._container_name:
+            return None
 
         try:
-            # Note: Docker SDK exec_run doesn't support timeout parameter directly.
-            # For timeouts, we wrap the command with 'timeout' utility.
-            if timeout is not None:
-                exec_cmd = ["timeout", str(timeout), "sh", "-c", command]
-            else:
-                exec_cmd = ["sh", "-c", command]
-
-            exit_code, output = self._container.exec_run(
-                exec_cmd,
-                workdir=self._work_dir,
-            )
-
-            if not isinstance(output, bytes):
-                output = b"".join(output)
-            output_str = output.decode("utf-8", errors="replace")
-
-            # Truncate if too long
-            max_output = 100000
-            truncated = len(output_str) > max_output
-            if truncated:
-                output_str = output_str[:max_output]
-
-            return ExecuteResponse(
-                output=output_str,
-                exit_code=exit_code,
-                truncated=truncated,
-            )
-        except Exception as e:
-            return ExecuteResponse(
-                output=f"Error: {e}",
-                exit_code=1,
-                truncated=False,
-            )
-
-    def read_bytes(self, path: str) -> bytes:
-        """Read raw bytes from file in container.
-
-        Args:
-            path: Path to the file in the container.
-
-        Returns:
-            File content as bytes, or empty bytes if the file does not
-            exist or cannot be read.
-        """
-        path = self._resolve_path(path)
-        self._ensure_container()
-        assert self._container is not None
-
-        try:
-            # Use Docker get_archive to read file
-            stream, stat = self._container.get_archive(path)
-            raw_tar_bytes = b"".join(stream)
-        except Exception:
-            return b""
-
-        # Extract file from tar archive
-        try:
-            with (
-                io.BytesIO(raw_tar_bytes) as tar_buffer,
-                tarfile.open(fileobj=tar_buffer, mode="r") as tar,
-            ):
-                member = next((m for m in tar.getmembers() if m.isfile()), None)
-
-                if not member:
-                    return b""
-
-                f = tar.extractfile(member)
-                if f is None:
-                    return b""
-
-                return f.read()
-        except Exception:
-            return b""
-
-    def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
-        """
-        Read file from container using Docker get_archive API.
-
-        Args:
-            path: Path to the file in the container.
-            offset: Start line index (for pagination).
-            limit: Maximum number of lines to return.
-        """
-        original_path = path
-        path = self._resolve_path(path)
-        try:
-            # Read raw bytes from file
-            file_bytes = self.read_bytes(path)
-            if not file_bytes:
-                return f"Error: File '{original_path}' not found"
-
-            # Convert bytes to string
-            file_ext = Path(path).suffix.lower().lstrip(".")
-            try:
-                full_text = self._convert_bytes_to_text(file_ext, file_bytes)
-            except ValueError as e:
-                return f"[Error: {e}]"
-
-            # Split into lines
-            lines = full_text.splitlines()
-            total_lines = len(lines)
-
-            if offset >= total_lines:
-                return "[End of file]"
-
-            end_index = offset + limit
-            chunk_lines = lines[offset:end_index]
-            chunk = "\n".join(chunk_lines)
-
-            if end_index < total_lines:
-                remaining = total_lines - end_index
-                footer = f"\n\n[... {remaining} more lines. Use offset={end_index} to read more.]"
-                return chunk + footer
-
-            return chunk
-
-        except Exception as e:
-            return f"[Error reading file: {e}]"
-
-    def _convert_bytes_to_text(self, file_ext: str, file_bytes: bytes) -> str:
-        # Plain text files with encoding detection
-        if file_ext in (TEXT_EXT | CODE_EXT):
-            return self._decode_text(file_bytes)
-
-        mime_type = mimetypes.types_map.get(f".{file_ext}")
-        if mime_type and (mime_type.startswith("text") or "json" in mime_type):
-            return self._decode_text(file_bytes)
-
-        # PDF files
-        elif file_ext == "pdf":
-            return self._extract_pdf_text(file_bytes)
-
-        return self._decode_unknown_text(file_bytes)
-
-    def _decode_text(self, file_bytes: bytes) -> str:
-        chardet = _get_chardet()
-
-        # Use chardet to detect encoding with confidence
-        detection = chardet.detect(file_bytes)
-        detected_encoding = detection.get("encoding")
-        confidence = detection.get("confidence", 0)
-
-        # If high confidence detection, use it
-        if detected_encoding and confidence > 0.7:
-            try:
-                return file_bytes.decode(detected_encoding)
-            except (UnicodeDecodeError, AttributeError, LookupError):
-                pass  # Fall through to manual attempts
-
-        # Fallback to common encodings if detection failed or low confidence
-        encodings = ["utf-8", "utf-8-sig", "latin-1", "cp1252", "iso-8859-1"]
-
-        # Add detected encoding to the front if not already there
-        if detected_encoding and detected_encoding not in encodings:
-            encodings.insert(0, detected_encoding)
-
-        for encoding in encodings:
-            try:
-                return file_bytes.decode(encoding)
-            except (UnicodeDecodeError, AttributeError, LookupError):
-                continue
-
-        # Last resort: decode with errors='replace' to avoid complete failure
-        return file_bytes.decode("utf-8", errors="replace")
-
-    def _decode_unknown_text(self, file_bytes: bytes) -> str:
-        chardet = _get_chardet()
-        # Use chardet to detect encoding with confidence
-        detected_encoding = chardet.detect(file_bytes).get("encoding")
-        # Try the detected encoding first, then utf-8. Use an ordered list (not
-        # a set) so decode order is deterministic for borderline inputs.
-        encodings = [detected_encoding, "utf-8"] if detected_encoding else ["utf-8"]
-        seen: set[str] = set()
-        for encoding in encodings:
-            if encoding in seen:
-                continue
-            seen.add(encoding)
-            text = file_bytes.decode(encoding, errors="replace")
-            if text.count("\ufffd") < max(len(text) // 100, 2):
-                return text
-        raise ValueError("[Binary File]")
-
-    def _extract_pdf_text(self, file_bytes: bytes) -> str:
-        pypdf = _get_pypdf()
-
-        try:
-            pdf_file = BytesIO(file_bytes)
-            pdf_reader = pypdf.PdfReader(pdf_file)
-
-            if len(pdf_reader.pages) == 0:
-                raise ValueError("PDF contains no pages")
-
-            # Extract metadata for context
-            metadata = pdf_reader.metadata
-            text_parts = []
-
-            if metadata:
-                if metadata.get("/Title"):
-                    text_parts.append(f"Title: {metadata['/Title']}\n")
-                if metadata.get("/Author"):
-                    text_parts.append(f"Author: {metadata['/Author']}\n")
-                if metadata.get("/Subject"):
-                    text_parts.append(f"Subject: {metadata['/Subject']}\n")
-                text_parts.append("\n")
-
-            # Extract text from each page with clear separators
-            for page_num, page in enumerate(pdf_reader.pages, 1):
-                page_text = page.extract_text()
-
-                if page_text and page_text.strip():
-                    # Clean up common PDF artifacts
-                    page_text = self._clean_pdf_text(page_text)
-                    text_parts.append(f"--- Page {page_num} ---\n")
-                    text_parts.append(page_text)
-                    text_parts.append("\n\n")
-
-            full_text = "".join(text_parts).strip()
-
-            if not full_text:
-                raise ValueError("No extractable text found in PDF")
-
-            return full_text
-
-        except Exception as e:
-            raise ValueError(f"Failed to parse PDF: {str(e)}") from e
-
-    def _clean_pdf_text(self, text: str) -> str:
-        """
-        Clean common PDF text extraction artifacts for better LLM processing.
-
-        Args:
-            text: Raw extracted text
-
-        Returns:
-            Cleaned text
-        """
-
-        # Remove excessive whitespace while preserving paragraph breaks
-        text = re.sub(r" +", " ", text)  # Multiple spaces to single space
-        text = re.sub(r"\n ", "\n", text)  # Remove leading spaces on lines
-        text = re.sub(r" \n", "\n", text)  # Remove trailing spaces on lines
-        text = re.sub(r"\n{3,}", "\n\n", text)  # Max 2 consecutive newlines
-
-        # Fix common hyphenation issues at line breaks
-        text = re.sub(r"(\w+)-\n(\w+)", r"\1\2", text)
-
-        # Remove form feed characters
-        text = text.replace("\f", "\n")
-
-        return text.strip()
-
-    def edit(
-        self, path: str, old_string: str, new_string: str, replace_all: bool = False
-    ) -> EditResult:
-        """Edit file using Python string operations instead of sed.
-
-        This method reads the entire file, performs string replacement in Python,
-        and writes it back. This approach handles multiline strings naturally
-        without shell escaping issues.
-
-        Args:
-            path: Path to the file in the container.
-            old_string: String to find and replace.
-            new_string: Replacement string.
-            replace_all: If True, replace all occurrences. If False, only replace first.
-
-        Returns:
-            EditResult with path and occurrence count on success, or error message.
-        """
-        original_path = path
-        path = self._resolve_path(path)
-        try:
-            # Read the file content
-            file_bytes = self.read_bytes(path)
-
-            if not file_bytes:
-                return EditResult(error=f"File '{original_path}' not found")
-
-            # Decode to string using the same logic as read()
-            file_ext = Path(path).suffix.lower().lstrip(".")
-            try:
-                content = self._convert_bytes_to_text(file_ext, file_bytes)
-            except ValueError as e:
-                return EditResult(error=str(e))
-
-            # Count occurrences
-            occurrences = content.count(old_string)
-
-            if occurrences == 0:
-                return EditResult(error="String not found in file")
-
-            if occurrences > 1 and not replace_all:
-                return EditResult(
-                    error=f"String found {occurrences} times. "
-                    "Use replace_all=True to replace all, or provide more context."
-                )
-
-            new_content = content.replace(old_string, new_string)
-
-            # Write back the modified content
-            write_result = self.write(path, new_content)
-
-            if write_result.error:
-                return EditResult(error=write_result.error)
-
-            return EditResult(path=path, occurrences=occurrences)
-
-        except Exception as e:
-            return EditResult(error=f"Failed to edit file: {e}")
-
-    def write(self, path: str, content: str | bytes) -> WriteResult:
-        """Write file to container using Docker put_archive API.
-
-        This method uses Docker's put_archive() instead of heredoc to handle
-        large files and special characters reliably.
-
-        Args:
-            path: Path where the file should be written (absolute or relative to work_dir).
-            content: File content as string or bytes.
-
-        Returns:
-            WriteResult with path on success, or error message on failure.
-        """
-        path = self._resolve_path(path)
-        self._ensure_container()
-        assert self._container is not None
-
-        try:
-            # Parse path into directory and filename
-            posix_path = PurePosixPath(path)
-            parent_dir = str(posix_path.parent)
-            filename = posix_path.name
-
-            # Ensure parent directory exists
-            safe_parent_dir = shlex.quote(parent_dir)
-            mkdir_result = self.execute(f"mkdir -p {safe_parent_dir}")
-            if mkdir_result.exit_code != 0:
-                return WriteResult(error=f"Failed to create directory: {mkdir_result.output}")
-
-            # Create tar archive in memory
-            content = content if isinstance(content, bytes) else content.encode()
-            tar_buffer = io.BytesIO()
-
-            with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
-                # Create TarInfo for the file
-                tarinfo = tarfile.TarInfo(name=filename)
-                tarinfo.size = len(content)
-                tarinfo.mtime = int(time.time())
-                tarinfo.mode = 0o644
-
-                # Add file to archive
-                tar.addfile(tarinfo, io.BytesIO(content))
-
-            # Reset buffer position
-            tar_buffer.seek(0)
-
-            # Upload to container. put_archive returns False when the target
-            # path is not a directory or the upload otherwise fails.
-            if not self._container.put_archive(parent_dir, tar_buffer):
-                return WriteResult(error=f"Failed to write file: put_archive to {parent_dir}")
-
-            return WriteResult(path=path)
-
-        except Exception as e:
-            return WriteResult(error=f"Failed to write file: {e}")
-
-    def start(self) -> None:
-        """Explicitly start the container.
-
-        This is useful for pre-warming containers before use.
-        The container is normally started lazily on first operation.
-        """
-        self._ensure_container()
+            existing = client.containers.get(self._container_name)
+        except docker.errors.NotFound:
+            return None
+
+        if existing.status == "running":
+            return existing
+        if existing.status in REATTACHABLE_STATUSES:
+            existing.start()
+            return existing
+        # Dead or being removed: a fresh container is the only way forward.
+        return None
+
+    def _run_kwargs(self) -> dict[str, Any]:
+        """Arguments for `containers.run`, including limits and hardening."""
+        kwargs: dict[str, Any] = {
+            "command": "sleep infinity",
+            "detach": True,
+            "working_dir": self._work_dir,
+            "auto_remove": self._auto_remove,
+            "environment": self._runtime.env_vars if self._runtime else {},
+            "volumes": {
+                host: {"bind": container, "mode": "rw"} for host, container in self._volumes.items()
+            }
+            or None,
+            # Sandboxed code is untrusted by definition, so deny it the one
+            # cheap escalation route a container still leaves open: gaining
+            # privileges by exec'ing a setuid binary.
+            "security_opt": ["no-new-privileges:true"],
+        }
+        if self._container_name is not None:
+            kwargs["name"] = self._container_name
+        if self._network_mode is not None:
+            kwargs["network_mode"] = self._network_mode
+        if self._pids_limit is not None:
+            kwargs["pids_limit"] = self._pids_limit
+        if self._mem_limit is not None:
+            # Without a matching swap ceiling the kernel lets a container over
+            # its memory limit swap instead, which starves the whole host.
+            kwargs["mem_limit"] = self._mem_limit
+            kwargs["memswap_limit"] = self._mem_limit
+        if self._cpus is not None:
+            kwargs["nano_cpus"] = int(self._cpus * 1_000_000_000)
+        if self._cpu_shares is not None:
+            kwargs["cpu_shares"] = self._cpu_shares
+        if self._tmpfs:
+            kwargs["tmpfs"] = {path: _with_exec(options) for path, options in self._tmpfs.items()}
+        if self._oci_runtime is not None:
+            kwargs["runtime"] = self._oci_runtime
+        return kwargs
 
     def is_alive(self) -> bool:
-        """Check if container is running.
+        """Whether the container is running.
 
-        Returns:
-            True if container is running, False otherwise.
+        The answer is cached for `ALIVE_CACHE_SECONDS`, since `reload()` is a
+        daemon round trip and session managers call this on every request.
         """
         if self._container is None:
             return False
+
+        now = time.monotonic()
+        checked_at = self._alive_checked_at
+        if checked_at is not None and now - checked_at < ALIVE_CACHE_SECONDS:
+            return self._alive
+
         try:
             self._container.reload()
-            return self._container.status == "running"
+            status: str = self._container.status
         except Exception:
-            return False
+            self._alive = False
+        else:
+            self._alive = status == "running"
 
-    def stop(self) -> None:
-        """Stop and remove the container."""
-        import contextlib
+        self._alive_checked_at = now
+        return self._alive
 
+    def resource_usage(self) -> SandboxUsage | None:
+        """Sample the container's current resource usage.
+
+        One non-streaming `stats()` call, which costs a daemon round trip and
+        should be polled sparingly rather than per request.
+        """
+        if self._container is None:
+            return None
+        try:
+            return parse_usage(self._container.stats(stream=False))
+        except Exception:
+            return None
+
+    def stop(self, remove: bool = False) -> None:
+        """Stop the container.
+
+        A container created without `container_name` runs with
+        `auto_remove=True` and is discarded by the daemon on exit. A *named*
+        container deliberately survives, since reuse across restarts is the
+        whole point of naming it.
+
+        Args:
+            remove: Also remove the container, discarding its filesystem state.
+        """
         container = getattr(self, "_container", None)
-        if container is not None:
+        if container is None:
+            return
+
+        with contextlib.suppress(Exception):
+            container.stop()
+        if remove:
             with contextlib.suppress(Exception):
-                container.stop()
-            self._container = None
+                container.remove(force=True)
+        self._container = None
+        self._alive_checked_at = None
 
     def __del__(self) -> None:
         """Best-effort cleanup on garbage collection.
 
-        Relying on `__del__` for container cleanup is unreliable (it may run
-        during interpreter shutdown when modules are torn down, or never run at
-        all). Prefer the explicit :meth:`stop` lifecycle. Any error raised
-        during teardown is suppressed so it cannot surface as a spurious
-        exception during shutdown.
+        `__del__` is unreliable for this — it may run during interpreter
+        shutdown when modules are already torn down, or never run at all. Prefer
+        the explicit :meth:`stop` lifecycle.
         """
-        import contextlib
-
         with contextlib.suppress(Exception):
             if getattr(self, "_container", None) is not None:
                 self.stop()
+
+    # ── Commands ───────────────────────────────────────────────────────
+
+    def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
+        """Run a command in the container.
+
+        Output beyond `MAX_EXECUTE_OUTPUT_BYTES` is discarded before decoding,
+        so the cap is measured in bytes rather than characters.
+        """
+        self._ensure_container()
+        self._last_activity = time.time()
+        assert self._container is not None
+
+        # The Docker SDK's exec_run takes no timeout, so the command is wrapped
+        # in the `timeout` utility instead.
+        argv = ["sh", "-c", command]
+        if timeout is not None:
+            argv = ["timeout", str(timeout), *argv]
+
+        try:
+            exit_code, output = self._container.exec_run(argv, workdir=self._work_dir)
+            if not isinstance(output, bytes):
+                output = b"".join(output)
+        except Exception as e:
+            return ExecuteResponse(output=f"Error: {e}", exit_code=1, truncated=False)
+
+        # Sliced before decoding: decoding the whole payload only to throw most
+        # of it away doubled peak memory on commands like `cat big.log`.
+        return ExecuteResponse(
+            output=output[:MAX_EXECUTE_OUTPUT_BYTES].decode("utf-8", errors="replace"),
+            exit_code=exit_code,
+            truncated=len(output) > MAX_EXECUTE_OUTPUT_BYTES,
+        )
+
+    # ── Files ──────────────────────────────────────────────────────────
+
+    def read_bytes(self, path: str) -> bytes:
+        """Read a whole file as bytes.
+
+        Returns:
+            The content, or `b""` when the file is missing, unreadable, or over
+            `max_read_bytes`. Use `read` when the reason matters — it reports
+            the limit explicitly.
+        """
+        try:
+            return self._fetch_file_bytes(self._resolve_path(path))
+        except ReadLimitExceeded:
+            return b""
+
+    def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
+        """Read a slice of a text file, decoding or extracting it as needed."""
+        resolved = self._resolve_path(path)
+        try:
+            data = self._fetch_file_bytes(resolved)
+            if not data:
+                return f"Error: File '{path}' not found"
+
+            extension = Path(resolved).suffix.lower().lstrip(".")
+            try:
+                lines = bytes_to_text(extension, data).splitlines()
+            except ValueError as e:
+                return f"[Error: {e}]"
+
+            if offset >= len(lines):
+                return "[End of file]"
+
+            end = offset + limit
+            chunk = "\n".join(lines[offset:end])
+            if end >= len(lines):
+                return chunk
+            remaining = len(lines) - end
+            return f"{chunk}\n\n[... {remaining} more lines. Use offset={end} to read more.]"
+
+        except ReadLimitExceeded as e:
+            return f"[Error: {e}]"
+        except Exception as e:
+            return f"[Error reading file: {e}]"
+
+    def edit(
+        self, path: str, old_string: str, new_string: str, replace_all: bool = False
+    ) -> EditResult:
+        """Edit a file by replacing a string.
+
+        The file is fetched, edited in Python and written back, so multiline
+        strings need no shell escaping.
+        """
+        resolved = self._resolve_path(path)
+        try:
+            data = self._fetch_file_bytes(resolved)
+            if not data:
+                return EditResult(error=f"File '{path}' not found")
+
+            extension = Path(resolved).suffix.lower().lstrip(".")
+            try:
+                content = bytes_to_text(extension, data)
+            except ValueError as e:
+                return EditResult(error=str(e))
+
+            outcome = replace_in_content(content, old_string, new_string, replace_all)
+            if not isinstance(outcome, Replacement):
+                return EditResult(error=outcome)
+
+            written = self.write(resolved, outcome.content)
+            if written.error:
+                return EditResult(error=written.error)
+            return EditResult(path=resolved, occurrences=outcome.occurrences)
+
+        except ReadLimitExceeded as e:
+            return EditResult(error=str(e))
+        except Exception as e:
+            return EditResult(error=f"Failed to edit file: {e}")
+
+    def write(self, path: str, content: str | bytes) -> WriteResult:
+        """Write a file, creating parent directories as needed."""
+        path = self._resolve_path(path)
+        self._ensure_container()
+        assert self._container is not None
+
+        try:
+            parent = str(PurePosixPath(path).parent)
+            mkdir = self.execute(f"mkdir -p {shlex.quote(parent)}")
+            if mkdir.exit_code != 0:
+                return WriteResult(error=f"Failed to create directory: {mkdir.output}")
+
+            raw = content if isinstance(content, bytes) else content.encode()
+            archive = _single_file_archive(PurePosixPath(path).name, raw)
+
+            # put_archive returns False when the target is not a directory or
+            # the upload otherwise fails.
+            if not self._container.put_archive(parent, archive):
+                return WriteResult(error=f"Failed to write file: put_archive to {parent}")
+            return WriteResult(path=path)
+        except Exception as e:
+            return WriteResult(error=f"Failed to write file: {e}")
+
+    def _fetch_file_bytes(self, path: str) -> bytes:
+        """Fetch a file's raw bytes out of the container.
+
+        Args:
+            path: Absolute path inside the container.
+
+        Returns:
+            The content, or `b""` when the path is missing or holds no regular
+            file.
+
+        Raises:
+            ReadLimitExceeded: If the file is over `max_read_bytes`.
+        """
+        self._ensure_container()
+        assert self._container is not None
+
+        try:
+            raw_stream, stat = self._container.get_archive(path)
+        except Exception:
+            return b""
+
+        # docker-py streams the archive from a generator, so it can be closed to
+        # release the socket as soon as the file turns out to be too large. The
+        # stub only promises an Iterator, which has no `close`.
+        stream = cast("Generator[bytes, None, None]", raw_stream)
+
+        # get_archive reports the size in a response header, so an oversized
+        # file is refused before any of its content crosses the socket.
+        reported_size = stat.get("size") if stat else None
+        if reported_size is not None and reported_size > self._max_read_bytes:
+            stream.close()
+            raise ReadLimitExceeded(
+                f"File is {reported_size} bytes, over the "
+                f"{self._max_read_bytes}-byte read limit. {READ_LIMIT_HINT}"
+            )
+
+        # Accumulated straight into the buffer tarfile reads from; a
+        # `b"".join(stream)` -> `BytesIO(...)` chain held several copies at once.
+        buffer = io.BytesIO()
+        try:
+            for chunk in stream:
+                buffer.write(chunk)
+                # Re-checked while streaming to stay bounded even when the
+                # daemon omits the size header.
+                if buffer.tell() > self._max_read_bytes:
+                    stream.close()
+                    raise ReadLimitExceeded(
+                        f"File exceeds the {self._max_read_bytes}-byte read limit. "
+                        f"{READ_LIMIT_HINT}"
+                    )
+        except ReadLimitExceeded:
+            raise
+        except Exception:
+            return b""
+
+        return _extract_single_file(buffer)
+
+
+def _with_exec(options: str) -> str:
+    """Add `exec` to a tmpfs option string unless it is already spelled out."""
+    if "exec" in {option.strip() for option in options.split(",")}:
+        return options
+    return f"{options},{TMPFS_OPTIONS}" if options else TMPFS_OPTIONS
+
+
+def _single_file_archive(name: str, content: bytes) -> io.BytesIO:
+    """Wrap one file's content in the tar stream `put_archive` expects."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        entry = tarfile.TarInfo(name=name)
+        entry.size = len(content)
+        entry.mtime = int(time.time())
+        entry.mode = 0o644
+        tar.addfile(entry, io.BytesIO(content))
+    buffer.seek(0)
+    return buffer
+
+
+def _extract_single_file(buffer: io.BytesIO) -> bytes:
+    """Read the first regular file out of a tar stream, or `b""`."""
+    try:
+        buffer.seek(0)
+        with buffer, tarfile.open(fileobj=buffer, mode="r") as tar:
+            member = next((m for m in tar.getmembers() if m.isfile()), None)
+            if member is None:
+                return b""
+            extracted = tar.extractfile(member)
+            return extracted.read() if extracted is not None else b""
+    except Exception:
+        return b""

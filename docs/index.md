@@ -64,9 +64,12 @@ from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_backends.permissions import READONLY_RULESET
 
 # Read-only agent — write/edit/execute tools hidden from model
-agent = Agent("openai:gpt-4.1", capabilities=[
-    ConsoleCapability(permissions=READONLY_RULESET),
-])
+agent = Agent(
+    "openai:gpt-4.1",
+    capabilities=[
+        ConsoleCapability(permissions=READONLY_RULESET),
+    ],
+)
 ```
 
 ### Alternative: Toolset API
@@ -76,9 +79,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 agent = Agent("openai:gpt-4.1", deps_type=Deps, toolsets=[create_console_toolset()])
 ```
@@ -140,6 +145,7 @@ Same toolset, different backends — swap based on your use case:
 | `StateBackend` | Ephemeral | No | Testing, mocking |
 | `DockerSandbox` | Ephemeral* | Yes | Safe execution, multi-user |
 | `DaytonaSandbox` | Ephemeral | Yes | Cloud deployments, CI/CD, multi-user |
+| `RemoteSandbox` | Ephemeral† | Yes | Containerised apps that must not hold the Docker socket |
 | `CompositeBackend` | Mixed | Depends | Route by path prefix |
 
 *[`DockerSandbox`][pydantic_ai_backends.backends.docker.sandbox.DockerSandbox]
@@ -147,6 +153,10 @@ supports persistent storage by mounting host directories with its `volumes`
 parameter (and `container_name` to reuse a named container across restarts).
 The [`SessionManager`][pydantic_ai_backends.backends.docker.session.SessionManager] `workspace_root`
 parameter builds these volume mounts automatically, one per session.
+
+†[`RemoteSandbox`](concepts/remote.md) is a Docker sandbox in another process, so
+persistence is the service's to configure — `SandboxdConfig(workspace_root=...)`
+gives each session a host-backed workspace that survives its container.
 
 ## Related Projects
 

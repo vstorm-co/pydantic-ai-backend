@@ -115,26 +115,14 @@ def apply_hashline_edit(
     end_hash: str | None = None,
     insert_after: bool = False,
 ) -> tuple[str, str | None]:
-    """Apply a hashline edit to file content.
+    """Apply a hashline edit, discarding the summary.
 
-    Validates that the referenced line hashes match current content before
-    applying any changes.  If hashes don't match, the edit is rejected —
-    the file was modified since the model last read it.
-
-    Args:
-        content: Current raw file content.
-        start_line: 1-indexed line number to start the edit.
-        start_hash: Expected 2-char hash of the start line.
-        new_content: Replacement text (empty string = delete).
-        end_line: 1-indexed end of range (inclusive).  `None` for single-line.
-        end_hash: Expected 2-char hash of the end line.
-        insert_after: If `True`, insert *after* `start_line` instead of
-            replacing it.
+    See :func:`apply_hashline_edit_with_summary` for the arguments.
 
     Returns:
-        `(new_file_content, error)`.  *error* is `None` on success.
+        `(new_file_content, error)`, where *error* is `None` on success.
     """
-    result, error, _ = _apply_hashline_edit_impl(
+    result, error, _ = apply_hashline_edit_with_summary(
         content,
         start_line,
         start_hash,
@@ -155,35 +143,23 @@ def apply_hashline_edit_with_summary(
     end_hash: str | None = None,
     insert_after: bool = False,
 ) -> tuple[str, str | None, str]:
-    """Like :func:`apply_hashline_edit` but also returns a human-readable summary.
+    """Apply a hashline edit to file content.
+
+    The referenced line hashes are checked against the current content before
+    anything changes. A mismatch rejects the edit — the file was modified since
+    the model read it, so the line numbers it chose no longer mean what it thinks.
+
+    Args:
+        content: Current raw file content.
+        start_line: 1-indexed line number to start the edit.
+        start_hash: Expected 2-char hash of the start line.
+        new_content: Replacement text; empty deletes the line(s).
+        end_line: 1-indexed end of an inclusive range. `None` for single-line.
+        end_hash: Expected 2-char hash of the end line.
+        insert_after: Insert *after* `start_line` instead of replacing it.
 
     Returns:
-        `(new_file_content, error, summary)`.
-    """
-    return _apply_hashline_edit_impl(
-        content,
-        start_line,
-        start_hash,
-        new_content,
-        end_line,
-        end_hash,
-        insert_after,
-    )
-
-
-def _apply_hashline_edit_impl(
-    content: str,
-    start_line: int,
-    start_hash: str,
-    new_content: str,
-    end_line: int | None,
-    end_hash: str | None,
-    insert_after: bool,
-) -> tuple[str, str | None, str]:
-    """Core implementation for hashline edits.
-
-    Returns:
-        `(new_file_content, error, summary)`.
+        `(new_file_content, error, summary)`, where *error* is `None` on success.
     """
     lines, has_trailing_newline = _split_lines(content)
     total_lines = len(lines)

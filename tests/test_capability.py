@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ToolCallPart
@@ -9,6 +11,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RunUsage
 
+from pydantic_ai_backends import LocalBackend
 from pydantic_ai_backends.capability import ConsoleCapability
 from pydantic_ai_backends.permissions.presets import PERMISSIVE_RULESET, READONLY_RULESET
 
@@ -238,44 +241,44 @@ class TestIsDeniedByRuleset:
     """Direct tests for _is_denied_by_ruleset helper."""
 
     def test_none_ruleset_not_denied(self):
-        from pydantic_ai_backends.toolsets.console import _is_denied_by_ruleset
+        from pydantic_ai_backends.toolsets._ruleset import is_denied
 
-        assert _is_denied_by_ruleset(None, "write") is False
+        assert is_denied(None, "write") is False
 
     def test_deny_default(self):
         from pydantic_ai_backends.permissions.types import PermissionRuleset
-        from pydantic_ai_backends.toolsets.console import _is_denied_by_ruleset
+        from pydantic_ai_backends.toolsets._ruleset import is_denied
 
         ruleset = PermissionRuleset(default="deny")
-        assert _is_denied_by_ruleset(ruleset, "write") is True
+        assert is_denied(ruleset, "write") is True
 
     def test_allow_default(self):
         from pydantic_ai_backends.permissions.types import PermissionRuleset
-        from pydantic_ai_backends.toolsets.console import _is_denied_by_ruleset
+        from pydantic_ai_backends.toolsets._ruleset import is_denied
 
         ruleset = PermissionRuleset(default="allow")
-        assert _is_denied_by_ruleset(ruleset, "write") is False
+        assert is_denied(ruleset, "write") is False
 
     def test_ask_default(self):
         from pydantic_ai_backends.permissions.types import PermissionRuleset
-        from pydantic_ai_backends.toolsets.console import _is_denied_by_ruleset
+        from pydantic_ai_backends.toolsets._ruleset import is_denied
 
         ruleset = PermissionRuleset(default="ask")
-        assert _is_denied_by_ruleset(ruleset, "write") is False
+        assert is_denied(ruleset, "write") is False
 
     def test_operation_override(self):
         from pydantic_ai_backends.permissions.types import (
             OperationPermissions,
             PermissionRuleset,
         )
-        from pydantic_ai_backends.toolsets.console import _is_denied_by_ruleset
+        from pydantic_ai_backends.toolsets._ruleset import is_denied
 
         ruleset = PermissionRuleset(
             default="allow",
             write=OperationPermissions(default="deny"),
         )
-        assert _is_denied_by_ruleset(ruleset, "write") is True
-        assert _is_denied_by_ruleset(ruleset, "read") is False
+        assert is_denied(ruleset, "write") is True
+        assert is_denied(ruleset, "read") is False
 
 
 class TestHashlineEditDenial:
@@ -289,3 +292,37 @@ class TestHashlineEditDenial:
         tool_names = set(toolset.tools.keys())
         assert "hashline_edit" not in tool_names
         assert "read_file" in tool_names
+
+
+class TestCapabilityOwnedBackend:
+    """A capability can carry its own backend, for hosts owning their deps type."""
+
+    def _ctx(self, deps: object) -> RunContext[object]:
+        return RunContext(deps=deps, model=TestModel(), usage=RunUsage())
+
+    async def test_tools_use_the_capability_backend_not_the_deps(self, tmp_path: Path):
+        backend = LocalBackend(root_dir=str(tmp_path))
+        backend.write("owned.txt", "held by the capability")
+        capability = ConsoleCapability(backend=backend)
+        toolset = capability.get_toolset()
+        assert toolset is not None
+
+        # Deps with no `backend` attribute at all: the host owns this type.
+        result = await toolset.tools["read_file"].function(self._ctx(object()), "owned.txt")
+
+        assert "held by the capability" in result
+
+    def test_hashline_format_reaches_the_toolset(self):
+        """The instructions promised hashline_edit; the tools must offer it."""
+        toolset = ConsoleCapability(edit_format="hashline").get_toolset()
+        assert toolset is not None
+
+        assert "hashline_edit" in toolset.tools
+        assert "edit_file" not in toolset.tools
+
+    def test_str_replace_remains_the_default(self):
+        toolset = ConsoleCapability().get_toolset()
+        assert toolset is not None
+
+        assert "edit_file" in toolset.tools
+        assert "hashline_edit" not in toolset.tools

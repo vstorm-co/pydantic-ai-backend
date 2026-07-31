@@ -9,9 +9,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 # Create backend for local filesystem
 backend = LocalBackend(root_dir="./workspace")
@@ -37,13 +39,13 @@ Interactive coding assistant that works with your local project:
 import asyncio
 from dataclasses import dataclass
 from pydantic_ai import Agent
-from pydantic_ai_backends import (
-    LocalBackend, create_console_toolset, get_console_system_prompt
-)
+from pydantic_ai_backends import LocalBackend, create_console_toolset, get_console_system_prompt
+
 
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 # Create backend with security restrictions
 backend = LocalBackend(
@@ -63,6 +65,7 @@ agent = Agent(
 )
 agent = agent.with_toolset(toolset)
 
+
 async def main():
     deps = Deps(backend=backend)
     print("CLI Agent ready! Type 'quit' to exit.\n")
@@ -74,6 +77,7 @@ async def main():
 
         result = await agent.run(user_input, deps=deps)
         print(f"\nAgent: {result.output}\n")
+
 
 asyncio.run(main())
 ```
@@ -87,9 +91,11 @@ from dataclasses import dataclass
 from pydantic_ai import Agent
 from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+
 @dataclass
 class Deps:
     backend: LocalBackend
+
 
 # Only allow access to specific directories
 backend = LocalBackend(

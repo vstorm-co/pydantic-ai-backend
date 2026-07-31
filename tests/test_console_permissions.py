@@ -4,10 +4,8 @@ from pydantic_ai_backends.permissions import (
     OperationPermissions,
     PermissionRuleset,
 )
-from pydantic_ai_backends.toolsets.console import (
-    _requires_approval_from_ruleset,
-    create_console_toolset,
-)
+from pydantic_ai_backends.toolsets._ruleset import requires_approval
+from pydantic_ai_backends.toolsets.console import create_console_toolset
 
 
 class TestRequiresApprovalFromRuleset:
@@ -15,30 +13,30 @@ class TestRequiresApprovalFromRuleset:
 
     def test_no_ruleset_uses_legacy_flag(self):
         """Test that legacy flag is used when no ruleset."""
-        assert _requires_approval_from_ruleset(None, "write", True) is True
-        assert _requires_approval_from_ruleset(None, "write", False) is False
+        assert requires_approval(None, "write", True) is True
+        assert requires_approval(None, "write", False) is False
 
     def test_ruleset_with_ask_default(self):
         """Test ruleset with ask as default action."""
         ruleset = PermissionRuleset(
             write=OperationPermissions(default="ask"),
         )
-        assert _requires_approval_from_ruleset(ruleset, "write", False) is True
+        assert requires_approval(ruleset, "write", False) is True
 
     def test_ruleset_with_allow_default(self):
         """Test ruleset with allow as default action."""
         ruleset = PermissionRuleset(
             write=OperationPermissions(default="allow"),
         )
-        assert _requires_approval_from_ruleset(ruleset, "write", True) is False
+        assert requires_approval(ruleset, "write", True) is False
 
     def test_ruleset_uses_global_default(self):
         """Test that global default is used for unconfigured operations."""
         ruleset = PermissionRuleset(default="ask")
-        assert _requires_approval_from_ruleset(ruleset, "write", False) is True
+        assert requires_approval(ruleset, "write", False) is True
 
         ruleset = PermissionRuleset(default="allow")
-        assert _requires_approval_from_ruleset(ruleset, "write", True) is False
+        assert requires_approval(ruleset, "write", True) is False
 
 
 class TestCreateConsoleToolsetWithPermissions:
