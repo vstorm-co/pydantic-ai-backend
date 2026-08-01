@@ -13,6 +13,7 @@ The names are public inside this private module so call sites read as prose:
 from __future__ import annotations
 
 import base64
+import binascii
 import shlex
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
@@ -70,19 +71,36 @@ def parse_ls(result: ExecuteResponse, path: str) -> list[FileInfo]:
 
 
 def read_bytes_command(path: str) -> str:
-    """Read a whole file."""
-    return f"cat {shlex.quote(path)}"
+    """Read a whole file, base64-encoded so arbitrary bytes survive the trip.
+
+    A plain `cat` could not carry them. Command output crosses back as text — a
+    sandbox decodes its exec stream with `errors="replace"` — so every byte that
+    is not UTF-8 arrived as U+FFFD. A PNG written by `write_command` and read
+    back came out a different file, silently and with no error, which is exactly
+    what the toolset's `image_support` does on a shell-derived sandbox.
+
+    Requires `base64` in the image, as `write_command` already does.
+    """
+    return f"base64 {shlex.quote(path)}"
 
 
 def parse_read_bytes(result: ExecuteResponse) -> bytes:
-    """Content of a `cat`, or `b""` on any failure.
+    """Content of a base64 read, or `b""` on any failure.
 
     An error message encoded into the payload would leave the caller unable to
     tell it from real file content, so failure is empty rather than described.
+    A *truncated* payload is a failure too: base64 cut short decodes to bytes
+    that are not the file's, and a wrong answer is worse here than no answer,
+    since the caller cannot tell one from the other. `read` returns a partial
+    slice for the oversized case; this returns nothing.
     """
-    if result.exit_code != 0:
+    if result.exit_code != 0 or result.truncated:
         return b""
-    return result.output.encode("utf-8", errors="replace")
+    try:
+        # `validate=False` (the default) discards the newlines `base64` wraps at.
+        return base64.b64decode(result.output)
+    except (binascii.Error, ValueError):
+        return b""
 
 
 def read_command(path: str, offset: int, limit: int) -> str:

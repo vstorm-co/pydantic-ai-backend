@@ -153,13 +153,22 @@ class TestParity:
         assert sync.commands == asyncish.commands
 
     async def test_read_bytes(self):
-        sync, asyncish = self._pair({"cat ": ExecuteResponse(output="payload", exit_code=0)})
+        encoded = base64.b64encode(b"payload").decode()
+        sync, asyncish = self._pair({"base64 ": ExecuteResponse(output=encoded, exit_code=0)})
 
         assert sync.read_bytes("/f") == b"payload"
         assert await asyncish.read_bytes("/f") == b"payload"
 
+    async def test_read_bytes_round_trips_arbitrary_bytes(self):
+        raw = bytes(range(256))
+        encoded = base64.b64encode(raw).decode()
+        sync, asyncish = self._pair({"base64 ": ExecuteResponse(output=encoded, exit_code=0)})
+
+        assert sync.read_bytes("/f") == raw
+        assert await asyncish.read_bytes("/f") == raw
+
     async def test_read_bytes_degrades_to_empty(self):
-        sync, asyncish = self._pair({"cat ": ExecuteResponse(output="nope", exit_code=1)})
+        sync, asyncish = self._pair({"base64 ": ExecuteResponse(output="nope", exit_code=1)})
 
         assert sync.read_bytes("/f") == b""
         assert await asyncish.read_bytes("/f") == b""

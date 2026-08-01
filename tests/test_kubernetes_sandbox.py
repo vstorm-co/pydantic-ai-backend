@@ -760,8 +760,10 @@ class TestApiModeFallsBackToTheShell:
     def teardown_method(self) -> None:
         fake_k8s_stream_mod.stream = _stream_fn
 
-    def test_read_bytes_goes_through_cat(self):
-        assert self._sandbox("payload").read_bytes("/f.txt") == b"payload"
+    def test_read_bytes_goes_through_base64(self):
+        encoded = base64.b64encode(b"payload").decode()
+
+        assert self._sandbox(encoded).read_bytes("/f.txt") == b"payload"
 
     def test_read_goes_through_awk(self):
         assert self._sandbox("     1\thello").read("/f.txt") == "     1\thello"

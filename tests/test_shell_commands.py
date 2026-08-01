@@ -121,15 +121,36 @@ drwxr-xr-x 2 root root 4096 Jan  1 00:00 src
 
 
 class TestReadBytes:
+    def test_it_reads_base64_not_raw_text(self):
+        """Command output crosses back as text, so raw bytes could not survive."""
+        assert _shell.read_bytes_command("/f") == "base64 /f"
+
     def test_content_is_returned(self):
-        assert _shell.parse_read_bytes(_ok("hello")) == b"hello"
+        assert _shell.parse_read_bytes(_ok("aGVsbG8=")) == b"hello"
+
+    def test_arbitrary_bytes_survive(self):
+        """A PNG through `cat` came back as U+FFFD for every non-UTF-8 byte."""
+        raw = bytes(range(256))
+
+        assert _shell.parse_read_bytes(_ok(base64.b64encode(raw).decode())) == raw
+
+    def test_the_wrapping_newlines_base64_adds_are_ignored(self):
+        payload = base64.encodebytes(b"x" * 200).decode()
+
+        assert _shell.parse_read_bytes(_ok(payload)) == b"x" * 200
 
     def test_failure_is_empty_never_a_message(self):
         """A caller cannot tell an error string from real file content."""
         assert _shell.parse_read_bytes(_failed("No such file")) == b""
 
-    def test_undecodable_bytes_are_replaced_not_raised(self):
-        assert _shell.parse_read_bytes(_ok("caf\udce9")) == b"caf?"
+    def test_a_truncated_payload_is_empty_not_wrong_bytes(self):
+        """Base64 cut short decodes to bytes that are not the file's."""
+        payload = base64.b64encode(b"x" * 300).decode()[:100]
+
+        assert _shell.parse_read_bytes(_ok(payload, truncated=True)) == b""
+
+    def test_output_that_is_not_base64_is_empty(self):
+        assert _shell.parse_read_bytes(_ok("not base64 at all !!!")) == b""
 
 
 class TestRead:

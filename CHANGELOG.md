@@ -77,13 +77,26 @@ before upgrading is deferred.
   and exposed as `RemoteSandbox.server_timeout`, falling back to the local
   timeout when the service will not say.
 
-- **`BaseSandbox.write` accepts `bytes`.** The protocol types `content` as
-  `str | bytes`; both base classes narrowed it to `str` and the heredoc
-  interpolated bytes as their Python repr, writing the 17 characters
-  `b'\x89PNG\r\n'` into the file with no error. Content now travels
-  base64-encoded, which also fixes the trailing newline a heredoc could not avoid
-  adding — `write(path, "x\n")` produced `"x\n\n"`. **Requires `base64` in the
-  sandbox image** (GNU coreutils and BusyBox both provide it).
+- **Shell-derived `write` and `read_bytes` carry binary intact.** The protocol
+  types `content` as `str | bytes`; both base classes narrowed it to `str`, and
+  the heredoc interpolated bytes as their Python repr — writing the 17 characters
+  `b'\x89PNG\r\n'` into the file with no error. `read_bytes` was lossy in the
+  other direction: `cat` returns its output through an exec stream a sandbox
+  decodes with `errors="replace"`, so every byte that is not UTF-8 came back as
+  U+FFFD. Both now travel base64-encoded, so a file written through one and read
+  through the other is byte-identical — which is what the console toolset's
+  `image_support` needs on a shell-derived sandbox. The write side also stops
+  appending the trailing newline a heredoc could not avoid: `write(path, "x\n")`
+  produced `"x\n\n"`.
+
+  Two consequences. **The sandbox image needs `base64`** (GNU coreutils and
+  BusyBox both provide it, alongside the `cat` this replaces). And a `read_bytes`
+  whose output is truncated by the execute ceiling now returns `b""` rather than
+  a prefix: base64 cut short decodes to bytes that are not the file's, and the
+  caller cannot tell a wrong answer from a right one.
+
+  Verified byte-for-byte over all 256 byte values against real `python:3.12-slim`,
+  `node:20-slim` and `alpine:3.20` containers, which CI does not cover.
 
 - **`LocalBackend.edit` returns its failure instead of raising.** It read the
   file as strict UTF-8 and caught only `PermissionError` and `OSError`;
