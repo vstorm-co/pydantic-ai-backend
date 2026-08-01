@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SandboxdConfig.sandbox_uid`, which runs sandboxes as an unprivileged user.** A container runs as root unless told otherwise, and that is two problems: an escape starts from uid 0, and every file an agent writes into its bind-mounted workspace is owned by root *on the host*, so a `sandboxd` running unprivileged cannot clean up after its own sessions. Set the uid and built runtimes are built around it — a real account (a bare numeric id breaks everything calling `getpwuid`, `whoami` first), a home directory it owns (with `HOME` left at `/`, the first `pip install` fails on `Permission denied: '/.local'`), and a virtualenv it owns first on `PATH`. That last one is what makes it workable rather than merely safer: a non-root user cannot write to the interpreter's own `site-packages`, and `uv` — unlike pip — has no `--user` mode to fall back on, so without a virtualenv it fails with no way forward. Measured in that shape: `whoami`, `git commit`, `pip install`, `uv pip install` and running the installed tool all succeed, while `/etc` and the system `site-packages` are refused.
+
+  Off by default, because it changes filesystem ownership. It asks two things of the deployment: the service must be able to give each workspace to that uid — with the privilege to `chown`, or by running *as* it — and a service that can do neither is told so when the session opens rather than starting a sandbox whose first file write would fail. Ready-made runtimes stay as root, since an image nobody built for this has no such user and no virtualenv, so an agent inside one could install nothing.
+- **`RuntimeConfig.run_as_uid`**, the library-level form of the same thing for anyone building a `DockerSandbox` directly.
+
 ## [0.2.19] - 2026-08-01
 
 ### Changed

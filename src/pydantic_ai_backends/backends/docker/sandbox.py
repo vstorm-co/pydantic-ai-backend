@@ -337,6 +337,23 @@ class DockerSandbox(BaseSandbox):
         # Dead or being removed: a fresh container is the only way forward.
         return None
 
+    def _environment(self) -> dict[str, str]:
+        """What the container starts with: the sandbox defaults, then the runtime's.
+
+        `UV_SYSTEM_PYTHON` is dropped for a runtime that runs unprivileged. A
+        container's environment overrides its image's, so leaving it set would
+        clobber the `0` the image asks for and send uv at the interpreter the
+        sandbox user cannot write to — which fails with `Permission denied` and
+        no way forward, the virtualenv built for exactly this being ignored.
+        """
+        env = dict(SANDBOX_ENV)
+        if self._runtime is None:
+            return env
+        if self._runtime.run_as_uid is not None:
+            del env["UV_SYSTEM_PYTHON"]
+        env.update(self._runtime.env_vars)
+        return env
+
     def _run_kwargs(self) -> dict[str, Any]:
         """Arguments for `containers.run`, including limits and hardening."""
         kwargs: dict[str, Any] = {
@@ -351,7 +368,7 @@ class DockerSandbox(BaseSandbox):
             "init": True,
             "working_dir": self._work_dir,
             "auto_remove": self._auto_remove,
-            "environment": {**SANDBOX_ENV, **(self._runtime.env_vars if self._runtime else {})},
+            "environment": self._environment(),
             "volumes": {
                 host: {"bind": container, "mode": "rw"} for host, container in self._volumes.items()
             }
@@ -363,6 +380,10 @@ class DockerSandbox(BaseSandbox):
         }
         if self._container_name is not None:
             kwargs["name"] = self._container_name
+        if self._runtime is not None and self._runtime.run_as_uid is not None:
+            # Both halves of the pair, because a process writing into a
+            # bind-mounted workspace is checked on its gid as well.
+            kwargs["user"] = f"{self._runtime.run_as_uid}:{self._runtime.run_as_uid}"
         if self._network_mode is not None:
             kwargs["network_mode"] = self._network_mode
         if self._pids_limit is not None:

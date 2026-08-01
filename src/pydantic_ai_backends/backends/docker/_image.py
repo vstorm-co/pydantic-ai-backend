@@ -51,6 +51,21 @@ cargo names — and rejects whitespace and shell metacharacters."""
 ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 """The POSIX portable character set for environment variable names."""
 
+VENV_PATH = "/opt/venv"
+"""Where an unprivileged runtime's virtualenv lives.
+
+Outside both the workspace — which is a bind mount, and would carry the
+environment into the user's own files — and the interpreter's own tree, which
+the sandbox user must not be able to write to.
+"""
+
+SANDBOX_USER = "agent"
+"""Login name given to the uid a `run_as_uid` runtime runs as.
+
+A numeric uid with no `/etc/passwd` entry works for the kernel and confuses
+everything that calls `getpwuid`, `whoami` included.
+"""
+
 SHELL_METACHARACTERS = frozenset(";&|`$()<>\n\r")
 """Characters that would let an interpolated value start its own command."""
 
@@ -256,6 +271,9 @@ def build_dockerfile(runtime: RuntimeConfig, *, cache_mounts: bool = False) -> s
     if runtime.packages:
         lines.extend(install_instructions(runtime, cache_mounts=cache_mounts))
 
+    if runtime.run_as_uid is not None:
+        lines.extend(unprivileged_instructions(runtime.run_as_uid))
+
     for key, value in runtime.env_vars.items():
         lines.append(env_instruction(key, value))
 
@@ -263,6 +281,43 @@ def build_dockerfile(runtime: RuntimeConfig, *, cache_mounts: bool = False) -> s
     lines.append(f"WORKDIR {shlex.quote(runtime.work_dir)}")
 
     return "\n".join(lines)
+
+
+def unprivileged_instructions(uid: int) -> list[str]:
+    """Instructions preparing an image to be run by an unprivileged user.
+
+    Three things, and each is load-bearing:
+
+    - **A real account** for `uid`, because a bare numeric id works for the
+      kernel and breaks everything that calls `getpwuid` — `whoami` first.
+    - **A home directory it owns**, since with `HOME` left at `/` an agent's
+      first `pip install` fails on `Permission denied: '/.local'`.
+    - **A virtualenv it owns**, first on `PATH`. Without one a non-root user
+      cannot install anything: pip falls back to a user-site directory whose
+      console scripts are not on `PATH`, and `uv` — which has no `--user` mode —
+      fails outright. Created with `--system-site-packages`, so a runtime's own
+      `packages`, installed system-wide above, stay importable.
+
+    `UV_SYSTEM_PYTHON` is switched off here rather than left to the sandbox's
+    default: on it, uv aims at the interpreter the user cannot write to and
+    ignores the virtualenv entirely.
+
+    Raises:
+        ValueError: If the uid is not one a user may hold. Root defeats the
+            purpose, and the value lands in a shell command.
+    """
+    if uid <= 0:
+        raise ValueError(f"run_as_uid must be a positive uid, not {uid}")
+
+    return [
+        f"RUN useradd --uid {uid} --create-home --shell /bin/bash {SANDBOX_USER} "
+        f"&& python -m venv --system-site-packages {VENV_PATH} "
+        f"&& chown -R {uid}:{uid} {VENV_PATH}",
+        f"ENV VIRTUAL_ENV={VENV_PATH} "
+        f"HOME=/home/{SANDBOX_USER} "
+        f"UV_SYSTEM_PYTHON=0 "
+        f"PATH={VENV_PATH}/bin:$PATH",
+    ]
 
 
 def install_instructions(runtime: RuntimeConfig, *, cache_mounts: bool = False) -> list[str]:

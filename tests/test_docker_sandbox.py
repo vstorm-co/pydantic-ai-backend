@@ -525,39 +525,40 @@ class TestSharedDockerClient:
         assert len(calls) == 1
 
 
+@pytest.fixture
+def fake_client(monkeypatch):
+    """Install fake `docker` modules and a client that records `containers.run`."""
+    import pydantic_ai_backends.backends.docker.sandbox as sandbox_mod
+
+    fake_errors = types.ModuleType("docker.errors")
+    fake_errors.NotFound = type("NotFound", (Exception,), {})
+    fake_errors.ImageNotFound = type("ImageNotFound", (Exception,), {})
+    fake_docker = types.ModuleType("docker")
+    fake_docker.errors = fake_errors
+    monkeypatch.setitem(sys.modules, "docker", fake_docker)
+    monkeypatch.setitem(sys.modules, "docker.errors", fake_errors)
+
+    class Containers:
+        def __init__(self):
+            self.image = None
+            self.kwargs = None
+
+        def run(self, image, **kwargs):
+            self.image = image
+            self.kwargs = kwargs
+            return _FakeContainer()
+
+    class Client:
+        def __init__(self):
+            self.containers = Containers()
+
+    client = Client()
+    monkeypatch.setattr(sandbox_mod, "docker_client", lambda: client)
+    return client
+
+
 class TestDockerSandboxResourceLimits:
     """Tests that limits and hardening reach `containers.run` (no daemon needed)."""
-
-    @pytest.fixture
-    def fake_client(self, monkeypatch):
-        """Install fake `docker` modules and a recording client."""
-        import pydantic_ai_backends.backends.docker.sandbox as sandbox_mod
-
-        fake_errors = types.ModuleType("docker.errors")
-        fake_errors.NotFound = type("NotFound", (Exception,), {})
-        fake_errors.ImageNotFound = type("ImageNotFound", (Exception,), {})
-        fake_docker = types.ModuleType("docker")
-        fake_docker.errors = fake_errors
-        monkeypatch.setitem(sys.modules, "docker", fake_docker)
-        monkeypatch.setitem(sys.modules, "docker.errors", fake_errors)
-
-        class Containers:
-            def __init__(self):
-                self.image = None
-                self.kwargs = None
-
-            def run(self, image, **kwargs):
-                self.image = image
-                self.kwargs = kwargs
-                return _FakeContainer()
-
-        class Client:
-            def __init__(self):
-                self.containers = Containers()
-
-        client = Client()
-        monkeypatch.setattr(sandbox_mod, "docker_client", lambda: client)
-        return client
 
     def test_defaults_bound_processes_and_block_escalation(self, fake_client):
         """A default sandbox still caps PIDs and denies setuid escalation."""
@@ -1463,3 +1464,45 @@ class TestOciRuntimePassthrough:
         assert kwargs["runtime"] == "kata"
         assert kwargs["mem_limit"] == "1g"
         assert kwargs["network_mode"] == "none"
+
+
+class TestUnprivilegedContainers:
+    """A runtime that names a uid is run as it, and told so consistently."""
+
+    def _runtime(self, **kwargs):
+        from pydantic_ai_backends.types import RuntimeConfig
+
+        return RuntimeConfig(name="nr", image="img", **kwargs)
+
+    def test_a_root_runtime_names_no_user(self, fake_client):
+        _sandbox(runtime=self._runtime())._ensure_container()
+
+        assert "user" not in fake_client.containers.kwargs
+
+    def test_the_container_runs_as_the_uid_and_its_group(self, fake_client):
+        """The gid matters too: a bind-mounted workspace is checked on both."""
+        _sandbox(runtime=self._runtime(run_as_uid=1000))._ensure_container()
+
+        assert fake_client.containers.kwargs["user"] == "1000:1000"
+
+    def test_uv_is_not_aimed_at_the_interpreter_the_user_cannot_write_to(self, fake_client):
+        """A container's environment overrides its image's, so this has to go.
+
+        Measured: left set, uv ignores the virtualenv the image built and fails
+        with `Permission denied` on the system `site-packages`.
+        """
+        _sandbox(runtime=self._runtime(run_as_uid=1000))._ensure_container()
+
+        assert "UV_SYSTEM_PYTHON" not in fake_client.containers.kwargs["environment"]
+
+    def test_a_root_runtime_keeps_it(self, fake_client):
+        _sandbox(runtime=self._runtime())._ensure_container()
+
+        assert fake_client.containers.kwargs["environment"]["UV_SYSTEM_PYTHON"] == "1"
+
+    def test_a_sandbox_without_a_runtime_still_gets_the_defaults(self, fake_client):
+        _sandbox()._ensure_container()
+        env = fake_client.containers.kwargs["environment"]
+
+        assert env["UV_SYSTEM_PYTHON"] == "1"
+        assert "user" not in fake_client.containers.kwargs

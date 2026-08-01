@@ -2090,7 +2090,10 @@ class TestPerRuntimeCeilings:
         assert config.limits_for(config.resolve_runtime("online")[1])["network_mode"] == "bridge"
 
     def test_the_builder_applies_the_runtime_ceilings(self):
-        from pydantic_ai_backends.remote.server import SandboxRuntime, _default_builder
+        from pydantic_ai_backends.remote.server import (
+            SandboxRuntime,
+            _default_builder,
+        )
 
         config = self._config(mem_limit="512m", cpus=1.0)
 
@@ -2105,7 +2108,10 @@ class TestPerRuntimeCeilings:
 
     def test_the_builder_forces_the_service_work_dir_on_a_built_runtime(self):
         """The volume mount, the archive and a client's paths must agree on one."""
-        from pydantic_ai_backends.remote.server import SandboxRuntime, _default_builder
+        from pydantic_ai_backends.remote.server import (
+            SandboxRuntime,
+            _default_builder,
+        )
 
         config = SandboxdConfig(
             token="t",
@@ -2220,7 +2226,10 @@ class TestTmpfsAndCpuShares:
 
     def test_every_sandbox_gets_an_in_memory_tmp_by_default(self):
         """Scratch writes otherwise land in the overlay and grow the disk."""
-        from pydantic_ai_backends.remote.server import SandboxRuntime, _default_builder
+        from pydantic_ai_backends.remote.server import (
+            SandboxRuntime,
+            _default_builder,
+        )
 
         config = SandboxdConfig(token="t")
         sandbox = _default_builder(config)("s1", SandboxRuntime(image="python:3.12-slim"))
@@ -2228,7 +2237,10 @@ class TestTmpfsAndCpuShares:
         assert sandbox._tmpfs == {"/tmp": "size=64m"}
 
     def test_tmpfs_can_be_turned_off(self):
-        from pydantic_ai_backends.remote.server import SandboxRuntime, _default_builder
+        from pydantic_ai_backends.remote.server import (
+            SandboxRuntime,
+            _default_builder,
+        )
 
         config = SandboxdConfig(token="t", tmpfs_size=None)
         sandbox = _default_builder(config)("s1", SandboxRuntime(image="python:3.12-slim"))
@@ -3701,3 +3713,87 @@ class TestAsyncSandboxThroughTheService:
 
         assert again.status_code == 200, again.text
         assert again.json()["session"]["alive"] is True
+
+
+class TestUnprivilegedSandboxes:
+    """`sandbox_uid` is what turns a root sandbox into an unprivileged one."""
+
+    def test_it_is_off_unless_an_operator_asks(self):
+        """It changes filesystem ownership, so it is not a silent default."""
+        assert SandboxdConfig(token="t").sandbox_uid is None
+
+    def test_a_built_runtime_is_handed_the_uid(self, tmp_path):
+        from pydantic_ai_backends.remote.server import (
+            SandboxRuntime,
+            _as_runtime,
+            _default_builder,
+        )
+
+        config = SandboxdConfig(
+            token="t",
+            runtimes={"built": SandboxRuntime(runtime="python-analytics")},
+            workspace_root=str(tmp_path),
+            sandbox_uid=os.getuid(),
+        )
+        sandbox = _default_builder(config)("s1", _as_runtime(config.runtimes["built"]))
+
+        assert sandbox._runtime.run_as_uid == os.getuid()
+
+    def test_a_ready_made_image_is_left_as_root(self, tmp_path):
+        """Nobody built it around the user, so it has no venv the agent owns —
+        an agent inside one could install nothing at all."""
+        from pydantic_ai_backends.remote.server import (
+            SandboxRuntime,
+            _as_runtime,
+            _default_builder,
+        )
+
+        config = SandboxdConfig(
+            token="t",
+            runtimes={"ready": SandboxRuntime(image="python:3.12-slim")},
+            workspace_root=str(tmp_path),
+            sandbox_uid=os.getuid(),
+        )
+        sandbox = _default_builder(config)("s1", _as_runtime(config.runtimes["ready"]))
+
+        assert sandbox._runtime is None
+
+    def test_the_workspace_is_given_to_the_user_that_will_write_it(self, tmp_path):
+        config = SandboxdConfig(token="t", workspace_root=str(tmp_path), sandbox_uid=os.getuid())
+
+        volumes = _session_volumes(config, "s1")
+
+        assert volumes is not None
+        assert Path(next(iter(volumes))).stat().st_uid == os.getuid()
+
+    def test_a_service_that_cannot_chown_is_told_so_at_once(self, tmp_path, monkeypatch):
+        """Rather than starting a sandbox whose first file write would fail."""
+        from pydantic_ai_backends.remote import server as server_mod
+
+        def refuse(*args: Any, **kwargs: Any) -> None:
+            raise PermissionError("not permitted")
+
+        monkeypatch.setattr(server_mod.os, "chown", refuse)
+        config = SandboxdConfig(token="t", workspace_root=str(tmp_path), sandbox_uid=4242)
+
+        with pytest.raises(RuntimeError, match="run sandboxd with the privilege to chown"):
+            _session_volumes(config, "s1")
+
+    def test_nothing_is_chowned_when_it_is_off(self, tmp_path, monkeypatch):
+        from pydantic_ai_backends.remote import server as server_mod
+
+        def refuse(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("chown must not be reached")
+
+        monkeypatch.setattr(server_mod.os, "chown", refuse)
+
+        assert _session_volumes(SandboxdConfig(token="t", workspace_root=str(tmp_path)), "s1")
+
+    def test_it_is_visible_in_the_policy(self, tmp_path):
+        harness = Harness(workspace_root=str(tmp_path), sandbox_uid=os.getuid())
+        with harness.client() as client:
+            policy = wire.ServicePolicy.model_validate(
+                client.get("/policy", headers=_service_headers()).json()
+            )
+
+        assert policy.sandbox_uid == os.getuid()
