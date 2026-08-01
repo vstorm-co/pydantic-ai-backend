@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`SandboxdConfig.default_runtime` defaults to the first entry in `runtimes`** rather than to the literal alias `"python"`. The old default meant every custom allowlist had to contain a key named `python` or the config refused to construct, which is a coupling nothing asked for. The shipped allowlist lists `coding` first, so that is what a default service now hands out; naming an alias explicitly still wins, and naming one that is not allowed is still refused.
+
+### Fixed
+
+- **An agent can use git in its sandbox.** Every git command in a bind-mounted workspace failed with `detected dubious ownership`, because the directory belongs to whoever the service runs as and the container does not — measured on `status`, `diff`, `log` and `commit` alike. Past that, a commit failed again with `Author identity unknown`. Both are now configured through `GIT_CONFIG_*` on the container, which is what makes it reach the ready-made runtimes (`bun`, `deno`, `go`, `rust`) that build no image of their own.
+- **A long-lived session no longer runs out of processes.** Containers run `sleep infinity` as PID 1, and `sleep` never calls `wait()` — so every process an agent orphans, a backgrounded server or anything the command timeout kills, was reparented to it and stayed a zombie for the life of the container. Measured: ten orphans, ten permanent zombies, accumulating against `pids_limit` (512) until every command in the session failed to fork. Containers now start with Docker's `init`, which costs 488 kB and reaps them.
+
+### Added
+
+- **An evicted session is hibernated rather than closed.** At the ceiling, `sandboxd` used to close the least recently used idle session: its container went, and so did its token, its event log and the caller's ability to come back to it. It now gives up only the sandbox. The record stays, `GET /sessions` reports it as `state: "hibernated"`, and the next request wakes it where it left off — measured at 0.09 s for a persisted container. Nothing a client holds stops being valid.
+- **`SandboxdConfig.max_open_sessions`**, which is the point of the above. `max_sessions` now means *resident* sandboxes — the number the host's RAM has to hold — while `max_open_sessions` bounds the sessions that exist at all, resident and hibernated together, which is a disk number and properly much larger. On a 4 GB host that is ten resident against a couple of hundred open. At the open ceiling the longest-asleep session is closed for good; with every open session in use, the caller gets `429`. A hibernated session is ended by `idle_timeout` like any other.
+- **`memswap_limit` on `DockerSandbox`, `SandboxRuntime` and `SandboxdConfig`.** Swap is still pinned to `mem_limit` by default, because a container swapping to a disk starves every other one on the host. That is the wrong trade where swap is `zram`: the pages stay in RAM compressed at roughly 3:1, and the alternative to a little swapping is an OOM kill mid-command. Set it above `mem_limit` there and nowhere else.
+- **A `coding` runtime, and it is the shipped default.** Python with git, ripgrep, fd, jq, less, procps and `uv` — 99.7 MB, eleven seconds to build, measured. `git` is 33.1 MB of that and unavoidable; the five tools an agent looks at a codebase with come to 4.3 MB between them. `build-essential` is deliberately absent at 94 MB to compile wheels manylinux already ships built. It is the first entry in `DEFAULT_RUNTIMES`, with `python` and `node` staying beside it as ready-made fallbacks for a host that cannot reach a Debian mirror.
+- **Every sandbox starts with a working environment**, applied at the container so it reaches images we did not build: `PYTHONUNBUFFERED` so a command killed by the timeout still returns what it printed, `NO_COLOR` and `PAGER=cat` so escape sequences do not fill the model's context, `LANG=C.UTF-8` because `node:20-slim` ships no locale, and `UV_CONCURRENT_DOWNLOADS=2` — uv's parallelism is memory, and uncapped it is OOM-killed by a 128 MB ceiling that pip survives, where capped it fits and stays 6.6× faster than pip. A runtime overrides any of it through its own `env_vars`.
+- **`polyglot` now carries npm 10.** Debian 13 ships a current Node (20.19.2 against `node:20-slim`'s 20.20.2) but an npm a major version behind, so the generalist runtime quietly behaved differently from the dedicated Node ones.
+- **`scripts/bench_density.py`**, which measures on the host being sized what no blog post can: marginal `MemAvailable` per session, per-container management overhead, time to first command, and wake latency from hibernation. Reasoning behind it in [`docs/plans/sandbox-density-on-small-hosts.md`](docs/plans/sandbox-density-on-small-hosts.md).
+
 ## [0.2.18] - 2026-08-01
 
 ### Added

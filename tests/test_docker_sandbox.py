@@ -579,6 +579,74 @@ class TestDockerSandboxResourceLimits:
         assert kwargs["mem_limit"] == "512m"
         assert kwargs["memswap_limit"] == "512m"
 
+    def test_every_container_gets_an_init_to_reap_with(self, fake_client):
+        """`sleep` as PID 1 never waits, so an orphan is a zombie for good.
+
+        Measured: ten orphaned children left ten permanent zombies, which
+        accumulate against `pids_limit` until the session cannot fork.
+        """
+        _sandbox()._ensure_container()
+
+        assert fake_client.containers.kwargs["init"] is True
+
+    def test_git_is_configured_through_the_environment(self, fake_client):
+        """Which is what reaches a ready-made image we never built.
+
+        Without `safe.directory` every git command in a bind-mounted workspace
+        fails with "detected dubious ownership", and without an identity a
+        commit fails outright.
+        """
+        _sandbox()._ensure_container()
+        env = fake_client.containers.kwargs["environment"]
+
+        pairs = {
+            env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+            for i in range(int(env["GIT_CONFIG_COUNT"]))
+        }
+        assert pairs["safe.directory"] == "*"
+        assert pairs["user.email"]
+        assert pairs["user.name"]
+
+    def test_the_environment_keeps_output_readable_and_installs_bounded(self, fake_client):
+        _sandbox()._ensure_container()
+        env = fake_client.containers.kwargs["environment"]
+
+        # A command killed by the timeout must still return what it printed.
+        assert env["PYTHONUNBUFFERED"] == "1"
+        # Escape sequences are tokens the model pays for and cannot read.
+        assert env["NO_COLOR"] == "1"
+        assert env["PAGER"] == "cat"
+        # uv's parallelism is memory: uncapped it is OOM-killed at 128 MB where
+        # pip survives, and capped at two it fits and stays 6.6x faster.
+        assert env["UV_CONCURRENT_DOWNLOADS"] == "2"
+        # node:20-slim ships no LANG, so a Node runtime would start in POSIX.
+        assert env["LANG"] == "C.UTF-8"
+
+    def test_a_runtime_may_override_any_of_it(self, fake_client):
+        from pydantic_ai_backends.types import RuntimeConfig
+
+        runtime = RuntimeConfig(name="loud", image="img", env_vars={"NO_COLOR": "0"})
+        _sandbox(runtime=runtime)._ensure_container()
+        env = fake_client.containers.kwargs["environment"]
+
+        assert env["NO_COLOR"] == "0"
+        # And the rest still arrives.
+        assert env["PYTHONUNBUFFERED"] == "1"
+
+    def test_a_wider_swap_ceiling_is_honoured(self, fake_client):
+        """A host whose swap is zram can afford one; the default still cannot."""
+        _sandbox(mem_limit="512m", memswap_limit="768m")._ensure_container()
+
+        kwargs = fake_client.containers.kwargs
+        assert kwargs["mem_limit"] == "512m"
+        assert kwargs["memswap_limit"] == "768m"
+
+    def test_a_swap_ceiling_without_a_memory_one_is_ignored(self, fake_client):
+        """Docker rejects a swap ceiling with no memory ceiling under it."""
+        _sandbox(memswap_limit="768m")._ensure_container()
+
+        assert "memswap_limit" not in fake_client.containers.kwargs
+
     def test_cpu_limit_converts_cores_to_nano_cpus(self, fake_client):
         _sandbox(cpus=1.5)._ensure_container()
 

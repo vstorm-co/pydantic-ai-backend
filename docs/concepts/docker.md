@@ -64,6 +64,8 @@ sandbox = DockerSandbox(runtime=runtime)
 
 | Runtime | Image | What it adds |
 |---|---|---|
+| `coding` | built on python:3.12-slim | git, ripgrep, fd, jq, less, procps, uv |
+| `polyglot` | built on python:3.12-slim | Python and Node together, curl, git, numpy, duckdb, polars, httpx |
 | `python-minimal` | python:3.12-slim | standard library only |
 | `python-datascience` | built on python:3.12-slim | pandas, numpy, matplotlib, scikit-learn, seaborn |
 | `python-analytics` | built on python:3.12-slim | duckdb, polars, pyarrow |
@@ -81,6 +83,37 @@ sandbox = DockerSandbox(runtime=runtime)
 A runtime naming an `image` starts as fast as a pull. One naming a `base_image`
 plus `packages` builds an image on first use and hits the cache afterwards, which
 is worth it when installing them per session would dominate.
+
+**`coding` is the one to reach for when the agent's job is code.** Measured at
+99.7 MB and eleven seconds to build: `git` is 33.1 MB of that and unavoidable,
+while `ripgrep`, `fd`, `jq`, `less` and `procps` come to 4.3 MB between them.
+`uv` is there because an agent installs packages inside its own turn — measured
+5–7× faster than pip on the same package set. What is deliberately absent is
+`build-essential`: 94 MB to compile wheels that manylinux already ships built.
+
+### What every sandbox gets, whatever its runtime
+
+Some settings are applied to the container rather than baked into an image, so
+they reach the ready-made runtimes too — `bun`, `deno`, `go` and `rust` build
+nothing, so a Dockerfile could never have carried them. A runtime overrides any
+of it through its own `env_vars`.
+
+- **git is configured through `GIT_CONFIG_*`.** Without it, every git command in
+  a bind-mounted workspace fails with `detected dubious ownership` — the
+  directory belongs to whoever the service runs as, and the container does not —
+  and a commit fails again with `Author identity unknown`. Both measured.
+- **An init process reaps orphans.** `sleep infinity` as PID 1 never calls
+  `wait()`, so a backgrounded server or anything the command timeout kills stays
+  a zombie for the life of the container. Measured: ten orphans left ten
+  permanent zombies, accumulating against `pids_limit` until the session could
+  not fork. The reaper costs 488 kB.
+- **Output stays readable**: `PYTHONUNBUFFERED` so a command killed by the
+  timeout still returns what it printed rather than an empty string, and
+  `NO_COLOR` / `PAGER=cat` so escape sequences do not fill the model's context.
+- **`uv` is capped at two concurrent downloads.** Its parallelism is memory:
+  measured installing pandas, uncapped uv is OOM-killed by a 128 MB ceiling that
+  pip survives. Capped it fits, and is still 6.6× faster than pip.
+- **`LANG=C.UTF-8`**, because `node:20-slim` ships no locale at all.
 
 ## SessionManager for Multi-User
 

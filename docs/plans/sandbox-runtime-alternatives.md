@@ -25,8 +25,16 @@ answers:
 The interesting finding is that the second problem has solutions that do not
 cost anything on the first. A Firecracker microVM boots in ~125ms with under
 5 MiB of VMM overhead, which is *stronger* isolation than Docker at comparable
-density. The naive assumption — that better isolation means slower and heavier —
-is wrong at this scale.
+*startup* cost. The naive assumption — that better isolation means slower — is
+wrong at this scale.
+
+> **Correction, August 2026.** An earlier version of that sentence said
+> "comparable density", which is wrong. The 5 MiB is the VMM's bookkeeping, not
+> a microVM's footprint: each one carries its own guest kernel and its own page
+> cache, so it shares nothing with its neighbours where containers share a base
+> image. Under a hard memory ceiling microVMs lose badly —
+> [Session density on a small host](sandbox-density-on-small-hosts.md) works
+> through what that costs on a 4 GB machine. They buy isolation, not density.
 
 So there is no single answer, only a ladder. Each rung costs more to adopt than
 the one below it.

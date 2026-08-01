@@ -116,6 +116,10 @@ class SandboxRuntime:
             Later sessions hit the build cache.
         description: What this environment is for, shown in the dashboard.
         mem_limit: Memory ceiling in Docker syntax, e.g. `"2g"`.
+        memswap_limit: Ceiling on memory and swap combined. `None` pins it to
+            `mem_limit`, denying the sandbox swap. Only worth raising on a host
+            whose swap is `zram`, where the pages stay in compressed RAM and the
+            alternative to a little swapping is an OOM kill.
         cpus: Hard CPU ceiling in cores. A sandbox never exceeds it — and so
             cannot use cores that are idle.
         cpu_shares: Relative CPU weight, which applies only under contention. On
@@ -137,6 +141,7 @@ class SandboxRuntime:
     runtime: RuntimeConfig | str | None = None
     description: str = ""
     mem_limit: str | None = None
+    memswap_limit: str | None = None
     cpus: float | None = None
     cpu_shares: int | None = None
     pids_limit: int | None = None
@@ -184,6 +189,12 @@ def _as_runtime(entry: str | SandboxRuntime) -> SandboxRuntime:
 
 
 DEFAULT_RUNTIMES: dict[str, SandboxRuntime] = {
+    "coding": SandboxRuntime(
+        runtime="coding",
+        # Needs the network for the reason it exists: an agent working on code
+        # installs what the project declares.
+        network_mode="bridge",
+    ),
     "python": SandboxRuntime(
         image="python:3.12-slim",
         description="Python 3.12, standard library only",
@@ -195,13 +206,26 @@ DEFAULT_RUNTIMES: dict[str, SandboxRuntime] = {
 }
 """What a service allows when its operator names nothing.
 
-Deliberately two ready-made images and no ceilings of their own: a default that
-built package sets would make the first session of a fresh deployment take
-minutes, and a default that raised ceilings would size the host on the operator's
-behalf. Richer catalogues are opt-in — see :data:`SUGGESTED_RUNTIMES`.
+No ceilings of their own, because a default that raised them would size the host
+on the operator's behalf. Richer catalogues are opt-in — see
+:data:`SUGGESTED_RUNTIMES`.
+
+`coding` is the exception to "nothing here builds an image", and it is the
+default because a sandbox for an agent working on code without `git` is not one.
+Measured at 99.7 MB and eleven seconds to build; `prewarm` — on by default —
+does it as the service starts rather than inside somebody's first request. A
+host that cannot reach a Debian mirror will fail to build it, which `prewarm`
+logs and skips; `python` and `node` stay here as ready-made fallbacks for
+exactly that case.
 """
 
 SUGGESTED_RUNTIMES: dict[str, SandboxRuntime] = {
+    "coding": SandboxRuntime(
+        runtime="coding",
+        mem_limit="1g",
+        cpus=2.0,
+        network_mode="bridge",
+    ),
     "polyglot": SandboxRuntime(
         runtime="polyglot",
         # The generalist: an agent that writes a script, a page and a stylesheet,
@@ -308,26 +332,48 @@ class SandboxdConfig:
             its own ceilings and, if it needs them, packages to build in. A
             request naming anything else is rejected; this is what stops a client
             from running an image of its choosing.
-        default_runtime: Alias used when a request names none.
-        max_sessions: Ceiling on *live sandboxes* across the service, or `None`
-            for no ceiling. Together with the largest per-runtime memory ceiling
-            this is what bounds the worst case an operator has to size the host
-            for, so `None` is for hosts where something else does the bounding.
+        default_runtime: Alias used when a request names none. Empty — the
+            default — takes the first entry in `runtimes`, so the shipped
+            allowlist defaults to `coding` while an operator who supplies their
+            own gets whichever they listed first. Naming a specific alias here
+            still wins; what it no longer does is force every custom allowlist
+            to contain a particular key.
+        max_sessions: Ceiling on *resident sandboxes* across the service, or
+            `None` for no ceiling. Together with the largest per-runtime memory
+            ceiling this is what bounds the worst case an operator has to size
+            the host for, so `None` is for hosts where something else does the
+            bounding. It does not bound how many sessions may exist — see
+            `max_open_sessions`.
+        max_open_sessions: Ceiling on sessions that *exist*, resident or
+            hibernated, or `None` for no ceiling. A hibernated session costs
+            disk and a few kilobytes of bookkeeping rather than memory, so this
+            number is properly much larger than `max_sessions` — that gap is the
+            difference between the sessions a host can carry and the ones it can
+            run at once. Only meaningful with `evict_idle_after`, which is what
+            demotes a session to hibernated in the first place.
         evict_idle_after: Seconds of inactivity after which a session at the
-            ceiling may be closed to make room for a new one, instead of the new
-            one being refused with `429`. This is what turns `max_sessions` from a
-            hard cap on how many sessions may *exist* into a working-set size:
-            with a workspace on disk the evicted session loses nothing but its
-            container, and its next request re-attaches and finds its files.
-            `None` refuses instead of evicting. Requires `workspace_root` —
-            evicting a session whose files live only in its container would
-            discard them silently, which is not a trade a config should make
-            quietly.
+            ceiling may be hibernated to make room for a new one, instead of the
+            new one being refused with `429`. This is what turns `max_sessions`
+            from a hard cap on how many sessions may *exist* into a working-set
+            size: the hibernated session keeps its token, its event log and its
+            files, and its next request wakes it where it left off. `None`
+            refuses instead of evicting. Requires `workspace_root` — hibernating
+            a session whose files live only in its container would discard them
+            silently, which is not a trade a config should make quietly.
         max_sessions_per_tenant: Ceiling on simultaneous sessions carrying one
             `tenant` label. Without it, one tenant of the calling application can
             occupy the whole pool and every other tenant gets `429`.
         mem_limit: Default memory ceiling per sandbox, in Docker syntax. A
             runtime naming its own overrides this, upwards or downwards.
+        memswap_limit: Default ceiling on memory and swap combined. `None` pins
+            it to `mem_limit`, so a sandbox at its ceiling is killed rather than
+            allowed to swap — which is right when swap is a disk, because one
+            swapping sandbox slows every other one on the host.
+
+            Raise it only where swap is `zram`. There the pages stay in RAM
+            compressed at roughly 3:1, so a sandbox briefly over its ceiling
+            costs CPU instead of the whole host's responsiveness, and on a small
+            box that trade is what turns an OOM kill into a slow command.
         cpus: Default hard CPU ceiling per sandbox, in cores. `None` leaves
             sandboxes free to use whatever is idle, bounded only by `cpu_shares`.
         cpu_shares: Default relative CPU weight, applied only under contention.
@@ -409,11 +455,13 @@ class SandboxdConfig:
     runtimes: Mapping[str, str | SandboxRuntime] = field(
         default_factory=lambda: dict(DEFAULT_RUNTIMES)
     )
-    default_runtime: str = "python"
+    default_runtime: str = ""
     max_sessions: int | None = 20
+    max_open_sessions: int | None = None
     max_sessions_per_tenant: int | None = None
     evict_idle_after: int | None = None
     mem_limit: str | None = "1g"
+    memswap_limit: str | None = None
     cpus: float | None = 2.0
     cpu_shares: int | None = None
     pids_limit: int | None = 512
@@ -438,6 +486,8 @@ class SandboxdConfig:
             raise ValueError("SandboxdConfig.token must not be empty")
         if not self.runtimes:
             raise ValueError("SandboxdConfig.runtimes must allow at least one image")
+        if not self.default_runtime:
+            self.default_runtime = next(iter(self.runtimes))
         if self.default_runtime not in self.runtimes:
             raise ValueError(
                 f"default_runtime {self.default_runtime!r} is not in runtimes "
@@ -445,8 +495,17 @@ class SandboxdConfig:
             )
         if self.evict_idle_after is not None and self.workspace_root is None:
             raise ValueError(
-                "evict_idle_after needs workspace_root: evicting a session whose "
+                "evict_idle_after needs workspace_root: hibernating a session whose "
                 "files live only in its container would discard them silently"
+            )
+        if (
+            self.max_open_sessions is not None
+            and self.max_sessions is not None
+            and self.max_open_sessions < self.max_sessions
+        ):
+            raise ValueError(
+                f"max_open_sessions ({self.max_open_sessions}) is below max_sessions "
+                f"({self.max_sessions}): a session has to exist to be resident"
             )
 
     def resolve_runtime(self, alias: str | None) -> tuple[str, SandboxRuntime]:
@@ -471,6 +530,9 @@ class SandboxdConfig:
         """
         return {
             "mem_limit": runtime.mem_limit if runtime.mem_limit is not None else self.mem_limit,
+            "memswap_limit": (
+                runtime.memswap_limit if runtime.memswap_limit is not None else self.memswap_limit
+            ),
             "cpus": runtime.cpus if runtime.cpus is not None else self.cpus,
             "cpu_shares": (
                 runtime.cpu_shares if runtime.cpu_shares is not None else self.cpu_shares
@@ -506,7 +568,13 @@ exactly what a dashboard wants anyway.
 
 @dataclass(slots=True)
 class _Session:
-    """Service-side bookkeeping for one session."""
+    """Service-side bookkeeping for one session.
+
+    Outlives the session's sandbox. A session evicted to make room keeps this
+    record — its token, its runtime and its event log — while its container is
+    stopped, so the caller comes back to the same session rather than being told
+    it no longer exists.
+    """
 
     runtime: str
     token: str
@@ -514,6 +582,8 @@ class _Session:
     tenant: str | None = None
     events: deque[wire.SessionEvent] = field(default_factory=lambda: deque(maxlen=_EVENT_HISTORY))
     next_seq: int = 1
+    hibernated_at: float | None = None
+    """When the sandbox was stopped to free a slot, or `None` while resident."""
 
 
 @dataclass(slots=True)
@@ -636,6 +706,28 @@ def sweep_containers(config: SandboxdConfig, client: Any, now: float) -> list[st
     if removed:
         _logger.info("Removed %d stopped sandbox container(s)", len(removed))
     return removed
+
+
+def remove_persisted_container(
+    config: SandboxdConfig, client_factory: Callable[[], Any], session_id: str
+) -> bool:
+    """Remove one session's persisted container by name, running or not.
+
+    The route a purge takes when the session is hibernated and so has no sandbox
+    object to ask. Failure is not raised: the container may already be gone, and
+    a purge that could not find one has nothing left to do either way.
+
+    Returns:
+        Whether a container was removed.
+    """
+    name = _container_name(config, session_id)
+    if name is None:
+        return False
+    try:
+        client_factory().containers.get(name).remove(force=True)
+    except Exception:
+        return False
+    return True
 
 
 def _stopped_at(state: dict[str, Any]) -> float | None:
@@ -796,6 +888,10 @@ class _Service:
         # command *starts*, so a long exec looks idle while it runs — evicting on
         # that alone would kill work mid-command.
         self._inflight: Counter[str] = Counter()
+        # Ids whose sandbox is being stopped to free a slot rather than closed.
+        # `on_release` cannot tell the two apart on its own, and forgetting a
+        # hibernating session would throw away the token its caller still holds.
+        self._hibernating: set[str] = set()
         self.manager = SessionManager(
             sandbox_factory=self._new_sandbox,
             max_sessions=config.max_sessions,
@@ -810,10 +906,16 @@ class _Service:
         without it a reaped session left its token and its whole event log behind
         for the life of the process, and `reuse` would attach to a record with no
         sandbox under it.
+
+        Hibernation goes through the same release path and must not do any of
+        that: the session is coming back, and the only thing that stops being
+        true about it is its usage sample.
         """
+        self._usage_cache.pop(session_id, None)
+        if session_id in self._hibernating:
+            return
         self._sessions.pop(session_id, None)
         self._pending.pop(session_id, None)
-        self._usage_cache.pop(session_id, None)
         self._inflight.pop(session_id, None)
 
     def _new_sandbox(self, session_id: str) -> Any:
@@ -828,8 +930,9 @@ class _Service:
         # both on this pool rather than on the loop every request shares.
         self.manager.executor = self._executor
         self.manager.start_cleanup_loop(interval=self.config.cleanup_interval)
-        if self.config.workspace_ttl is not None or self.config.container_ttl is not None:
-            self._sweep_task = asyncio.create_task(self._sweep_loop())
+        # Always: the manager only reaps sessions it holds a sandbox for, so
+        # ending the hibernated ones is this loop's job whatever the TTLs say.
+        self._sweep_task = asyncio.create_task(self._sweep_loop())
         if self.config.prewarm and self._prewarm is not None:
             # Off the event loop and un-awaited: the service serves requests
             # while the images arrive, which is the whole point of doing it here
@@ -848,18 +951,42 @@ class _Service:
             _logger.exception("Prewarming the runtime allowlist failed")
 
     async def _sweep_loop(self) -> None:
-        """Reclaim unused workspaces and stopped containers periodically.
+        """End long-asleep sessions and reclaim what nobody is using.
 
         Separate from the manager's idle reaping because it outlives it: a
         workspace is swept long after the session that wrote it stopped
-        existing, which is the whole point of keeping one.
+        existing, which is the whole point of keeping one — and a hibernated
+        session has no sandbox for the manager to notice at all.
         """
         while True:
             await asyncio.sleep(self.config.cleanup_interval)
             try:
+                await self._reap_hibernated()
                 await self._in_thread(self._sweep_once)
             except Exception:
                 _logger.exception("Sweep failed; retrying next interval")
+
+    async def _reap_hibernated(self) -> None:
+        """End the sessions that have been asleep past `idle_timeout`.
+
+        The manager reaps by sandbox, and a hibernated session has none — so
+        without this an eviction meant to free a slot would instead keep the
+        session's record and workspace for the life of the process.
+        """
+        now = time.time()
+        # "Asleep for at least `idle_timeout`", so a timeout of zero means the
+        # next sweep — rather than never, which a strict comparison against a
+        # clock that has not visibly ticked would give.
+        stale = [
+            session_id
+            for session_id, record in self._sessions.items()
+            if record.hibernated_at is not None
+            and now - record.hibernated_at >= self.config.idle_timeout
+        ]
+        for session_id in stale:
+            await self.close_session(session_id)
+        if stale:
+            _logger.info("Closed %d session(s) asleep past the idle timeout", len(stale))
 
     def _sweep_once(self) -> None:
         """One reclaim pass, off the event loop.
@@ -869,7 +996,10 @@ class _Service:
         loop for.
         """
         now = time.time()
-        swept = sweep_workspaces(self.config, self.manager.sessions, now)
+        # Hibernated sessions have no sandbox in the manager, and their
+        # workspace is the only reason they are worth waking.
+        keep = self._sessions.keys() | self.manager.sessions.keys()
+        swept = sweep_workspaces(self.config, keep, now)
         if swept:
             _logger.info("Swept %d unused workspace(s)", len(swept))
         if self._docker_client is not None:
@@ -930,15 +1060,33 @@ class _Service:
 
         Used by the operation endpoints: a client asking to run a command wants
         a working sandbox, so a container that died since the last call is
-        replaced rather than reported.
+        replaced rather than reported — and a session hibernated to free a slot
+        is woken here, which is the only place it can be, since waking is what
+        the next request means.
 
         Raises:
-            HTTPException: 404 when the session has since disappeared.
+            HTTPException: 404 when the session has since disappeared, and 429
+                when it is hibernated and every resident session is busy. The
+                second is backpressure rather than an error: the work is still
+                there, and the caller is being asked to come back.
         """
         try:
-            return await self.manager.get_or_create(session_id)
+            if session_id not in self.manager.sessions:
+                # Waking claims a slot, so somebody idle may have to give one up.
+                await self.make_room()
+            sandbox = await self.manager.get_or_create(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"No such session: {session_id}") from exc
+        except SessionLimitExceeded as exc:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Cannot wake session {session_id}: {exc}",
+            ) from exc
+
+        record = self._sessions.get(session_id)
+        if record is not None:  # pragma: no branch - an authorized caller has one
+            record.hibernated_at = None
+        return sandbox
 
     def peek(self, session_id: str) -> Any:
         """Existing sandbox for a session, without creating anything.
@@ -946,15 +1094,19 @@ class _Service:
         Inspection must not have side effects: routing `GET /sessions/{id}`
         through :meth:`sandbox` would silently replace a dead container and then
         report it as alive, which is precisely the state an operator is looking
-        for.
+        for — and would wake a hibernated session merely for being looked at.
+
+        Returns:
+            The sandbox, or `None` when the session is hibernated and so has
+            none. A hibernated session is still a session, and describing it is
+            most of the point of keeping the record.
 
         Raises:
-            HTTPException: 404 when the session has no sandbox.
+            HTTPException: 404 when there is no such session at all.
         """
-        sandbox = self.manager.sessions.get(session_id)
-        if sandbox is None:
+        if session_id not in self._sessions:
             raise HTTPException(status_code=404, detail=f"No such session: {session_id}")
-        return sandbox
+        return self.manager.sessions.get(session_id)
 
     def describe(
         self,
@@ -981,12 +1133,19 @@ class _Service:
         if record is None:
             raise HTTPException(status_code=404, detail=f"No such session: {session_id}")
         now = time.time()
-        last_activity = getattr(sandbox, "last_activity", now)
+        # A hibernated session has no sandbox to ask, and the moment it was put
+        # to sleep is the last thing that happened to it.
+        last_activity = (
+            record.hibernated_at
+            if record.hibernated_at is not None
+            else getattr(sandbox, "last_activity", now)
+        )
         return wire.SessionInfo(
             session_id=session_id,
             runtime=record.runtime,
             tenant=record.tenant,
             alive=alive,
+            state="hibernated" if record.hibernated_at is not None else "running",
             created_at=record.created_at,
             last_activity=last_activity,
             idle_seconds=max(0.0, now - last_activity),
@@ -1018,7 +1177,13 @@ class _Service:
         return sample
 
     async def described(self, session_id: str, sandbox: Any, usage: bool) -> wire.SessionInfo:
-        """Describe one session, sampling its usage only when asked."""
+        """Describe one session, sampling its usage only when asked.
+
+        `sandbox` is `None` for a hibernated session, which has nothing to
+        sample and is not alive — both true without asking the daemon.
+        """
+        if sandbox is None:
+            return self.describe(session_id, None, None, alive=False)
         sample = await self.sampled_usage(session_id, sandbox) if usage else None
         alive = await alive_of(sandbox)
         loop = asyncio.get_running_loop()
@@ -1033,6 +1198,8 @@ class _Service:
             status="ok",
             sessions=self.manager.session_count,
             limit=self.config.max_sessions,
+            open_sessions=len(self._sessions),
+            open_limit=self.config.max_open_sessions,
             runtimes=sorted(self.config.runtimes),
         )
 
@@ -1096,9 +1263,11 @@ class _Service:
             runtimes=[self._runtime_policy(alias) for alias in sorted(config.runtimes)],
             default_runtime=config.default_runtime,
             max_sessions=config.max_sessions,
+            max_open_sessions=config.max_open_sessions,
             max_sessions_per_tenant=config.max_sessions_per_tenant,
             evict_idle_after=config.evict_idle_after,
             mem_limit=config.mem_limit,
+            memswap_limit=config.memswap_limit,
             cpus=config.cpus,
             cpu_shares=config.cpu_shares,
             pids_limit=config.pids_limit,
@@ -1126,6 +1295,7 @@ class _Service:
             description=runtime.describes(),
             builds=runtime.builds,
             mem_limit=limits["mem_limit"],
+            memswap_limit=limits["memswap_limit"],
             cpus=limits["cpus"],
             cpu_shares=limits["cpu_shares"],
             pids_limit=limits["pids_limit"],
@@ -1141,17 +1311,18 @@ class _Service:
         per session, on the event loop, which stalled everything else the service
         was doing.
         """
-        live = [
-            (session_id, sandbox)
-            for session_id, sandbox in self.manager.sessions.items()
-            if session_id in self._sessions
-        ]
+        # Driven by the service's own records rather than the manager's, so a
+        # hibernated session — which has no sandbox and is exactly the one an
+        # operator is looking for when the pool is full — still appears.
+        resident = self.manager.sessions
+        rows = [(session_id, resident.get(session_id)) for session_id in self._sessions]
         described = await asyncio.gather(
-            *(self._described_or_gone(session_id, sandbox, usage) for session_id, sandbox in live)
+            *(self._described_or_gone(session_id, sandbox, usage) for session_id, sandbox in rows)
         )
         return wire.SessionList(
             sessions=[row for row in described if row is not None],
             limit=self.config.max_sessions,
+            open_limit=self.config.max_open_sessions,
             tenant_limit=self.config.max_sessions_per_tenant,
         )
 
@@ -1202,6 +1373,7 @@ class _Service:
         # this two requests naming one id both get past the check above, both are
         # handed the same sandbox, and the second overwrites the first's record —
         # which silently invalidates the token the first caller is holding.
+        await self._make_open_room()
         self._pending[session_id] = _Pending(runtime=runtime, tenant=body.tenant)
         try:
             self._reject_tenant_at_capacity(body.tenant, session_id)
@@ -1263,10 +1435,68 @@ class _Service:
             return None
 
         _, victim = max(candidates)
-        # Not a purge: the workspace is what the session comes back to.
-        await self.close_session(victim)
-        _logger.info("Evicted idle session %s to make room", victim)
+        await self.hibernate(victim)
+        _logger.info("Hibernated idle session %s to make room", victim)
         return victim
+
+    async def _make_open_room(self) -> None:
+        """Close the longest-asleep session when the open ceiling is full.
+
+        Hibernated sessions cost disk rather than memory, which is what lets
+        there be many more of them than resident ones — but not unboundedly
+        many, since each keeps a workspace and possibly a stopped container. At
+        the ceiling the one that has been asleep longest is the one least likely
+        to be wanted again, and it is closed for good.
+
+        Raises:
+            HTTPException: 429 when every open session is resident, so nothing
+                can be given up without killing work somebody is doing.
+        """
+        ceiling = self.config.max_open_sessions
+        if ceiling is None or len(self._pending) < ceiling:
+            return
+
+        asleep = [
+            (record.hibernated_at, session_id)
+            for session_id, record in self._sessions.items()
+            if record.hibernated_at is not None
+        ]
+        if not asleep:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Service holds its ceiling of {ceiling} open sessions and all of "
+                    "them are in use. Close one before opening another."
+                ),
+            )
+
+        _, longest_asleep = min(asleep)
+        await self.close_session(longest_asleep)
+        _logger.info("Closed hibernated session %s to make room", longest_asleep)
+
+    async def hibernate(self, session_id: str) -> None:
+        """Stop a session's sandbox without ending the session.
+
+        What goes is everything resident: the container, the process supervising
+        it, and the memory both hold. What stays is the record — the token its
+        caller is holding, the runtime it was opened on, and its event log — plus
+        the workspace on disk. The next request wakes it, finds its files, and
+        never learns it was away.
+
+        This is why eviction is not a close. Closing frees the same memory, but
+        it also invalidates a token that a client has no way of knowing is gone,
+        and it makes the number of sessions a host can carry the number it can
+        run at once. Those are different numbers, and on a small host they differ
+        by an order of magnitude.
+        """
+        self._hibernating.add(session_id)
+        try:
+            await self.manager.release(session_id)
+        finally:
+            self._hibernating.discard(session_id)
+        record = self._sessions.get(session_id)
+        if record is not None:  # pragma: no branch - the caller picked a live session
+            record.hibernated_at = time.time()
 
     def _reject_tenant_at_capacity(self, tenant: str | None, opening: str) -> None:
         """Refuse a new session once its tenant holds its share of the pool.
@@ -1328,6 +1558,10 @@ class _Service:
                 ),
             )
         sandbox = self.peek(session_id)
+        if sandbox is None:
+            # Hibernated. Re-opening a session is a caller saying it wants to
+            # work again, which is exactly what wakes one.
+            sandbox = await self.sandbox(session_id)
         return wire.SessionCreated(
             session=self.describe(session_id, sandbox, alive=await alive_of(sandbox)),
             token=session.token,
@@ -1345,10 +1579,23 @@ class _Service:
                 the session is gone for good.
         """
         sandbox = self.manager.sessions.get(session_id)
-        if purge and sandbox is not None:
-            await self._discard(sandbox)
+        if purge:
+            if sandbox is not None:
+                await self._discard(sandbox)
+            elif self._docker_client is not None:
+                # Hibernated: there is no sandbox object to stop, but a persisted
+                # container is sitting stopped under the session's name and a
+                # purge that left it there would not be one.
+                await self._in_thread(
+                    functools.partial(
+                        remove_persisted_container, self.config, self._docker_client, session_id
+                    )
+                )
 
-        await self.manager.release(session_id)
+        if not await self.manager.release(session_id):
+            # Hibernated, so the manager has nothing to release and `on_release`
+            # never fires. The records that outlive a sandbox end here instead.
+            self._forget(session_id)
 
         if purge:
             session_dir = _session_dir(self.config, session_id)

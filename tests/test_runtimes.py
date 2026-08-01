@@ -150,3 +150,48 @@ class TestGetRuntime:
         for name in BUILTIN_RUNTIMES:
             runtime = get_runtime(name)
             assert runtime.name == name
+
+
+class TestCodingRuntime:
+    """The runtime an agent working on code is given."""
+
+    def test_it_ships_the_tools_an_agent_looks_at_code_with(self):
+        """Measured at 4.3 MB between them, against 33.1 MB for git alone."""
+        coding = get_runtime("coding")
+        installed = " ".join(coding.setup_commands)
+
+        for tool in ("git", "ripgrep", "fd-find", "jq", "less", "procps"):
+            assert tool in installed, tool
+
+    def test_debians_fdfind_is_reachable_as_fd(self):
+        """A model that has read fd's documentation types `fd`."""
+        installed = " ".join(get_runtime("coding").setup_commands)
+
+        assert "ln -s /usr/bin/fdfind /usr/local/bin/fd" in installed
+
+    def test_it_installs_uv_after_the_curl_it_needs(self):
+        """The installer is fetched with curl, which the apt line provides."""
+        commands = get_runtime("coding").setup_commands
+        apt = next(i for i, c in enumerate(commands) if "apt-get install" in c)
+        uv = next(i for i, c in enumerate(commands) if "astral.sh/uv" in c)
+
+        assert apt < uv
+
+    def test_it_carries_no_compiler(self):
+        """`build-essential` is 94 MB to compile wheels manylinux ships built."""
+        installed = " ".join(get_runtime("coding").setup_commands)
+
+        assert "build-essential" not in installed
+
+    def test_it_installs_no_libraries(self):
+        """What an agent needs here is tools plus whatever its project declares."""
+        assert get_runtime("coding").packages == []
+
+
+class TestPolyglotNpm:
+    """Debian's Node is current; its npm is a major version behind."""
+
+    def test_npm_is_brought_up_to_the_version_the_node_runtimes_have(self):
+        installed = " ".join(BUILTIN_RUNTIMES["polyglot"].setup_commands)
+
+        assert "npm install -g npm@10" in installed
