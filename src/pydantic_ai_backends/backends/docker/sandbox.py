@@ -98,6 +98,7 @@ class DockerSandbox(BaseSandbox):
         network_mode: str | None = None,
         container_name: str | None = None,
         mem_limit: str | None = None,
+        memswap_limit: str | None = None,
         cpus: float | None = None,
         cpu_shares: int | None = None,
         pids_limit: int | None = DEFAULT_PIDS_LIMIT,
@@ -127,8 +128,21 @@ class DockerSandbox(BaseSandbox):
                 preserves installed packages and other filesystem state.
                 Implies `auto_remove=False`.
             mem_limit: Memory ceiling in Docker syntax (`"512m"`, `"2g"`). Swap
-                is pinned to the same value, so a container over its ceiling is
-                stopped rather than left swapping against the host.
+                is pinned to the same value unless `memswap_limit` says
+                otherwise, so a container over its ceiling is stopped rather
+                than left swapping against the host.
+            memswap_limit: Ceiling on memory *and* swap combined, in the same
+                syntax. `None` pins it to `mem_limit`, which denies the container
+                swap entirely — the right default, because a container swapping
+                past its limit against a disk starves every other sandbox on the
+                host.
+
+                It is the wrong default on a host backed by `zram`, where swap
+                is compressed RAM: the pages never leave memory, idle Python
+                heaps compress to roughly a third, and the alternative to a
+                little swapping is an OOM kill. Set this above `mem_limit` there
+                and nowhere else. Ignored without `mem_limit`, since Docker
+                rejects a swap ceiling with no memory ceiling under it.
             cpus: Hard CPU ceiling in cores, e.g. `1.5`. A container never
                 exceeds it, which also means it cannot use cores that are sitting
                 idle — on a small host that is often the wrong trade.
@@ -177,6 +191,7 @@ class DockerSandbox(BaseSandbox):
         self._volumes = volumes or {}
         self._network_mode = network_mode
         self._mem_limit = mem_limit
+        self._memswap_limit = memswap_limit
         self._cpus = cpus
         self._cpu_shares = cpu_shares
         self._pids_limit = pids_limit
@@ -291,9 +306,10 @@ class DockerSandbox(BaseSandbox):
             kwargs["pids_limit"] = self._pids_limit
         if self._mem_limit is not None:
             # Without a matching swap ceiling the kernel lets a container over
-            # its memory limit swap instead, which starves the whole host.
+            # its memory limit swap instead, which starves the whole host. A
+            # host whose swap is `zram` can afford a wider one, and says so.
             kwargs["mem_limit"] = self._mem_limit
-            kwargs["memswap_limit"] = self._mem_limit
+            kwargs["memswap_limit"] = self._memswap_limit or self._mem_limit
         if self._cpus is not None:
             kwargs["nano_cpus"] = int(self._cpus * 1_000_000_000)
         if self._cpu_shares is not None:

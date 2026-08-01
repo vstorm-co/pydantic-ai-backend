@@ -12,6 +12,8 @@ cannot carry arbitrary bytes, and a sandbox holds real files.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 TOKEN_HEADER = "X-Sandbox-Token"
@@ -243,6 +245,10 @@ class SessionInfo(BaseModel):
     tenant: str | None = None
     """Whoever the session was opened for, when the client said."""
     alive: bool
+    state: Literal["running", "hibernated"] = "running"
+    """Whether the session holds a sandbox, or was stopped to free a slot and is
+    waiting for its next request to wake it. A hibernated session is never
+    `alive`; it still has its token, its event log and its files."""
     created_at: float
     last_activity: float
     idle_seconds: float
@@ -262,7 +268,9 @@ class SessionList(BaseModel):
 
     sessions: list[SessionInfo] = Field(default_factory=list)
     limit: int | None = None
-    """Configured `max_sessions`, or `None` when uncapped."""
+    """Configured `max_sessions` — the ceiling on *resident* sandboxes."""
+    open_limit: int | None = None
+    """Configured `max_open_sessions`, or `None` when uncapped."""
     tenant_limit: int | None = None
     """Configured `max_sessions_per_tenant`, or `None` when uncapped."""
 
@@ -272,7 +280,11 @@ class ServiceHealth(BaseModel):
 
     status: str = "ok"
     sessions: int = 0
+    """Sessions holding a sandbox right now."""
     limit: int | None = None
+    open_sessions: int = 0
+    """Sessions that exist, resident and hibernated together."""
+    open_limit: int | None = None
     runtimes: list[str] = Field(default_factory=list)
 
 
@@ -292,6 +304,8 @@ class RuntimePolicy(BaseModel):
     builds: bool = False
     """Whether the first session on this runtime builds an image."""
     mem_limit: str | None = None
+    memswap_limit: str | None = None
+    """Memory-plus-swap ceiling, or `None` when swap is pinned to `mem_limit`."""
     cpus: float | None = None
     cpu_shares: int | None = None
     pids_limit: int | None = None
@@ -313,10 +327,15 @@ class ServicePolicy(BaseModel):
     """Every allowed runtime, with the ceilings it actually runs under."""
     default_runtime: str = ""
     max_sessions: int | None = None
+    """Ceiling on resident sandboxes."""
+    max_open_sessions: int | None = None
+    """Ceiling on sessions that exist, resident or hibernated."""
     max_sessions_per_tenant: int | None = None
     evict_idle_after: int | None = None
-    """Seconds after which an idle session may be evicted to free a slot."""
+    """Seconds after which an idle session may be hibernated to free a slot."""
     mem_limit: str | None = None
+    memswap_limit: str | None = None
+    """Default memory-plus-swap ceiling, or `None` when swap is pinned to memory."""
     cpus: float | None = None
     cpu_shares: int | None = None
     pids_limit: int | None = None

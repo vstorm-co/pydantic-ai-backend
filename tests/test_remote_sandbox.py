@@ -1568,10 +1568,11 @@ class TestWorkspaceSweep:
 class TestSweepLoop:
     """The background pass that reclaims workspaces."""
 
-    def test_the_loop_runs_only_when_a_ttl_is_set(self, tmp_path):
+    def test_the_loop_runs_even_without_a_ttl(self, tmp_path):
+        """It ends long-asleep sessions too, which no TTL governs."""
         harness = Harness(workspace_root=str(tmp_path))
         with harness.client():
-            assert harness.app.state.service._sweep_task is None
+            assert harness.app.state.service._sweep_task is not None
 
         harness = Harness(workspace_root=str(tmp_path), workspace_ttl=60)
         with harness.client():
@@ -2048,6 +2049,7 @@ class TestPerRuntimeCeilings:
 
         assert limits == {
             "mem_limit": "512m",
+            "memswap_limit": None,
             "cpus": 1.0,
             "cpu_shares": None,
             "pids_limit": 128,
@@ -2517,9 +2519,12 @@ class TestEviction:
 
             assert response.status_code == 200
             service = harness.app.state.service
-            assert "oldest" not in service._sessions
-            assert "newest" in service._sessions
-            assert "third" in service._sessions
+            # Hibernated, not closed: the record survives so the caller's token
+            # and event log do, and only the sandbox is given up.
+            assert "oldest" not in service.manager.sessions
+            assert service._sessions["oldest"].hibernated_at is not None
+            assert "newest" in service.manager.sessions
+            assert "third" in service.manager.sessions
 
     async def test_an_evicted_session_keeps_its_workspace(self, tmp_path):
         """Which is what makes eviction cheap rather than destructive."""
@@ -2575,6 +2580,258 @@ class TestEviction:
             )
 
         assert policy.evict_idle_after == 45
+
+
+class TestHibernation:
+    """An evicted session gives up its sandbox, not its identity."""
+
+    def _harness(self, tmp_path, **kwargs) -> Harness:
+        return Harness(workspace_root=str(tmp_path), evict_idle_after=0, **kwargs)
+
+    async def test_a_hibernated_session_is_still_listed(self, tmp_path):
+        harness = self._harness(tmp_path)
+        with harness.client() as client:
+            _open_session(client, session_id="asleep")
+            await harness.app.state.service.hibernate("asleep")
+
+            listing = wire.SessionList.model_validate(
+                client.get("/sessions", headers=_service_headers()).json()
+            )
+
+        assert [session.session_id for session in listing.sessions] == ["asleep"]
+        assert listing.sessions[0].state == "hibernated"
+        assert listing.sessions[0].alive is False
+
+    async def test_inspecting_one_reports_it_rather_than_404(self, tmp_path):
+        """Looking at a session must not wake it, and must not lose it either."""
+        harness = self._harness(tmp_path)
+        with harness.client() as client:
+            _open_session(client, session_id="asleep")
+            service = harness.app.state.service
+            await service.hibernate("asleep")
+
+            response = client.get("/sessions/asleep?usage=true", headers=_service_headers())
+
+            assert response.status_code == 200
+            info = wire.SessionInfo.model_validate(response.json())
+            assert info.state == "hibernated"
+            assert info.usage is None
+            # Still asleep: inspection has no side effects.
+            assert "asleep" not in service.manager.sessions
+
+    async def test_the_next_command_wakes_it_on_the_same_token(self, tmp_path):
+        harness = self._harness(tmp_path)
+        with harness.client() as client:
+            _, token = _open_session(client, session_id="asleep")
+            service = harness.app.state.service
+            await service.hibernate("asleep")
+
+            response = client.post(
+                "/sessions/asleep/exec",
+                json={"command": "echo hi"},
+                headers={wire.TOKEN_HEADER: token},
+            )
+
+            assert response.status_code == 200
+            assert "asleep" in service.manager.sessions
+            assert service._sessions["asleep"].hibernated_at is None
+
+    async def test_reopening_one_wakes_it(self, tmp_path):
+        harness = self._harness(tmp_path)
+        with harness.client() as client:
+            _open_session(client, session_id="asleep")
+            service = harness.app.state.service
+            await service.hibernate("asleep")
+
+            response = client.post(
+                "/sessions",
+                json={"session_id": "asleep", "reuse": True},
+                headers=_service_headers(),
+            )
+
+            assert response.status_code == 200
+            created = wire.SessionCreated.model_validate(response.json())
+            assert created.session.state == "running"
+            assert "asleep" in service.manager.sessions
+
+    async def test_waking_is_refused_when_every_slot_is_busy(self, tmp_path):
+        """Backpressure, not an error: the work is still there to come back to."""
+        harness = Harness(workspace_root=str(tmp_path), max_sessions=1, evict_idle_after=60)
+        with harness.client() as client:
+            _, token = _open_session(client, session_id="asleep")
+            service = harness.app.state.service
+            await service.hibernate("asleep")
+            _open_session(client, session_id="busy")
+            harness.built["busy"]._last_activity = time.time()
+
+            response = client.post(
+                "/sessions/asleep/exec",
+                json={"command": "echo hi"},
+                headers={wire.TOKEN_HEADER: token},
+            )
+
+            assert response.status_code == 429
+            assert "Cannot wake session asleep" in response.json()["detail"]
+
+    async def test_one_asleep_past_the_idle_timeout_is_closed(self, tmp_path):
+        harness = self._harness(tmp_path, idle_timeout=0)
+        with harness.client() as client:
+            _open_session(client, session_id="forgotten")
+            service = harness.app.state.service
+            await service.hibernate("forgotten")
+
+            await service._reap_hibernated()
+
+            assert "forgotten" not in service._sessions
+
+    async def test_closing_one_forgets_it(self, tmp_path):
+        """The manager has nothing to release, so nothing fires `on_release`."""
+        harness = self._harness(tmp_path)
+        with harness.client() as client:
+            _open_session(client, session_id="asleep")
+            service = harness.app.state.service
+            await service.hibernate("asleep")
+
+            await service.close_session("asleep")
+
+            assert "asleep" not in service._sessions
+            assert "asleep" not in service._pending
+
+    async def test_purging_one_takes_its_workspace_too(self, tmp_path):
+        """No sandbox to discard and no daemon to ask; the files still go."""
+        harness = self._harness(tmp_path)
+        with harness.client() as client:
+            _open_session(client, session_id="asleep")
+            service = harness.app.state.service
+            await service.hibernate("asleep")
+
+            await service.close_session("asleep", purge=True)
+
+            assert "asleep" not in service._sessions
+            assert not (tmp_path / "asleep").exists()
+
+
+class TestOpenSessionCeiling:
+    """Hibernated sessions cost disk, so they are bounded separately."""
+
+    def _harness(self, tmp_path, **kwargs) -> Harness:
+        return Harness(workspace_root=str(tmp_path), evict_idle_after=0, **kwargs)
+
+    def test_it_cannot_sit_below_the_resident_ceiling(self):
+        with pytest.raises(ValueError, match="is below max_sessions"):
+            SandboxdConfig(token="t", max_sessions=10, max_open_sessions=5)
+
+    async def test_the_longest_asleep_session_is_closed_at_the_ceiling(self, tmp_path):
+        harness = self._harness(tmp_path, max_sessions=1, max_open_sessions=2)
+        with harness.client() as client:
+            _open_session(client, session_id="first")
+            service = harness.app.state.service
+            await service.hibernate("first")
+            _open_session(client, session_id="second")
+            await service.hibernate("second")
+            # Asleep longer than "second", and so the one given up.
+            service._sessions["first"].hibernated_at = time.time() - 500
+
+            response = client.post(
+                "/sessions", json={"session_id": "third"}, headers=_service_headers()
+            )
+
+            assert response.status_code == 200
+            assert "first" not in service._sessions
+            assert "second" in service._sessions
+
+    async def test_a_full_ceiling_of_working_sessions_refuses(self, tmp_path):
+        harness = self._harness(tmp_path, max_sessions=1, max_open_sessions=1)
+        with harness.client() as client:
+            _open_session(client, session_id="only")
+
+            response = client.post(
+                "/sessions", json={"session_id": "next"}, headers=_service_headers()
+            )
+
+            assert response.status_code == 429
+            assert "all of them are in use" in response.json()["detail"]
+
+    def test_both_ceilings_are_visible_in_the_policy(self, tmp_path):
+        harness = self._harness(tmp_path, max_sessions=2, max_open_sessions=50)
+        with harness.client() as client:
+            policy = wire.ServicePolicy.model_validate(
+                client.get("/policy", headers=_service_headers()).json()
+            )
+            health = wire.ServiceHealth.model_validate(client.get("/healthz").json())
+
+        assert (policy.max_sessions, policy.max_open_sessions) == (2, 50)
+        assert (health.limit, health.open_limit) == (2, 50)
+
+
+class TestPurgingAHibernatedSession:
+    """A stopped container is still a container, and a purge means all of it."""
+
+    def test_the_named_container_is_removed(self):
+        from pydantic_ai_backends.remote.server import _container_name, remove_persisted_container
+
+        removed: list[str] = []
+
+        class FakeContainer:
+            def remove(self, force: bool) -> None:
+                removed.append(f"force={force}")
+
+        class FakeContainers:
+            def get(self, name: str) -> FakeContainer:
+                removed.append(name)
+                return FakeContainer()
+
+        config = SandboxdConfig(token="t", persist_containers=True)
+        assert remove_persisted_container(
+            config, lambda: types.SimpleNamespace(containers=FakeContainers()), "gone"
+        )
+        assert removed == [_container_name(config, "gone"), "force=True"]
+
+    def test_a_service_that_persists_nothing_has_nothing_to_remove(self):
+        from pydantic_ai_backends.remote.server import remove_persisted_container
+
+        config = SandboxdConfig(token="t")
+
+        assert not remove_persisted_container(config, lambda: None, "gone")
+
+    def test_a_daemon_that_refuses_is_not_an_error(self):
+        """The container may already be gone, which is the outcome anyway."""
+        from pydantic_ai_backends.remote.server import remove_persisted_container
+
+        def explode() -> Any:
+            raise RuntimeError("no daemon")
+
+        config = SandboxdConfig(token="t", persist_containers=True)
+
+        assert not remove_persisted_container(config, explode, "gone")
+
+    async def test_purging_a_hibernated_session_reaches_its_container(self, tmp_path):
+        harness = Harness(workspace_root=str(tmp_path), evict_idle_after=0, persist_containers=True)
+        with harness.client() as client:
+            from pydantic_ai_backends.remote.server import _container_name
+
+            _open_session(client, session_id="asleep")
+            service = harness.app.state.service
+            await service.hibernate("asleep")
+            asked: list[str] = []
+            service._docker_client = lambda: types.SimpleNamespace(
+                containers=types.SimpleNamespace(
+                    get=lambda name: asked.append(name) or _Removable()
+                )
+            )
+
+            response = client.delete("/sessions/asleep?purge=true", headers=_service_headers())
+
+            assert response.status_code == 204
+            assert asked == [_container_name(service.config, "asleep")]
+            assert not (tmp_path / "asleep").exists()
+
+
+class _Removable:
+    """Stand-in for a container the purge reaches through the daemon."""
+
+    def remove(self, force: bool) -> None:
+        assert force
 
 
 class TestEvictionNeverInterruptsWork:

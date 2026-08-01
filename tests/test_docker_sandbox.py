@@ -579,6 +579,20 @@ class TestDockerSandboxResourceLimits:
         assert kwargs["mem_limit"] == "512m"
         assert kwargs["memswap_limit"] == "512m"
 
+    def test_a_wider_swap_ceiling_is_honoured(self, fake_client):
+        """A host whose swap is zram can afford one; the default still cannot."""
+        _sandbox(mem_limit="512m", memswap_limit="768m")._ensure_container()
+
+        kwargs = fake_client.containers.kwargs
+        assert kwargs["mem_limit"] == "512m"
+        assert kwargs["memswap_limit"] == "768m"
+
+    def test_a_swap_ceiling_without_a_memory_one_is_ignored(self, fake_client):
+        """Docker rejects a swap ceiling with no memory ceiling under it."""
+        _sandbox(memswap_limit="768m")._ensure_container()
+
+        assert "memswap_limit" not in fake_client.containers.kwargs
+
     def test_cpu_limit_converts_cores_to_nano_cpus(self, fake_client):
         _sandbox(cpus=1.5)._ensure_container()
 

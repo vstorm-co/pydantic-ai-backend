@@ -1230,10 +1230,14 @@
     String(value).replace(/[&<>"']/g, (char) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 
+  // Hibernated is not stopped: the session is intact and its next request wakes
+  // it, so an operator reading a red badge would be chasing nothing.
   const stateBadge = (row) =>
     row.alive
       ? '<span class="pill pill--good"><i class="dot dot--live"></i>running</span>'
-      : '<span class="pill pill--bad"><i class="dot"></i>stopped</span>';
+      : row.state === "hibernated"
+        ? '<span class="pill pill--info"><i class="dot"></i>asleep</span>'
+        : '<span class="pill pill--bad"><i class="dot"></i>stopped</span>';
 
   function toast(message, kind) {
     const node = document.createElement("p");
@@ -1607,10 +1611,13 @@
       return "Reading the stored workspace off the host volume — no container is started, " +
         "so this works for a session that has already been reaped. Only " + workDir + " is kept.";
     }
-    return row && row.alive
-      ? "Reading the running sandbox, so the whole filesystem is visible."
-      : "This session is stopped: reading it live restarts its container. " +
-        "Switch to the stored workspace to browse without starting anything.";
+    if (row && row.alive) {
+      return "Reading the running sandbox, so the whole filesystem is visible.";
+    }
+    const why = row && row.state === "hibernated"
+      ? "This session is asleep: it gave up its sandbox to free a slot, and reading it live wakes it. "
+      : "This session is stopped: reading it live restarts its container. ";
+    return why + "Switch to the stored workspace to browse without starting anything.";
   }
 
   async function loadDir(path) {
@@ -1916,10 +1923,13 @@
 
       sessions = listing.sessions || [];
       const live = sessions.filter((row) => row.alive).length;
-      const stopped = sessions.length - live;
+      const asleep = sessions.filter((row) => !row.alive && row.state === "hibernated").length;
+      const stopped = sessions.length - live - asleep;
       el.statSessions.textContent = sessions.length;
       el.statLimit.textContent = listing.limit === null ? "/ ∞" : "/ " + listing.limit;
-      el.statLive.textContent = live + " running" + (stopped ? ", " + stopped + " stopped" : "");
+      el.statLive.textContent = live + " running"
+        + (asleep ? ", " + asleep + " asleep" : "")
+        + (stopped ? ", " + stopped + " stopped" : "");
 
       if (wantUsage) {
         const memory = sessions.reduce(

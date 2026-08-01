@@ -210,6 +210,7 @@ class TestWireCoupling:
             "runtime",
             "tenant",
             "alive",
+            "state",
             "created_at",
             "last_activity",
             "idle_seconds",
@@ -217,6 +218,18 @@ class TestWireCoupling:
         }
 
         assert read <= set(wire.SessionInfo.model_fields)
+
+    def test_the_session_states_it_branches_on_are_the_wire_ones(self):
+        """A renamed state would silently badge every asleep session as dead."""
+        from typing import get_args
+
+        from pydantic_ai_backends.remote import wire
+
+        states = get_args(wire.SessionInfo.model_fields["state"].annotation)
+
+        assert "hibernated" in states
+        for state in states:
+            assert f'"{state}"' in PAGE or f">{state}<" in PAGE
 
     def test_the_usage_fields_it_reads_all_exist(self):
         from pydantic_ai_backends.remote import wire

@@ -232,12 +232,17 @@ SandboxdConfig(
     token=token,
     runtimes=SUGGESTED_RUNTIMES,
     prewarm=True,  # build and pull the allowlist at startup, not on a request
-    persist_containers=True,  # a reaped session restarts instead of rebuilding
+    persist_containers=True,  # a woken session restarts instead of rebuilding
     tmpfs_size="64m",  # scratch writes stay in RAM, off the overlay
     cpu_shares=1024,  # weight rather than a hard cap, so idle cores get used
     cpus=None,
 )
 ```
+
+None of them moves the ceiling as far as separating resident sessions from open
+ones does — see [A working set, not a hard cap](#a-working-set-not-a-hard-cap),
+which is where the order-of-magnitude is. These four are what make each resident
+session cheap once that split is in place.
 
 **`prewarm`** pulls and builds the whole allowlist in the background as the
 service starts, sequentially so several builds do not fight over one small host.
@@ -274,6 +279,45 @@ Images superseded by a build are removed as it finishes. The tag embeds a digest
 of the runtime, so every edit mints a new one and would otherwise leave a few
 hundred megabytes behind for good — an image still backing a running container is
 left alone.
+
+### What the host is worth, before any of the above
+
+Three changes outside this library, in descending order of megabytes recovered.
+None of them needs a code change here.
+
+**`crun` as the daemon's default runtime.** `runc` is Go, with a garbage
+collector and a supervising process per container; `crun` is the same interface
+in C. Reported at roughly twice the container-lifecycle speed and 30–40% less
+per-container overhead, which at a hundred sessions is a gigabyte the sandboxes
+get instead:
+
+```json
+{ "default-runtime": "crun", "runtimes": { "crun": { "path": "/usr/bin/crun" } } }
+```
+
+This is a different question from `oci_runtime`, which selects an *isolation
+model* per runtime alias. `crun` is a faster `runc`, not a different boundary, so
+it belongs in the daemon's own config where it applies to everything.
+
+**`zram`, and then `memswap_limit`.** A sandbox is denied swap by default —
+`memswap_limit` is pinned to `mem_limit` — because a container swapping to a disk
+starves every other one on the host. That reasoning does not hold when swap is
+`zram`: the pages stay in RAM compressed, idle Python heaps at roughly 3:1, and
+the alternative to a little swapping is an OOM kill mid-command. On a host with
+`zram` configured, and only there:
+
+```python
+SandboxdConfig(token=token, mem_limit="384m", memswap_limit="512m")
+```
+
+**One base image across the allowlist.** Read-only pages are shared between
+containers only when the layer is literally the same file. Runtimes built from
+one `python:3.12-slim` share the interpreter and the standard library; runtimes
+built from different bases share nothing. `SUGGESTED_RUNTIMES` is arranged this
+way — every Python entry on `python:3.12-slim`, every Node one on `node:20-slim`
+— and a custom allowlist is worth checking against the same rule. It is also the
+reason containers beat microVMs badly on a small host: a microVM caches those
+pages once per guest, so a hundred of them hold a hundred copies.
 
 ### The library matters more than the tuning
 
@@ -362,22 +406,41 @@ sessions nobody is using: an agent is turned away while a hundred containers sit
 idle holding slots.
 
 `evict_idle_after` changes that. At the ceiling, the least recently used session
-idle for at least that long is closed to make room:
+idle for at least that long is **hibernated** to make room:
 
 ```python
 SandboxdConfig(
     token=token,
-    max_sessions=100,  # live sandboxes — the working set
+    max_sessions=10,  # resident sandboxes — what the RAM has to hold
+    max_open_sessions=200,  # sessions that exist — what the disk has to hold
     evict_idle_after=120,  # idle two minutes? your slot can be reused
     workspace_root="/var/lib/sandboxd",
     persist_containers=True,
 )
 ```
 
-With a workspace on disk, eviction costs the evicted session nothing but its
-container: its next request re-attaches, finds its files, and pays a container
-start — measured at 0.09 s for a persisted one. So the number of sessions that
-may *exist* becomes unbounded while the number *running at once* stays at 100.
+Hibernating is not closing. The container, the process supervising it and the
+memory both hold are given up; the session's token, its runtime, its event log
+and its files stay. Its next request wakes it, finds its work, and pays a
+container start — measured at 0.09 s for a persisted one. Nothing the client
+holds stops being valid, so it never has to learn that any of this happened.
+
+That splits one number into two, which is the point:
+
+- **`max_sessions`** bounds *resident* sandboxes. This is the RAM number: it
+  times the largest runtime ceiling is the worst case the host must survive.
+- **`max_open_sessions`** bounds sessions that *exist*, resident and hibernated
+  together. This is the disk number, and it is properly much larger. At the
+  ceiling the session that has been asleep longest is closed for good; with every
+  open session resident, the caller gets `429`.
+
+On a small host that gap is the whole design. Ten resident sessions at 384 MB is
+a machine that fits in 4 GB; two hundred open ones is what it can advertise.
+
+A hibernated session shows in `GET /sessions` with `state: "hibernated"` and
+`alive: false`, and as **asleep** in the dashboard. `idle_timeout` still ends it:
+a session asleep longer than that is closed on the next sweep, since one nobody
+came back to is one nobody is coming back to.
 
 Two deliberate limits on it:
 
@@ -385,10 +448,15 @@ Two deliberate limits on it:
   `evict_idle_after` are candidates, because killing an agent's work to serve
   somebody else's first request is worse than making them wait. With every
   session genuinely busy the caller still gets `429` — backpressure is the honest
-  answer there, not an unbounded queue.
-- **It requires `workspace_root`.** Evicting a session whose files live only in
-  its container would discard them silently, so the configuration refuses rather
-  than making that trade quietly.
+  answer there, not an unbounded queue. Waking is subject to the same rule: a
+  hibernated session whose slot cannot be freed is answered `429` rather than
+  taking one from somebody working.
+- **It requires `workspace_root`.** Hibernating a session whose files live only
+  in its container would discard them silently, so the configuration refuses
+  rather than making that trade quietly.
+- **What does not survive is process state.** A hibernated session's background
+  processes — a dev server left running through the console toolset — are stopped
+  with the container. Files survive; a long-lived process does not.
 
 `max_sessions=None` removes the ceiling entirely, for hosts where something else
 does the bounding.
@@ -504,12 +572,15 @@ all needs to know why.
 
 ## Capacity and reaping
 
-- `max_sessions` caps concurrency; beyond it, opening a session answers `429`
-  rather than starting unbounded containers. `max_sessions_per_tenant` applies the
-  same ceiling per `tenant` label.
+- `max_sessions` caps *resident* sandboxes; beyond it, opening a session either
+  hibernates an idle one or answers `429` rather than starting unbounded
+  containers. `max_open_sessions` caps how many sessions exist at all, resident
+  and hibernated together. `max_sessions_per_tenant` applies a ceiling per
+  `tenant` label.
 - `idle_timeout` reaps sessions that have gone quiet, and the reaping is visible
   to the service's own bookkeeping — a reaped session's token and event log are
-  released with it.
+  released with it. It applies to hibernated sessions too, which the sweep ends
+  once they have been asleep that long.
 - `execute_timeout` clamps every command, so one client cannot occupy a worker
   indefinitely.
 - `workspace_ttl` sweeps workspaces no session has opened for that long, on the

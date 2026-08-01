@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **An evicted session is hibernated rather than closed.** At the ceiling, `sandboxd` used to close the least recently used idle session: its container went, and so did its token, its event log and the caller's ability to come back to it. It now gives up only the sandbox. The record stays, `GET /sessions` reports it as `state: "hibernated"`, and the next request wakes it where it left off — measured at 0.09 s for a persisted container. Nothing a client holds stops being valid.
+- **`SandboxdConfig.max_open_sessions`**, which is the point of the above. `max_sessions` now means *resident* sandboxes — the number the host's RAM has to hold — while `max_open_sessions` bounds the sessions that exist at all, resident and hibernated together, which is a disk number and properly much larger. On a 4 GB host that is ten resident against a couple of hundred open. At the open ceiling the longest-asleep session is closed for good; with every open session in use, the caller gets `429`. A hibernated session is ended by `idle_timeout` like any other.
+- **`memswap_limit` on `DockerSandbox`, `SandboxRuntime` and `SandboxdConfig`.** Swap is still pinned to `mem_limit` by default, because a container swapping to a disk starves every other one on the host. That is the wrong trade where swap is `zram`: the pages stay in RAM compressed at roughly 3:1, and the alternative to a little swapping is an OOM kill mid-command. Set it above `mem_limit` there and nowhere else.
+- **`scripts/bench_density.py`**, which measures on the host being sized what no blog post can: marginal `MemAvailable` per session, per-container management overhead, time to first command, and wake latency from hibernation. Reasoning behind it in [`docs/plans/sandbox-density-on-small-hosts.md`](docs/plans/sandbox-density-on-small-hosts.md).
+
 ## [0.2.18] - 2026-08-01
 
 ### Added
