@@ -33,7 +33,42 @@ NODE_WORK_DIR = "/app"
 """Node tooling resolves `node_modules` from the working directory, so the
 JavaScript runtimes install into the directory they also run in."""
 
+CODING_TOOLS = "git curl ca-certificates ripgrep fd-find jq less procps"
+"""What an agent needs to *look* at a codebase, and what each part costs.
+
+Measured over `python:3.12-slim` (41.5 MB): `git` is 33.1 MB and unavoidable,
+and `ripgrep`, `fd-find`, `jq`, `less` and `procps` come to **4.3 MB between
+them**. Leaving those out to save four megabytes is a bad trade at any image
+size — without `rg` an agent falls back to `grep -r`, which floods its own
+context with matches from `node_modules` and `.git`, and without `procps` it has
+no `ps` or `kill`, so backgrounding a server is a one-way door.
+
+Deliberately absent is `build-essential`: 94 MB, more than doubling a minimal
+runtime, to compile wheels that manylinux already ships built.
+"""
+
 BUILTIN_RUNTIMES: dict[str, RuntimeConfig] = {
+    "coding": RuntimeConfig(
+        name="coding",
+        description="Python with git, ripgrep, fd, jq and uv — the runtime for working on code",
+        base_image="python:3.12-slim",
+        setup_commands=[
+            f"apt-get update && apt-get install -y --no-install-recommends {CODING_TOOLS} "
+            # Debian ships the binary as `fdfind` because of a name clash, and a
+            # model that has read fd's documentation types `fd`.
+            "&& ln -s /usr/bin/fdfind /usr/local/bin/fd "
+            "&& rm -rf /var/lib/apt/lists/*",
+            # A single binary rather than `pip install uv`: 19.9 MB against
+            # 23.8 MB, and nothing lands in site-packages for user code to
+            # collide with. Second, because the installer needs the curl the
+            # line above provides.
+            "curl -fsSL https://astral.sh/uv/install.sh "
+            "| env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh",
+        ],
+        # No libraries: what an agent needs here is tools, and whatever the
+        # project it is working on declares. `uv` is what makes installing those
+        # cheap — measured at 5-7x pip on the same package set.
+    ),
     "polyglot": RuntimeConfig(
         name="polyglot",
         description="Python and Node together, with curl and git — installs more on demand",
@@ -43,6 +78,11 @@ BUILTIN_RUNTIMES: dict[str, RuntimeConfig] = {
             # in the image once the install is done.
             "apt-get update && apt-get install -y --no-install-recommends "
             "curl ca-certificates git nodejs npm && rm -rf /var/lib/apt/lists/*",
+            # Debian's Node is current (20.19.2 against node:20-slim's 20.20.2),
+            # but its npm is a major version behind at 9.2.0. Upgrading only npm
+            # costs a few megabytes and avoids a runtime that quietly behaves
+            # differently from the dedicated Node ones.
+            "npm install -g npm@10 && npm cache clean --force",
         ],
         # Deliberately without pandas: at 97 MB of import it would take a third of
         # a 256 MB sandbox before doing any work, and DuckDB and Polars answer the

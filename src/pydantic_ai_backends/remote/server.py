@@ -189,6 +189,12 @@ def _as_runtime(entry: str | SandboxRuntime) -> SandboxRuntime:
 
 
 DEFAULT_RUNTIMES: dict[str, SandboxRuntime] = {
+    "coding": SandboxRuntime(
+        runtime="coding",
+        # Needs the network for the reason it exists: an agent working on code
+        # installs what the project declares.
+        network_mode="bridge",
+    ),
     "python": SandboxRuntime(
         image="python:3.12-slim",
         description="Python 3.12, standard library only",
@@ -200,13 +206,26 @@ DEFAULT_RUNTIMES: dict[str, SandboxRuntime] = {
 }
 """What a service allows when its operator names nothing.
 
-Deliberately two ready-made images and no ceilings of their own: a default that
-built package sets would make the first session of a fresh deployment take
-minutes, and a default that raised ceilings would size the host on the operator's
-behalf. Richer catalogues are opt-in — see :data:`SUGGESTED_RUNTIMES`.
+No ceilings of their own, because a default that raised them would size the host
+on the operator's behalf. Richer catalogues are opt-in — see
+:data:`SUGGESTED_RUNTIMES`.
+
+`coding` is the exception to "nothing here builds an image", and it is the
+default because a sandbox for an agent working on code without `git` is not one.
+Measured at 99.7 MB and eleven seconds to build; `prewarm` — on by default —
+does it as the service starts rather than inside somebody's first request. A
+host that cannot reach a Debian mirror will fail to build it, which `prewarm`
+logs and skips; `python` and `node` stay here as ready-made fallbacks for
+exactly that case.
 """
 
 SUGGESTED_RUNTIMES: dict[str, SandboxRuntime] = {
+    "coding": SandboxRuntime(
+        runtime="coding",
+        mem_limit="1g",
+        cpus=2.0,
+        network_mode="bridge",
+    ),
     "polyglot": SandboxRuntime(
         runtime="polyglot",
         # The generalist: an agent that writes a script, a page and a stylesheet,
@@ -313,7 +332,12 @@ class SandboxdConfig:
             its own ceilings and, if it needs them, packages to build in. A
             request naming anything else is rejected; this is what stops a client
             from running an image of its choosing.
-        default_runtime: Alias used when a request names none.
+        default_runtime: Alias used when a request names none. Empty — the
+            default — takes the first entry in `runtimes`, so the shipped
+            allowlist defaults to `coding` while an operator who supplies their
+            own gets whichever they listed first. Naming a specific alias here
+            still wins; what it no longer does is force every custom allowlist
+            to contain a particular key.
         max_sessions: Ceiling on *resident sandboxes* across the service, or
             `None` for no ceiling. Together with the largest per-runtime memory
             ceiling this is what bounds the worst case an operator has to size
@@ -431,7 +455,7 @@ class SandboxdConfig:
     runtimes: Mapping[str, str | SandboxRuntime] = field(
         default_factory=lambda: dict(DEFAULT_RUNTIMES)
     )
-    default_runtime: str = "python"
+    default_runtime: str = ""
     max_sessions: int | None = 20
     max_open_sessions: int | None = None
     max_sessions_per_tenant: int | None = None
@@ -462,6 +486,8 @@ class SandboxdConfig:
             raise ValueError("SandboxdConfig.token must not be empty")
         if not self.runtimes:
             raise ValueError("SandboxdConfig.runtimes must allow at least one image")
+        if not self.default_runtime:
+            self.default_runtime = next(iter(self.runtimes))
         if self.default_runtime not in self.runtimes:
             raise ValueError(
                 f"default_runtime {self.default_runtime!r} is not in runtimes "

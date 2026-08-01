@@ -2148,11 +2148,20 @@ class TestRuntimePolicyReporting:
 class TestShippedCatalogues:
     """What an operator gets by default, and what they can opt into."""
 
-    def test_the_default_allowlist_builds_nothing(self):
-        """A fresh deployment's first session must not wait on an image build."""
+    def test_only_the_coding_runtime_builds_by_default(self):
+        """`coding` is the one entry worth a build, and it is not left alone.
+
+        A sandbox for an agent working on code without `git` is not one, so the
+        default pays for a build — covered by `prewarm` at startup rather than
+        inside a request. The ready-made entries stay beside it so a host that
+        cannot reach a Debian mirror still has something that runs.
+        """
         from pydantic_ai_backends.remote.server import DEFAULT_RUNTIMES
 
-        assert all(not entry.builds for entry in DEFAULT_RUNTIMES.values())
+        building = {alias for alias, entry in DEFAULT_RUNTIMES.items() if entry.builds}
+
+        assert building == {"coding"}
+        assert set(DEFAULT_RUNTIMES) - building
 
     def test_the_default_allowlist_is_the_config_default(self):
         from pydantic_ai_backends.remote.server import DEFAULT_RUNTIMES
@@ -2160,7 +2169,24 @@ class TestShippedCatalogues:
         config = SandboxdConfig(token="t")
 
         assert set(config.runtimes) == set(DEFAULT_RUNTIMES)
-        assert config.default_runtime in config.runtimes
+        assert config.default_runtime == "coding"
+
+    def test_a_custom_allowlist_defaults_to_whichever_entry_is_listed_first(self):
+        """Naming a fixed alias would make every custom allowlist carry that key."""
+        config = SandboxdConfig(token="t", runtimes={"mine": "img", "other": "img2"})
+
+        assert config.default_runtime == "mine"
+
+    def test_naming_one_explicitly_still_wins(self):
+        config = SandboxdConfig(
+            token="t", runtimes={"mine": "img", "other": "img2"}, default_runtime="other"
+        )
+
+        assert config.default_runtime == "other"
+
+    def test_naming_one_that_is_not_allowed_is_still_refused(self):
+        with pytest.raises(ValueError, match="is not in runtimes"):
+            SandboxdConfig(token="t", runtimes={"mine": "img"}, default_runtime="absent")
 
     def test_the_suggested_catalogue_is_usable_as_is(self):
         from pydantic_ai_backends.remote.server import SUGGESTED_RUNTIMES
@@ -2184,8 +2210,9 @@ class TestShippedCatalogues:
             alias for alias, entry in SUGGESTED_RUNTIMES.items() if entry.network_mode == "bridge"
         }
 
-        # Scraping fetches pages; polyglot exists to install what it is missing.
-        assert online == {"python-scraping", "polyglot"}
+        # Scraping fetches pages; polyglot exists to install what it is missing;
+        # coding installs whatever the project it is working on declares.
+        assert online == {"python-scraping", "polyglot", "coding"}
 
 
 class TestTmpfsAndCpuShares:
