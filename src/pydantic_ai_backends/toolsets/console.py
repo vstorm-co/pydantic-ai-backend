@@ -101,6 +101,17 @@ GREP_LINE_WIDTH = 100
 
 DEFAULT_EXECUTE_TIMEOUT = 120
 
+EXECUTE_TOOLS = frozenset(
+    {"execute", "run_in_background", "read_output", "kill_shell", "list_shells"}
+)
+"""Every tool the "execute" operation governs.
+
+Named as a set because listing only `execute` is how a ruleset that denied shell
+execution still left `run_in_background` — which runs an arbitrary command —
+registered for the model to call. The background tools are the same operation
+reached a different way, so they live and die with it.
+"""
+
 
 @runtime_checkable
 class ConsoleDeps(Protocol):
@@ -466,18 +477,24 @@ the old_string must appear exactly once in the file.
             raw_backend = backend_for(ctx)
             backend = ensure_async(raw_backend)
 
-            stale = await _tracking.staleness_error(backend, raw_backend, path)
-            if stale is not None:
-                return stale
+            # Locked for the same reason `hashline_edit` is: every backend's
+            # `edit` is a read, a replace and a write, so two edits to one path
+            # in flight together lose one of them. The staleness check belongs
+            # inside the lock too — checked outside, it is answered before the
+            # other edit's write and passes on content that no longer exists.
+            async with _tracking.edit_lock(raw_backend, path):
+                stale = await _tracking.staleness_error(backend, raw_backend, path)
+                if stale is not None:
+                    return stale
 
-            result = await backend.edit(path, old_string, new_string, replace_all)
-            if result.error:
-                return f"Error: {result.error}"
+                result = await backend.edit(path, old_string, new_string, replace_all)
+                if result.error:
+                    return f"Error: {result.error}"
 
-            # The agent's view is the post-edit content now, so a follow-up edit
-            # must not be flagged as stale.
-            await _tracking.record_path_read(backend, raw_backend, path)
-            return f"Edited {result.path}: replaced {result.occurrences} occurrence(s)"
+                # The agent's view is the post-edit content now, so a follow-up
+                # edit must not be flagged as stale.
+                await _tracking.record_path_read(backend, raw_backend, path)
+                return f"Edited {result.path}: replaced {result.occurrences} occurrence(s)"
 
     @toolset.tool(description=described.get("glob", GLOB_DESCRIPTION))
     @_degrade_on_error
@@ -692,7 +709,7 @@ def _denied_tools(permissions: PermissionRuleset | None) -> set[str]:
     if _ruleset.is_denied(permissions, "edit"):
         denied.update({"edit_file", "hashline_edit"})
     if _ruleset.is_denied(permissions, "execute"):
-        denied.add("execute")
+        denied |= EXECUTE_TOOLS
     return denied
 
 

@@ -375,3 +375,34 @@ class TestPermissionErrors:
         )
         error = PermissionDeniedError("execute", "rm -rf /", rule)
         assert "Dangerous command blocked" in str(error)
+
+
+class TestAnUnrenderablePatternIsInert:
+    """`[\\]` renders to `^[\\]$`, which `re` rejects as an unterminated set.
+
+    A rule carrying one used to raise `re.error` out of the permission check,
+    which every caller is promised only ever returns an action.
+    """
+
+    def test_it_compiles_to_something_that_matches_nothing(self):
+        compiled = glob_to_regex("[\\]")
+
+        assert compiled.match("") is None
+        assert compiled.match("[\\]") is None
+        assert compiled.match("anything at all") is None
+
+    def test_a_rule_carrying_one_does_not_raise(self):
+        checker = PermissionChecker(
+            ruleset=PermissionRuleset(
+                read=OperationPermissions(
+                    default="allow",
+                    rules=[PermissionRule(pattern="[\\]", action="deny")],
+                )
+            )
+        )
+
+        assert checker.check_sync("read", "/notes.md") == "allow"
+
+    def test_a_well_formed_class_still_works(self):
+        assert matches_pattern("a.py", "[ab].py")
+        assert not matches_pattern("c.py", "[ab].py")

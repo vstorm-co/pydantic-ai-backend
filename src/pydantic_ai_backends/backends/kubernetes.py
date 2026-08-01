@@ -417,11 +417,12 @@ class KubernetesPodSandbox(BaseSandbox):
             return [_to_file_info(row) for row in r.json()]
         return super().glob_info(pattern, path)
 
-    def write(self, path: str, content: str) -> WriteResult:
+    def write(self, path: str, content: str | bytes) -> WriteResult:
         self.touch()
         if self._mode == "http":
             try:
-                payload = base64.b64encode(content.encode("utf-8")).decode("ascii")
+                raw = content if isinstance(content, bytes) else content.encode("utf-8")
+                payload = base64.b64encode(raw).decode("ascii")
                 r = self._http.post("/write", json={"path": path, "content_b64": payload})
                 r.raise_for_status()
             except Exception as exc:

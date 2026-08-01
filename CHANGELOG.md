@@ -7,6 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.21] - 2026-08-01
+
+A full audit of the codebase, and the ten findings it produced. Nothing here is a
+new feature; several are behaviour changes, and the security one is worth reading
+before upgrading is deferred.
+
+### Security
+
+- **A denied `execute` now removes every shell tool, not just `execute`.**
+  `create_console_toolset(permissions=...)` promises that an operation defaulting
+  to `"deny"` drops its tools entirely, and `_denied_tools` listed only
+  `execute` — so `run_in_background`, which runs an arbitrary command, stayed
+  registered. With the shipped `READONLY_RULESET`, whose docstring reads "nothing
+  may change or run", the model was still handed a working shell.
+  `ConsoleCapability` was worse: the background tools were absent from
+  `TOOL_OPERATIONS`, and an unmapped name is both kept by `prepare_tools` and
+  waved through `before_tool_execute` unchecked, so no permission check ran on
+  them at all — via the example in the capability's own module docstring. All
+  five tools now live and die with the `execute` operation, the capability passes
+  its ruleset to the toolset as well as filtering per request, and a test asserts
+  the tool/operation map covers every registered tool so the next tool cannot
+  repeat this.
+
+- **`grep_raw` no longer interpolates the pattern into a shell command
+  unquoted.** Every other value in `_shell` goes through `shlex.quote`; the grep
+  pattern and glob were wrapped in literal single quotes, which one of their own
+  closed. A search for `don't` produced an unterminated command and a crafted
+  pattern ran whatever followed it, on `DockerSandbox`, `DaytonaSandbox`,
+  `KubernetesPodSandbox(mode="api")` and any third-party `BaseSandbox` subclass.
+  Both are quoted now, and the pattern is passed with `-e` so one starting with
+  `-` is a pattern rather than an option.
+
+### Fixed
+
+- **`path="."` no longer returns nothing on the virtual-path backends.**
+  `normalize_path` prefixed a slash without resolving the segment, so `"."` — the
+  console toolset's default for `ls` and `glob` — became `"/."`, a directory no
+  file is ever stored under. `StateBackend` and `CompositeBackend` therefore
+  answered every default listing, glob and grep with nothing at all, and an agent
+  was told its workspace was empty with no error anywhere. `"/"`, `""`, `"."` and
+  `"./"` now all mean the root, and the composite's fan-out recognises them.
+
+- **`SessionManager.release` takes the session's lock.** It mutated `_sessions`
+  and `_locks` with no lock at all, so a release landing inside a concurrent
+  `get_or_create` deleted the entry that call was about to delete — a `KeyError`
+  out of a public coroutine — and deleted the lock it was holding, after which
+  the next caller interned a fresh one and two tasks created a sandbox for one
+  session. Locks are now reference-counted while in use rather than pruned on
+  `Lock.locked()`, which reads False between a holder releasing and the woken
+  waiter resuming.
+
+- **The service's command ceiling applies to every operation.**
+  `SandboxdConfig.execute_timeout` is documented as "a hard ceiling applied to
+  every command, so one client cannot occupy a worker indefinitely" and was
+  applied to `/exec` alone. `ls`, `glob`, `grep`, `read` and `write` reach the
+  sandbox's shell too, and `BaseSandbox` passed a timeout for `exists` and
+  nothing else — so one slow search pinned a worker thread that nothing could
+  reclaim, and `max_workers` of them wedged the service. The derived operations
+  now carry `FILE_OP_TIMEOUT` (30s) or `SEARCH_TIMEOUT` (120s), and every
+  sandboxd operation route is bounded by the ceiling, answering `504` past it.
+
+- **`RemoteSandbox` waits as long as the service will run a command.**
+  `TRANSPORT_SLACK_SECONDS` exists so the transport never gives up first, but the
+  client's default (60s) and the service's ceiling (300s) were set independently.
+  Anything in between was reported to the agent as `sandbox service unavailable`
+  while the command was in fact still running — and typically retried, starting a
+  second one. The ceiling is now read from `GET /policy` when the session opens
+  and exposed as `RemoteSandbox.server_timeout`, falling back to the local
+  timeout when the service will not say.
+
+- **Shell-derived `write` and `read_bytes` carry binary intact.** The protocol
+  types `content` as `str | bytes`; both base classes narrowed it to `str`, and
+  the heredoc interpolated bytes as their Python repr — writing the 17 characters
+  `b'\x89PNG\r\n'` into the file with no error. `read_bytes` was lossy in the
+  other direction: `cat` returns its output through an exec stream a sandbox
+  decodes with `errors="replace"`, so every byte that is not UTF-8 came back as
+  U+FFFD. Both now travel base64-encoded, so a file written through one and read
+  through the other is byte-identical — which is what the console toolset's
+  `image_support` needs on a shell-derived sandbox. The write side also stops
+  appending the trailing newline a heredoc could not avoid: `write(path, "x\n")`
+  produced `"x\n\n"`.
+
+  Two consequences. **The sandbox image needs `base64`** (GNU coreutils and
+  BusyBox both provide it, alongside the `cat` this replaces). And a `read_bytes`
+  whose output is truncated by the execute ceiling now returns `b""` rather than
+  a prefix: base64 cut short decodes to bytes that are not the file's, and the
+  caller cannot tell a wrong answer from a right one.
+
+  Verified byte-for-byte over all 256 byte values against real `python:3.12-slim`,
+  `node:20-slim` and `alpine:3.20` containers, which CI does not cover.
+
+- **`LocalBackend.edit` returns its failure instead of raising.** It read the
+  file as strict UTF-8 and caught only `PermissionError` and `OSError`;
+  `UnicodeDecodeError` subclasses `ValueError`, so a file that is not text raised
+  straight out of a backend the protocol promises never raises. It is now refused
+  with an error, and the file is left untouched — decoding with replacement would
+  substitute U+FFFD and write it back.
+
+- **`edit_file` serializes on the same lock `hashline_edit` uses.** Both are a
+  read, a replace and a write; only one was locked, so two concurrent edits to a
+  path lost one of them. The staleness check moved inside the lock too — checked
+  outside, it was answered before the other edit's write.
+
+- **`LocalBackend.ls_info` survives an entry that vanishes mid-listing.**
+  `glob_info` was hardened against exactly this and its sibling was not, so a
+  file removed between `iterdir` and `stat` raised out of the whole listing and
+  took the directory's other rows with it.
+
+- **`ConsoleCapability` accepts `ask_callback` and `ask_fallback`.** It exposed
+  `permissions` but built its checker with the defaults, so every operation
+  resolving to `"ask"` raised `PermissionAskError` with no way to answer it —
+  which made `DEFAULT_RULESET` and `STRICT_RULESET` unusable through the
+  capability. It also gained `include_background`.
+
+- **Smaller ones.** `StateBackend` reported a size one byte short per line and
+  silently corrupted non-UTF-8 writes (`write`/`read_bytes` now round-trip byte
+  for byte via `surrogateescape`); `sandboxd`'s `/events` raised `KeyError` — a
+  500 — where its sibling `describe` correctly 404s on the same race; a malformed
+  glob in a permission rule raised `re.error` out of the permission check and is
+  now inert; and a docstring in `ServicePolicy` sat under the wrong field.
+
 ## [0.2.20] - 2026-08-01
 
 ### Added

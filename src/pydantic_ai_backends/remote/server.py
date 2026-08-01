@@ -52,13 +52,13 @@ import stat
 import time
 import uuid
 from collections import Counter, deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, TypeVar, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
@@ -89,6 +89,8 @@ if TYPE_CHECKING:
     from pydantic_ai_backends.protocol import AsyncSandboxProtocol
 
 _logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 SandboxBuilder = Callable[[str, "SandboxRuntime"], Any]
 """Builds a sandbox for the service: `(session_id, runtime) -> sandbox`."""
@@ -1307,8 +1309,16 @@ class _Service:
                 record.next_seq += 1
 
     def events(self, session_id: str, after: int) -> wire.SessionEvents:
-        """Activity entries newer than `after`, for incremental polling."""
-        record = self._sessions[session_id]
+        """Activity entries newer than `after`, for incremental polling.
+
+        Raises:
+            HTTPException: 404 when the session was reaped between the
+                authorization check and this call, matching :meth:`describe` —
+                a subscript here turned that race into a 500.
+        """
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"No such session: {session_id}")
         return wire.SessionEvents(
             events=[event for event in record.events if event.seq > after],
             latest_seq=record.next_seq - 1,
@@ -1762,6 +1772,33 @@ class _Service:
             return self.config.execute_timeout
         return min(requested, self.config.execute_timeout)
 
+    async def bounded(self, operation: Awaitable[_T]) -> _T:
+        """Await one sandbox operation under the service's command ceiling.
+
+        `execute_timeout` is documented as applying to every command, and it was
+        applied to `/exec` alone. Everything else — `ls`, `glob`, `grep`, `read`,
+        `write` — reaches the sandbox's shell too, and an uncapped one of those
+        occupies a worker thread that nothing reclaims: a grep over a large tree
+        is enough, and `max_workers` of them wedge the service. Enforced here
+        rather than per backend so the promise is kept in the one place that
+        makes it.
+
+        The thread running the call cannot be interrupted, so this bounds how
+        long a *client* waits rather than how long the command runs. The
+        backend's own per-operation timeouts bound the command; this is what
+        stops the request from outliving them.
+
+        Raises:
+            HTTPException: 504 when the operation outlasts the ceiling.
+        """
+        try:
+            return await asyncio.wait_for(operation, timeout=self.config.execute_timeout)
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Operation exceeded the {self.config.execute_timeout}s service ceiling",
+            ) from exc
+
 
 def _service_of(request: Request) -> _Service:
     """Pull the service off application state."""
@@ -1920,8 +1957,13 @@ def _register_operation_routes(app: FastAPI, service: _Service) -> None:
         """Run a shell command, capped by the service's `execute_timeout`."""
         sandbox = await service.sandbox(session_id)
         with service.observe(session_id, "exec", body.command) as outcome:
-            result = await service.adapter(sandbox).execute(
-                body.command, service.command_timeout(body.timeout_seconds)
+            # Both: the clamped timeout kills the command inside the sandbox,
+            # and `bounded` stops a backend that ignores it from holding the
+            # request — and its worker — for ever.
+            result = await service.bounded(
+                service.adapter(sandbox).execute(
+                    body.command, service.command_timeout(body.timeout_seconds)
+                )
             )
             outcome.ok = result.exit_code == 0
             outcome.detail = f"exit {result.exit_code}"
@@ -1934,7 +1976,9 @@ def _register_operation_routes(app: FastAPI, service: _Service) -> None:
         """Read a slice of a text file."""
         sandbox = await service.sandbox(session_id)
         with service.observe(session_id, "read", body.path) as outcome:
-            content = await service.adapter(sandbox).read(body.path, body.offset, body.limit)
+            content = await service.bounded(
+                service.adapter(sandbox).read(body.path, body.offset, body.limit)
+            )
             outcome.ok = not content.startswith(("Error:", "[Error"))
             outcome.detail = f"{len(content)} chars"
         return wire.ReadResponse(content=content)
@@ -1946,7 +1990,7 @@ def _register_operation_routes(app: FastAPI, service: _Service) -> None:
         """Read a whole file as base64."""
         sandbox = await service.sandbox(session_id)
         with service.observe(session_id, "read_bytes", body.path) as outcome:
-            raw = await service.adapter(sandbox).read_bytes(body.path)
+            raw = await service.bounded(service.adapter(sandbox).read_bytes(body.path))
             outcome.ok = bool(raw)
             outcome.detail = f"{len(raw)} bytes"
         return wire.ReadBytesResponse(content_b64=base64.b64encode(raw).decode("ascii"))
@@ -1965,7 +2009,7 @@ def _register_operation_routes(app: FastAPI, service: _Service) -> None:
 
         sandbox = await service.sandbox(session_id)
         with service.observe(session_id, "write", body.path) as outcome:
-            result = await service.adapter(sandbox).write(body.path, raw)
+            result = await service.bounded(service.adapter(sandbox).write(body.path, raw))
             outcome.ok = result.error is None
             outcome.detail = result.error or f"{len(raw)} bytes"
         return wire.WriteResponse(path=result.path, error=result.error)
@@ -1975,8 +2019,10 @@ def _register_operation_routes(app: FastAPI, service: _Service) -> None:
         """Replace a string inside a file."""
         sandbox = await service.sandbox(session_id)
         with service.observe(session_id, "edit", body.path) as outcome:
-            result = await service.adapter(sandbox).edit(
-                body.path, body.old_string, body.new_string, body.replace_all
+            result = await service.bounded(
+                service.adapter(sandbox).edit(
+                    body.path, body.old_string, body.new_string, body.replace_all
+                )
             )
             outcome.ok = result.error is None
             outcome.detail = result.error or f"{result.occurrences} replaced"
@@ -1991,7 +2037,7 @@ def _register_operation_routes(app: FastAPI, service: _Service) -> None:
         """Test whether a path is a regular file."""
         sandbox = await service.sandbox(session_id)
         with service.observe(session_id, "exists", body.path) as outcome:
-            found = await service.adapter(sandbox).exists(body.path)
+            found = await service.bounded(service.adapter(sandbox).exists(body.path))
             outcome.ok = True
             outcome.detail = "found" if found else "missing"
         return wire.ExistsResponse(exists=found)
@@ -2001,7 +2047,7 @@ def _register_operation_routes(app: FastAPI, service: _Service) -> None:
         """List one directory."""
         sandbox = await service.sandbox(session_id)
         with service.observe(session_id, "ls", body.path) as outcome:
-            rows = await service.adapter(sandbox).ls_info(body.path)
+            rows = await service.bounded(service.adapter(sandbox).ls_info(body.path))
             outcome.ok = True
             outcome.detail = f"{len(rows)} entries"
         return [wire.FileEntry(**row) for row in rows]
@@ -2013,7 +2059,9 @@ def _register_operation_routes(app: FastAPI, service: _Service) -> None:
         """Match files by glob pattern."""
         sandbox = await service.sandbox(session_id)
         with service.observe(session_id, "glob", f"{body.pattern} in {body.path}") as outcome:
-            rows = await service.adapter(sandbox).glob_info(body.pattern, body.path)
+            rows = await service.bounded(
+                service.adapter(sandbox).glob_info(body.pattern, body.path)
+            )
             outcome.ok = True
             outcome.detail = f"{len(rows)} matches"
         return [wire.FileEntry(**row) for row in rows]
@@ -2025,8 +2073,10 @@ def _register_operation_routes(app: FastAPI, service: _Service) -> None:
         """Search file contents."""
         sandbox = await service.sandbox(session_id)
         with service.observe(session_id, "grep", body.pattern) as outcome:
-            found = await service.adapter(sandbox).grep_raw(
-                body.pattern, body.path, body.glob, body.ignore_hidden
+            found = await service.bounded(
+                service.adapter(sandbox).grep_raw(
+                    body.pattern, body.path, body.glob, body.ignore_hidden
+                )
             )
             outcome.ok = not isinstance(found, str)
             outcome.detail = found if isinstance(found, str) else f"{len(found)} matches"

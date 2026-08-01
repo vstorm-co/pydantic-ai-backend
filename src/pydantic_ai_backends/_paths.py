@@ -4,12 +4,20 @@ from __future__ import annotations
 
 
 def normalize_path(path: str) -> str:
-    """Return `path` as an absolute POSIX path without a trailing slash."""
-    if not path.startswith("/"):
-        path = "/" + path
-    if len(path) > 1 and path.endswith("/"):
-        path = path.rstrip("/")
-    return path
+    """Return `path` as an absolute POSIX path without a trailing slash.
+
+    `.` segments are dropped, so the three ways a caller spells a backend's root
+    — `"/"`, `""` and `"."` — all arrive as `"/"`. That matters because the
+    console toolset's `ls` and `glob` default to `"."`: prefixing a slash without
+    resolving it produced `"/."`, a directory no file is ever stored under, so a
+    virtual-path backend answered every default listing with nothing at all.
+
+    `..` is *not* resolved here — :func:`unsafe_path_reason` rejects it outright,
+    and resolving it in this function would quietly turn a path the caller should
+    have been told about into a valid one.
+    """
+    segments = [segment for segment in path.split("/") if segment and segment != "."]
+    return "/" + "/".join(segments) if segments else "/"
 
 
 def unsafe_path_reason(path: str) -> str | None:

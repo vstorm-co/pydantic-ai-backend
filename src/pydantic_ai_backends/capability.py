@@ -27,7 +27,11 @@ from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset
 
-from pydantic_ai_backends.permissions.checker import PermissionChecker
+from pydantic_ai_backends.permissions.checker import (
+    AskCallback,
+    AskFallback,
+    PermissionChecker,
+)
 from pydantic_ai_backends.permissions.types import (
     PermissionOperation,
     PermissionRuleset,
@@ -48,8 +52,16 @@ TOOL_OPERATIONS: dict[str, PermissionOperation] = {
     "glob": "glob",
     "grep": "grep",
     "execute": "execute",
+    # The background shells are the "execute" operation reached a different way.
+    # Left out of this map they were governed by nothing at all: an unmapped name
+    # is both kept by `prepare_tools` and waved through `before_tool_execute`, so
+    # a ruleset denying execution still handed the model `run_in_background`.
+    # `tests/test_capability.py` asserts this map covers every registered tool.
+    "run_in_background": "execute",
+    "read_output": "execute",
+    "kill_shell": "execute",
+    "list_shells": "execute",
 }
-
 """Console tool name -> the permission operation that governs it."""
 
 PATH_OPERATIONS: set[PermissionOperation] = {"read", "write", "edit"}
@@ -71,9 +83,11 @@ class ConsoleCapability(AbstractCapability[Any]):
     grep, execute) with dynamic instructions and per-tool permission control.
 
     When a permission ruleset is provided:
-    - Tools for denied operations are hidden from the model entirely
+    - Tools for denied operations are dropped from the toolset entirely, and
+      hidden again from each request's tool definitions
     - Per-path/command permissions are checked before each tool execution
-    - "ask" permissions can trigger an approval callback
+    - "ask" permissions go to `ask_callback`, and are refused or raised per
+      `ask_fallback` when there is none
 
     Example:
         ```python
@@ -107,11 +121,31 @@ class ConsoleCapability(AbstractCapability[Any]):
     include_execute: bool = True
     """Whether to include the execute tool."""
 
+    include_background: bool = True
+    """Whether to include the background-shell tools.
+
+    Separate from `include_execute` because a backend may support commands
+    without supporting long-lived ones — and because an agent that should not
+    start a process it cannot see finish wants these off while keeping `execute`.
+    """
+
     edit_format: EditFormat = "str_replace"
     """Edit format: 'str_replace' or 'hashline'."""
 
     permissions: PermissionRuleset | None = None
     """Permission ruleset for controlling tool access."""
+
+    ask_callback: AskCallback | None = None
+    """Async approval callback for operations the ruleset resolves to "ask".
+
+    Without one an "ask" cannot be answered, and `ask_fallback` decides what
+    happens instead. Every shipped preset except `PERMISSIVE_RULESET` has at
+    least one operation defaulting to "ask", so a ruleset supplied without this
+    or `ask_fallback="deny"` refuses those operations by raising.
+    """
+
+    ask_fallback: AskFallback = "error"
+    """What an unanswerable "ask" does — `"deny"` refuses it, `"error"` raises."""
 
     _toolset: AbstractToolset[Any] | None = field(default=None, init=False, repr=False)
     _checker: PermissionChecker | None = field(default=None, init=False, repr=False)
@@ -121,10 +155,19 @@ class ConsoleCapability(AbstractCapability[Any]):
         self._toolset = create_console_toolset(
             backend=self.backend,
             include_execute=self.include_execute,
+            include_background=self.include_background,
             edit_format=self.edit_format,
+            # Passed through as well as being enforced in `prepare_tools`: the
+            # toolset drops a denied operation's tools outright, so they are gone
+            # rather than merely hidden from one request's tool definitions.
+            permissions=self.permissions,
         )
         if self.permissions is not None:
-            self._checker = PermissionChecker(ruleset=self.permissions)
+            self._checker = PermissionChecker(
+                ruleset=self.permissions,
+                ask_callback=self.ask_callback,
+                ask_fallback=self.ask_fallback,
+            )
 
     @classmethod
     def get_serialization_name(cls) -> str:

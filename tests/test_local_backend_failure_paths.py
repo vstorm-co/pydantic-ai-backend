@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -504,3 +505,64 @@ class TestBackgroundExecuteFailures:
 
         assert result.exit_code == 1
         assert "cannot spawn" in result.output
+
+
+class TestEditNeverRaises:
+    """`protocol.py`: "Every method here returns its failures and never raises."
+
+    `edit` read the file as strict UTF-8 and caught only `PermissionError` and
+    `OSError`. `UnicodeDecodeError` subclasses `ValueError`, so a file that is
+    not text raised straight out of a backend that sits in an agent's tool path.
+    `read`, four lines above it, decodes the same file fine.
+    """
+
+    def test_a_non_utf8_file_is_refused_not_raised(self, tmp_path: Path):
+        backend = LocalBackend(root_dir=tmp_path)
+        (tmp_path / "bin.dat").write_bytes(b"\xff\xfe\x00binary\xc3\x28")
+
+        result = backend.edit("bin.dat", "binary", "text")
+
+        assert result.path is None
+        assert "not valid UTF-8" in (result.error or "")
+
+    def test_the_file_is_left_untouched(self, tmp_path: Path):
+        """Decoding with replacement would substitute U+FFFD and write it back."""
+        backend = LocalBackend(root_dir=tmp_path)
+        raw = b"\xff\xfe\x00binary\xc3\x28"
+        (tmp_path / "bin.dat").write_bytes(raw)
+
+        backend.edit("bin.dat", "binary", "text")
+
+        assert (tmp_path / "bin.dat").read_bytes() == raw
+
+    def test_read_still_shows_what_it_can(self, tmp_path: Path):
+        backend = LocalBackend(root_dir=tmp_path)
+        (tmp_path / "bin.dat").write_bytes(b"\xff\xfe\x00binary\xc3\x28")
+
+        assert "binary" in backend.read("bin.dat")
+
+
+class TestListingSurvivesAVanishingEntry:
+    """`glob_info` was hardened against this; `ls_info`, its sibling, was not.
+
+    A file that disappears between `iterdir` and the `stat` in `_entry_info`
+    raised `FileNotFoundError` out of the whole listing, taking the directory's
+    other rows with it.
+    """
+
+    def test_one_unstattable_entry_does_not_lose_the_others(self, tmp_path: Path):
+        backend = LocalBackend(root_dir=tmp_path)
+        (tmp_path / "kept.txt").write_text("here")
+        (tmp_path / "vanishes.txt").write_text("gone in a moment")
+
+        real_stat = Path.stat
+
+        def stat_but_one(self: Path, *args: object, **kwargs: object):
+            if self.name == "vanishes.txt":
+                raise FileNotFoundError(self)
+            return real_stat(self, *args, **kwargs)
+
+        with patch.object(Path, "stat", stat_but_one):
+            rows = backend.ls_info(".")
+
+        assert [row["name"] for row in rows] == ["kept.txt"]

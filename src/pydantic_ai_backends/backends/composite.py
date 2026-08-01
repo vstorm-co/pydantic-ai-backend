@@ -12,7 +12,17 @@ from pydantic_ai_backends.types import EditResult, FileInfo, GrepMatch, WriteRes
 BackendT = TypeVar("BackendT")
 
 ROOT_PATHS = ("/", "")
-"""Paths that mean "everywhere", and so fan out to every backend."""
+"""Paths that mean "everywhere", and so fan out to every backend.
+
+Kept for callers that import it. Use :func:`is_root_path`, which recognises the
+other spellings — `"."` is what the console toolset's `glob` sends by default,
+and compared against this tuple it routed to one backend instead of fanning out.
+"""
+
+
+def is_root_path(path: str) -> bool:
+    """Whether `path` means "everywhere" and so fans out to every backend."""
+    return normalize_path(path) == "/"
 
 
 class PrefixRouter(Generic[BackendT]):
@@ -125,10 +135,10 @@ class CompositeBackend:
 
     def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
         """Match files, searching every backend when starting from the root."""
-        if path not in ROOT_PATHS:
+        if not is_root_path(path):
             return self._router.for_path(path).glob_info(pattern, path)
 
-        results = list(self._router.default.glob_info(pattern, path))
+        results = list(self._router.default.glob_info(pattern, "/"))
         for prefix, backend in self._router.routes.items():
             results.extend(backend.glob_info(pattern, prefix))
         return sorted(results, key=lambda x: x["path"])
@@ -145,7 +155,7 @@ class CompositeBackend:
         An error from any backend is returned as-is rather than dropped, so a
         failed search is never mistaken for no matches.
         """
-        if path is not None and path not in ROOT_PATHS:
+        if path is not None and not is_root_path(path):
             return self._router.for_path(path).grep_raw(pattern, path, glob, ignore_hidden)
 
         matches: list[GrepMatch] = []
@@ -227,10 +237,10 @@ class AsyncCompositeBackend:
 
     async def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
         """Match files, searching every backend when starting from the root."""
-        if path not in ROOT_PATHS:
+        if not is_root_path(path):
             return await self._router.for_path(path).glob_info(pattern, path)
 
-        results = list(await self._router.default.glob_info(pattern, path))
+        results = list(await self._router.default.glob_info(pattern, "/"))
         for prefix, backend in self._router.routes.items():
             results.extend(await backend.glob_info(pattern, prefix))
         return sorted(results, key=lambda x: x["path"])
@@ -243,7 +253,7 @@ class AsyncCompositeBackend:
         ignore_hidden: bool = True,
     ) -> list[GrepMatch] | str:
         """Search, covering every backend when no specific path is given."""
-        if path is not None and path not in ROOT_PATHS:
+        if path is not None and not is_root_path(path):
             return await self._router.for_path(path).grep_raw(pattern, path, glob, ignore_hidden)
 
         matches: list[GrepMatch] = []
