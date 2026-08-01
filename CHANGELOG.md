@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.18] - 2026-08-01
+
 ### Added
 
 - **`KubernetesPodSandbox` and `DaytonaSandbox` are covered.** The last two class-level `# pragma: no cover`; no blanket one remains in the package. 30 tests cover the pod-exec path, both readiness outcomes and the polling in between, liveness, config loading, the `mode="http"` listing failures and the `mode="api"` fallbacks to the shell — plus Daytona's readiness probe and failure handlers. The two exec bugs above are what the pass found.
