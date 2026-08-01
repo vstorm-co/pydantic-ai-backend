@@ -41,7 +41,12 @@ def parse_ls(result: ExecuteResponse, path: str) -> list[FileInfo]:
     if result.exit_code != 0:
         return []
 
-    quoted_path = shlex.quote(path)
+    # The *unquoted* path: a listing's rows are handed to a model, which sends
+    # them back to `read` or `edit`, which quote for the shell themselves. Built
+    # from the quoted form, a directory with a space in it produced
+    # `'/my work'/notes.md` — a path that does not exist and cannot be recovered
+    # from. Plain paths quote to themselves, which is why it went unnoticed.
+    root = path.rstrip("/")
     entries: list[FileInfo] = []
     for line in result.output.strip().split("\n")[1:]:  # The first line is the total.
         parts = line.split()
@@ -55,7 +60,7 @@ def parse_ls(result: ExecuteResponse, path: str) -> list[FileInfo]:
         entries.append(
             FileInfo(
                 name=name,
-                path=f"{quoted_path.rstrip('/')}/{name}",
+                path=f"{root}/{name}",
                 is_dir=parts[0].startswith("d"),
                 size=int(parts[4]) if parts[4].isdigit() else None,
             )
