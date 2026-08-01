@@ -204,12 +204,36 @@ default.
 
 ## What is still open
 
-- **Running as a non-root user.** `_run_kwargs` sets no `user`, so every sandbox
-  runs as uid 0. Two things follow: an escape starts from root rather than from
-  nobody, and every file the agent writes into the bind-mounted workspace is
-  owned by root *on the host*, so a `sandboxd` running unprivileged cannot clean
-  up after its own sessions. `no-new-privileges` does not help — it stops a
-  process gaining privileges it lacks, and this one already has them.
+- ~~**Running as a non-root user.**~~ Shipped as `SandboxdConfig.sandbox_uid`
+  and `RuntimeConfig.run_as_uid`. The measurements changed the design twice on
+  the way, and both corrections are worth keeping:
+
+  - **`getpwuid` was not the problem.** The note below guessed git would break
+    on a uid with no `/etc/passwd` entry. It does not — git works fine. What
+    breaks is `pip`, on `Permission denied: '/.local'`, because `HOME` defaults
+    to `/`.
+  - **`uv` was the real obstacle**, and it is not fixable with a writable home.
+    `uv` has no `--user` mode: `--system` hits permission denied on the
+    interpreter's `site-packages`, and without it there is simply no
+    environment. A virtualenv the sandbox user owns is the only design that
+    works, which is why option (1) below was not the one taken.
+  - **The container's environment overrides its image's**, so the
+    `UV_SYSTEM_PYTHON=0` the image asks for was being clobbered by the sandbox
+    default. It is dropped for an unprivileged runtime instead.
+
+  Validated on true Linux filesystem semantics rather than through a macOS bind
+  mount: `whoami`, `git commit`, `pip install`, `uv pip install` and running the
+  installed console script all succeed, while `/etc` and the system
+  `site-packages` are refused.
+
+  Original reasoning, kept because the options were the argument:
+
+  `_run_kwargs` set no `user`, so every sandbox ran as uid 0. Two things
+  followed: an escape starts from root rather than from nobody, and every file
+  the agent writes into the bind-mounted workspace is owned by root *on the
+  host*, so a `sandboxd` running unprivileged cannot clean up after its own
+  sessions. `no-new-privileges` does not help — it stops a process gaining
+  privileges it lacks, and this one already has them.
 
   It is not a one-line fix, because adding `user="1000:1000"` breaks the happy
   path immediately: `_session_volumes` creates

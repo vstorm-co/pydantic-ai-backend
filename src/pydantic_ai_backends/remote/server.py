@@ -438,6 +438,28 @@ class SandboxdConfig:
             `node_modules` — while leaving its workspace untouched, so the files
             survive and only the rebuildable part goes. `None` keeps them.
             Only meaningful with `persist_containers`.
+        sandbox_uid: Run every built runtime's sandbox as this unprivileged
+            user instead of root, and give each session's workspace to it.
+            `None` — the default — keeps the current behaviour, where a sandbox
+            runs as root.
+
+            Worth turning on. A container escape starts from whoever the
+            container runs as, and every file an agent writes into its
+            bind-mounted workspace is owned by that user on the host — as root,
+            a `sandboxd` running unprivileged cannot clean up after its own
+            sessions. The image is built around the uid: a real account, a home
+            directory, and a virtualenv it owns first on `PATH`, without which
+            an agent's `pip install` fails and `uv` — having no `--user` mode —
+            fails with no way forward.
+
+            Two things it asks of the deployment. The service must be able to
+            `chown` each session's workspace to this uid, which means either
+            running with the privilege or running *as* that uid so the
+            directories are created owned by it; a service that can do neither
+            is told so when the session opens rather than handing an agent a
+            workspace it cannot write to. And ready-made runtimes are left as
+            root, since an image nobody built for this has no such user and no
+            virtualenv, so an agent inside one could install nothing.
         max_read_bytes: Largest single file a client may read out of a sandbox.
         execute_timeout: Hard ceiling applied to every command, so one client
             cannot occupy a worker indefinitely.
@@ -476,6 +498,7 @@ class SandboxdConfig:
     cleanup_interval: int = 300
     workspace_ttl: int | None = None
     container_ttl: int | None = None
+    sandbox_uid: int | None = None
     max_read_bytes: int = 8 * 1024 * 1024
     execute_timeout: int = 300
     max_workers: int = 32
@@ -615,11 +638,17 @@ def _default_builder(config: SandboxdConfig) -> SandboxBuilder:
         from pydantic_ai_backends.backends.docker.sandbox import DockerSandbox
 
         built = runtime.resolved_runtime()
+        # A ready-made image was not built around the sandbox user and has no
+        # virtualenv it owns, so running it unprivileged would leave an agent
+        # unable to install anything. Only built runtimes take the uid.
+        overrides: dict[str, Any] = {"work_dir": config.work_dir}
+        if config.sandbox_uid is not None:
+            overrides["run_as_uid"] = config.sandbox_uid
         return DockerSandbox(
             # One work directory service-wide: it is where the workspace volume
             # is mounted and what the archive endpoints read, so a runtime's own
             # `work_dir` is overridden rather than allowed to disagree.
-            runtime=built.model_copy(update={"work_dir": config.work_dir}) if built else None,
+            runtime=built.model_copy(update=overrides) if built else None,
             image=runtime.image or "",
             session_id=session_id,
             work_dir=config.work_dir,
@@ -659,10 +688,39 @@ def _session_volumes(config: SandboxdConfig, session_id: str) -> dict[str, str] 
         return None
     workspace = workspace_root_for(session_dir.parent, session_id)
     workspace.mkdir(parents=True, exist_ok=True)
+    if config.sandbox_uid is not None:
+        _hand_workspace_to(workspace, config.sandbox_uid)
     # The sweep reads this mtime as "when the session was last opened", and
     # mkdir on an existing directory does not touch it.
     os.utime(session_dir)
     return {str(workspace.resolve()): config.work_dir}
+
+
+def _hand_workspace_to(workspace: Path, uid: int) -> None:
+    """Give one session's workspace to the user its sandbox will run as.
+
+    A sandbox running unprivileged writes into this directory as `uid`, so the
+    directory has to belong to `uid` — otherwise the agent's very first file
+    write fails, which is a worse outcome than the privilege this is buying back.
+
+    Raises:
+        RuntimeError: When the service cannot change the ownership, naming what
+            it would have to be able to do. Starting the sandbox anyway would
+            hand an agent a workspace it cannot write to, and the cause would
+            surface much later as an unexplained permission error inside a
+            container.
+    """
+    try:
+        # Owner only. The container writes as this uid, so the owner bits are
+        # what decide; setting the group as well would additionally require the
+        # service to be a member of a group it may well not have.
+        os.chown(workspace, uid, -1)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot give {workspace} to uid {uid} for an unprivileged sandbox: {exc}. "
+            "Either run sandboxd with the privilege to chown, or run it as that uid "
+            "so the directory is created owned by it, or unset sandbox_uid."
+        ) from exc
 
 
 def sweep_containers(config: SandboxdConfig, client: Any, now: float) -> list[str]:
@@ -1278,6 +1336,7 @@ class _Service:
             execute_timeout=config.execute_timeout,
             max_read_bytes=config.max_read_bytes,
             persist_containers=config.persist_containers,
+            sandbox_uid=config.sandbox_uid,
             workspace_ttl=config.workspace_ttl,
             container_ttl=config.container_ttl,
             tmpfs_size=config.tmpfs_size,

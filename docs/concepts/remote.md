@@ -182,6 +182,46 @@ that:
   untrusted code should not give them the network unless that is deliberate.
 - Bind it to a private network. It has no TLS and no rate limiting of its own.
 
+### Running sandboxes unprivileged
+
+A container runs as root unless told otherwise, and that is two problems: an
+escape starts from uid 0, and every file an agent writes into its bind-mounted
+workspace is owned by root **on the host**, so a `sandboxd` running
+unprivileged cannot clean up after its own sessions.
+
+`sandbox_uid` turns that off:
+
+```python
+SandboxdConfig(
+    token=token,
+    workspace_root="/var/lib/sandboxd",
+    sandbox_uid=1000,
+)
+```
+
+Built runtimes are then built around that user — a real account for it, a home
+directory, and a virtualenv it owns first on `PATH` — and their containers run
+as it, with each session's workspace given to it.
+
+The virtualenv is what makes this workable rather than merely safer. A non-root
+user cannot write to the interpreter's own `site-packages`, so without one an
+agent's first `pip install` fails; `uv`, which has no `--user` mode, fails with
+no way forward at all. Owning a virtualenv means both simply work, and console
+scripts land somewhere already on `PATH`. Measured in that shape: `whoami`,
+`git commit`, `pip install`, `uv pip install` and running the installed tool all
+succeed, while `/etc` and the system `site-packages` are refused.
+
+Two things it asks of the deployment:
+
+- **The service must be able to give each workspace to that uid.** Either run it
+  with the privilege to `chown`, or run it *as* that uid so the directories are
+  created owned by it. A service that can do neither is told so when the session
+  opens, rather than starting a sandbox whose first file write would fail with
+  an error nothing explains.
+- **Ready-made runtimes stay as root.** An image nobody built for this has no
+  such user and no virtualenv, so an agent inside one could install nothing. The
+  uid reaches runtimes built from a `base_image` and no others.
+
 ## Sessions that outlive a run
 
 By default, opening a session id that is already in use is a `409` — silently

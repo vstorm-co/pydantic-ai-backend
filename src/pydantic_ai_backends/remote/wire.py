@@ -348,6 +348,8 @@ class ServicePolicy(BaseModel):
     execute_timeout: int = 0
     max_read_bytes: int = 0
     persist_containers: bool = False
+    sandbox_uid: int | None = None
+    """Uid built runtimes run as, or `None` when sandboxes run as root."""
     """Whether a stopped sandbox keeps its filesystem for the next attach."""
     workspace_ttl: int | None = None
     """Seconds an unused workspace is kept before it is swept, or `None`."""

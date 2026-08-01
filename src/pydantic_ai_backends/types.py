@@ -168,3 +168,27 @@ class RuntimeConfig(BaseModel):
 
     cache_image: bool = True
     """Whether to cache the built image locally."""
+
+    run_as_uid: int | None = None
+    """Build the image around an unprivileged user, and run containers as them.
+
+    `None` — the default — runs as root, which is what a container does unless
+    told otherwise. Naming a uid instead adds three things to the generated
+    image: a real user with that id (so `whoami` and anything else calling
+    `getpwuid` works), a home directory it owns, and a virtualenv at
+    :data:`VENV_PATH` it owns, put first on `PATH`.
+
+    The virtualenv is the part that makes this workable rather than merely
+    safer. A non-root user cannot write to the interpreter's own
+    `site-packages`, so without one an agent's first `pip install` fails — and
+    `uv`, unlike pip, has no `--user` mode to fall back on, so it fails with no
+    way forward at all. Owning a virtualenv means both simply work, and console
+    scripts land somewhere already on `PATH`.
+
+    Only meaningful with `base_image`: a ready-made `image` was not built with
+    this user, so running it unprivileged would leave an agent unable to install
+    anything system-wide.
+
+    The uid has to match whoever owns the workspace mounted into the container,
+    which is why it is a number rather than a name.
+    """

@@ -442,3 +442,66 @@ class TestPruningSupersededImages:
         build_image(_Client(images), runtime)
 
         assert images.removed == [stale]
+
+
+class TestUnprivilegedRuntimes:
+    """What `run_as_uid` adds to a generated image, and why each part is there."""
+
+    def _runtime(self, **kwargs):
+        from pydantic_ai_backends.types import RuntimeConfig
+
+        return RuntimeConfig(name="nr", base_image="python:3.12-slim", **kwargs)
+
+    def test_nothing_is_added_without_a_uid(self):
+        from pydantic_ai_backends.backends.docker._image import build_dockerfile
+
+        assert "useradd" not in build_dockerfile(self._runtime())
+
+    def test_the_uid_gets_a_real_account(self):
+        """A bare numeric id works for the kernel and breaks `getpwuid`."""
+        from pydantic_ai_backends.backends.docker._image import SANDBOX_USER, build_dockerfile
+
+        dockerfile = build_dockerfile(self._runtime(run_as_uid=1000))
+
+        assert f"useradd --uid 1000 --create-home --shell /bin/bash {SANDBOX_USER}" in dockerfile
+
+    def test_it_owns_a_virtualenv_that_comes_first_on_path(self):
+        """Without one, pip installs somewhere off `PATH` and uv cannot install at all."""
+        from pydantic_ai_backends.backends.docker._image import VENV_PATH, build_dockerfile
+
+        dockerfile = build_dockerfile(self._runtime(run_as_uid=1000))
+
+        assert f"python -m venv --system-site-packages {VENV_PATH}" in dockerfile
+        assert f"chown -R 1000:1000 {VENV_PATH}" in dockerfile
+        assert f"PATH={VENV_PATH}/bin:$PATH" in dockerfile
+
+    def test_the_venv_keeps_the_runtimes_own_packages_importable(self):
+        """They were installed system-wide, before the user existed."""
+        from pydantic_ai_backends.backends.docker._image import build_dockerfile
+
+        dockerfile = build_dockerfile(self._runtime(packages=["six"], run_as_uid=1000))
+        install = dockerfile.index("pip install")
+        venv = dockerfile.index("python -m venv")
+
+        assert install < venv
+        assert "--system-site-packages" in dockerfile
+
+    def test_uv_is_pointed_at_the_venv_rather_than_the_interpreter(self):
+        from pydantic_ai_backends.backends.docker._image import build_dockerfile
+
+        assert "UV_SYSTEM_PYTHON=0" in build_dockerfile(self._runtime(run_as_uid=1000))
+
+    def test_a_runtimes_own_env_still_wins(self):
+        from pydantic_ai_backends.backends.docker._image import build_dockerfile
+
+        dockerfile = build_dockerfile(self._runtime(run_as_uid=1000, env_vars={"HOME": "/tmp"}))
+
+        assert dockerfile.index("HOME=/home/agent") < dockerfile.index("ENV HOME=/tmp")
+
+    @pytest.mark.parametrize("uid", [0, -1])
+    def test_a_uid_that_is_not_one_is_refused(self, uid: int):
+        """Root defeats the purpose, and the value lands in a shell command."""
+        from pydantic_ai_backends.backends.docker._image import unprivileged_instructions
+
+        with pytest.raises(ValueError, match="positive uid"):
+            unprivileged_instructions(uid)
