@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.20] - 2026-08-01
+
 ### Added
 
 - **`SandboxdConfig.sandbox_uid`, which runs sandboxes as an unprivileged user.** A container runs as root unless told otherwise, and that is two problems: an escape starts from uid 0, and every file an agent writes into its bind-mounted workspace is owned by root *on the host*, so a `sandboxd` running unprivileged cannot clean up after its own sessions. Set the uid and built runtimes are built around it — a real account (a bare numeric id breaks everything calling `getpwuid`, `whoami` first), a home directory it owns (with `HOME` left at `/`, the first `pip install` fails on `Permission denied: '/.local'`), and a virtualenv it owns first on `PATH`. That last one is what makes it workable rather than merely safer: a non-root user cannot write to the interpreter's own `site-packages`, and `uv` — unlike pip — has no `--user` mode to fall back on, so without a virtualenv it fails with no way forward. Measured in that shape: `whoami`, `git commit`, `pip install`, `uv pip install` and running the installed tool all succeed, while `/etc` and the system `site-packages` are refused.
