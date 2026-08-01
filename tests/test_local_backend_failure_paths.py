@@ -327,6 +327,24 @@ class TestGrepBothImplementations:
 
         assert backend.grep_raw("secret") == []
 
+    def test_ripgrep_respects_a_file_hidden_from_grep(
+        self, workspace: Path, with_ripgrep, monkeypatch
+    ):
+        """Covered only by accident wherever `rg` happens to be installed."""
+        (workspace / "visible.txt").write_text("todo yes\n")
+        (workspace / "secret.txt").write_text("todo no\n")
+        self._canned_rg(monkeypatch, "visible.txt:1:todo yes\nsecret.txt:1:todo no\n")
+
+        backend = LocalBackend(root_dir=str(workspace))
+        monkeypatch.setattr(
+            backend, "_hidden_from_grep", lambda path: Path(path).name == "secret.txt"
+        )
+
+        found = backend.grep_raw("todo")
+
+        assert isinstance(found, list)
+        assert [Path(m["path"]).name for m in found] == ["visible.txt"]
+
     def test_an_invalid_regex_is_reported(
         self, backend: LocalBackend, without_ripgrep, monkeypatch
     ):
