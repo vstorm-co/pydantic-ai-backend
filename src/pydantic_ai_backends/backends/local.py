@@ -154,7 +154,7 @@ class LocalBackend:
         elif self._allowed_directories:
             self._root = self._allowed_directories[0]
         else:
-            self._root = Path.cwd()  # pragma: no cover
+            self._root = Path.cwd()
         self._root.mkdir(parents=True, exist_ok=True)
 
         if not self._allowed_directories:
@@ -242,13 +242,13 @@ class LocalBackend:
         """
         try:
             full_path = self._resolve(path)
-        except PermissionError:  # pragma: no cover
+        except PermissionError:
             return []
 
         if self._is_denied("ls", str(full_path)) or not full_path.exists():
             return []
 
-        if full_path.is_file():  # pragma: no cover
+        if full_path.is_file():
             return [_entry_info(full_path)]
 
         results: list[FileInfo] = []
@@ -256,11 +256,11 @@ class LocalBackend:
             for entry in full_path.iterdir():
                 try:
                     self._resolve(str(entry))
-                except PermissionError:  # pragma: no cover
+                except PermissionError:
                     continue
                 if not self._is_denied("ls", str(entry)):
                     results.append(_entry_info(entry))
-        except PermissionError:  # pragma: no cover
+        except PermissionError:
             return []
 
         return sorted(results, key=lambda x: (not x["is_dir"], x["name"]))
@@ -282,7 +282,7 @@ class LocalBackend:
 
         try:
             return full_path.read_bytes()
-        except (PermissionError, OSError):  # pragma: no cover
+        except (PermissionError, OSError):
             return b""
 
     def read(self, path: str, offset: int = 0, limit: int = DEFAULT_READ_LIMIT) -> str:
@@ -298,18 +298,18 @@ class LocalBackend:
 
         if not full_path.exists():
             return f"Error: File '{path}' not found"
-        if full_path.is_dir():  # pragma: no cover
+        if full_path.is_dir():
             return f"Error: '{path}' is a directory"
 
         try:
             with open(full_path, encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
-        except PermissionError:  # pragma: no cover
+        except PermissionError:
             return f"Error: Permission denied for '{path}'"
-        except OSError as e:  # pragma: no cover
+        except OSError as e:
             return f"Error: {e}"
 
-        if offset >= len(lines):  # pragma: no cover
+        if offset >= len(lines):
             return f"Error: Offset {offset} exceeds file length ({len(lines)} lines)"
 
         end = min(offset + limit, len(lines))
@@ -332,14 +332,14 @@ class LocalBackend:
 
         try:
             full_path.parent.mkdir(parents=True, exist_ok=True)
-            if isinstance(content, bytes):  # pragma: no cover
+            if isinstance(content, bytes):
                 full_path.write_bytes(content)
             else:
                 full_path.write_text(_normalize_newlines(content), encoding="utf-8")
             return WriteResult(path=str(full_path))
-        except PermissionError:  # pragma: no cover
+        except PermissionError:
             return WriteResult(error=f"Permission denied for '{path}'")
-        except OSError as e:  # pragma: no cover
+        except OSError as e:
             return WriteResult(error=str(e))
 
     def edit(
@@ -348,7 +348,7 @@ class LocalBackend:
         """Edit a file by replacing a string."""
         try:
             full_path = self._resolve(path)
-        except PermissionError as e:  # pragma: no cover
+        except PermissionError as e:
             return EditResult(error=str(e))
 
         denial = self._denial_reason("edit", str(full_path))
@@ -360,9 +360,9 @@ class LocalBackend:
 
         try:
             content = full_path.read_text(encoding="utf-8")
-        except PermissionError:  # pragma: no cover
+        except PermissionError:
             return EditResult(error=f"Permission denied for '{path}'")
-        except OSError as e:  # pragma: no cover
+        except OSError as e:
             return EditResult(error=str(e))
 
         outcome = replace_in_content(content, old_string, new_string, replace_all)
@@ -371,9 +371,9 @@ class LocalBackend:
 
         try:
             full_path.write_text(_normalize_newlines(outcome.content), encoding="utf-8")
-        except PermissionError:  # pragma: no cover
+        except PermissionError:
             return EditResult(error=f"Permission denied for '{path}'")
-        except OSError as e:  # pragma: no cover
+        except OSError as e:
             return EditResult(error=str(e))
 
         return EditResult(path=str(full_path), occurrences=outcome.occurrences)
@@ -387,7 +387,7 @@ class LocalBackend:
         """
         try:
             base_path = self._resolve(path)
-        except PermissionError:  # pragma: no cover
+        except PermissionError:
             return []
 
         if self._is_denied("glob", str(base_path)) or not base_path.exists():
@@ -396,18 +396,27 @@ class LocalBackend:
         collected: list[tuple[float, str, FileInfo]] = []
         try:
             for match in base_path.glob(pattern):  # pragma: no branch
-                if not match.is_file():
-                    continue
                 try:
+                    if not match.is_file():
+                        continue
                     self._resolve(str(match))
-                except PermissionError:  # pragma: no cover
+                    if self._is_denied("glob", str(match)):
+                        continue
+                    stat = match.stat()
+                except PermissionError:
                     continue
-                if self._is_denied("glob", str(match)):
+                except OSError:
+                    # Per entry, not per walk. One file that vanished or cannot
+                    # be stat'd between the glob and the stat used to abort the
+                    # whole loop and return whatever had been collected — a
+                    # silently short answer, which is worse than a missing row
+                    # and worse than an error. `ls_info` and grep both skip and
+                    # carry on; this now matches them.
                     continue
-                stat = match.stat()
                 info = FileInfo(name=match.name, path=str(match), is_dir=False, size=stat.st_size)
                 collected.append((stat.st_mtime, str(match), info))
-        except (PermissionError, OSError):  # pragma: no cover
+        except (PermissionError, OSError):
+            # The walk itself failed, so there is nothing left to collect.
             pass
 
         collected.sort(key=lambda item: (-item[0], item[1]))
@@ -430,17 +439,17 @@ class LocalBackend:
 
         try:
             validated = self._resolve(search_path)
-        except PermissionError as e:  # pragma: no cover
+        except PermissionError as e:
             return str(e)
 
         if self._is_denied("grep", str(validated)):
             return f"Error: Permission denied for grep on '{search_path}'"
 
-        if shutil.which("rg") is not None and not validated.is_file():  # pragma: no cover
+        if shutil.which("rg") is not None and not validated.is_file():
             return self._grep_ripgrep(pattern, validated, glob, ignore_hidden)
-        return self._grep_python(pattern, validated, glob, ignore_hidden)  # pragma: no cover
+        return self._grep_python(pattern, validated, glob, ignore_hidden)
 
-    def _grep_ripgrep(  # pragma: no cover
+    def _grep_ripgrep(
         self, pattern: str, search_path: Path, glob: str | None, ignore_hidden: bool
     ) -> list[GrepMatch] | str:
         argv = ["rg", "--line-number", "--no-heading", pattern]
@@ -476,7 +485,7 @@ class LocalBackend:
             matches.append(GrepMatch(path=str(full_path), line_number=line_number, line=line))
         return matches
 
-    def _grep_python(  # pragma: no cover
+    def _grep_python(
         self, pattern: str, search_path: Path, glob: str | None, ignore_hidden: bool
     ) -> list[GrepMatch] | str:
         try:
@@ -552,7 +561,7 @@ class LocalBackend:
             return ExecuteResponse(
                 output="Error: Command timed out", exit_code=124, truncated=False
             )
-        except Exception as e:  # pragma: no cover
+        except Exception as e:
             return ExecuteResponse(output=f"Error: {e}", exit_code=1, truncated=False)
 
         return _execute_response(result.stdout + result.stderr, result.returncode)
@@ -602,7 +611,7 @@ class LocalBackend:
             output = stdout.decode("utf-8", errors="replace")
             output += stderr.decode("utf-8", errors="replace")
             return _execute_response(output, process.returncode)
-        except Exception as e:  # pragma: no cover
+        except Exception as e:
             return ExecuteResponse(output=f"Error: {e}", exit_code=1, truncated=False)
 
     def _execute_denial(self, command: str) -> str | None:
@@ -710,7 +719,7 @@ def _within_read_ceiling(result: str, *, explicit: bool) -> str:
 
 def _execute_response(output: str, returncode: int | None) -> ExecuteResponse:
     truncated = len(output) > MAX_EXECUTE_OUTPUT_BYTES
-    if truncated:  # pragma: no cover
+    if truncated:
         output = output[:MAX_EXECUTE_OUTPUT_BYTES]
     return ExecuteResponse(
         output=output,
@@ -719,7 +728,7 @@ def _execute_response(output: str, returncode: int | None) -> ExecuteResponse:
     )
 
 
-def _parse_grep_lines(stdout: str) -> list[tuple[str, int, str]]:  # pragma: no cover
+def _parse_grep_lines(stdout: str) -> list[tuple[str, int, str]]:
     """Parse ripgrep's `path:line:content` output, skipping malformed rows."""
     rows: list[tuple[str, int, str]] = []
     for line in stdout.strip().split("\n"):
