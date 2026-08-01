@@ -456,3 +456,79 @@ class TestDaytonaSandboxLazyImport:
         import pydantic_ai_backends
 
         assert "DaytonaSandbox" in pydantic_ai_backends.__all__
+
+
+class TestDaytonaFailurePaths:
+    """Handlers that were hidden by the class-level pragma."""
+
+    def _sandbox(self):
+        from pydantic_ai_backends import DaytonaSandbox
+
+        sandbox = DaytonaSandbox.__new__(DaytonaSandbox)
+        sandbox._id = "s1"
+        sandbox._last_activity = 0.0
+        return sandbox
+
+    def test_is_alive_is_false_when_the_probe_fails(self, monkeypatch):
+        sandbox = self._sandbox()
+        monkeypatch.setattr(
+            type(sandbox),
+            "execute",
+            lambda self, cmd, timeout=None: (_ for _ in ()).throw(OSError("transport gone")),
+        )
+
+        assert sandbox.is_alive() is False
+
+    def test_is_alive_is_false_on_a_nonzero_exit(self, monkeypatch):
+        from pydantic_ai_backends.types import ExecuteResponse
+
+        sandbox = self._sandbox()
+        monkeypatch.setattr(
+            type(sandbox),
+            "execute",
+            lambda self, cmd, timeout=None: ExecuteResponse(output="", exit_code=1),
+        )
+
+        assert sandbox.is_alive() is False
+
+    def test_an_unexpected_failure_during_edit_is_reported(self, monkeypatch):
+        sandbox = self._sandbox()
+        monkeypatch.setattr(
+            type(sandbox),
+            # `edit` probes existence first, so that is where the failure lands.
+            "exists",
+            lambda self, path: (_ for _ in ()).throw(RuntimeError("api exploded")),
+        )
+
+        result = sandbox.edit("/f.txt", "a", "b")
+
+        assert result.error is not None
+        assert "api exploded" in result.error
+
+    def test_readiness_polling_tolerates_a_failing_probe(self, monkeypatch):
+        """A sandbox that is not up yet raises; that is expected, not fatal."""
+        from pydantic_ai_backends.backends import daytona as module
+
+        sandbox = self._sandbox()
+        attempts: list[int] = []
+
+        class Process:
+            def exec(self, command: str, timeout: int = 5):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise OSError("not listening yet")
+
+                class Ok:
+                    exit_code = 0
+
+                return Ok()
+
+        class Inner:
+            process = Process()
+
+        sandbox._sandbox = Inner()
+        monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+        sandbox._wait_until_ready(timeout=30)
+
+        assert len(attempts) == 2
