@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.19] - 2026-08-01
+
 ### Changed
 
 - **`SandboxdConfig.default_runtime` defaults to the first entry in `runtimes`** rather than to the literal alias `"python"`. The old default meant every custom allowlist had to contain a key named `python` or the config refused to construct, which is a coupling nothing asked for. The shipped allowlist lists `coding` first, so that is what a default service now hands out; naming an alias explicitly still wins, and naming one that is not allowed is still refused.
