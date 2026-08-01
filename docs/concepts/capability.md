@@ -53,24 +53,53 @@ agent = Agent(
 
 ## How Permissions Work
 
-1. **`prepare_tools`** — hides tools for denied operations. With `READONLY_RULESET`,
-   the model never sees `write_file`, `edit_file`, or `execute`.
+1. **The toolset drops denied tools** — the ruleset is passed straight through to
+   `create_console_toolset`, so a denied operation's tools are never registered.
 
-2. **`before_tool_execute`** — checks per-path permissions before each tool call.
+2. **`prepare_tools`** — hides them again from each request's tool definitions.
+   With `READONLY_RULESET`, the model never sees `write_file`, `edit_file`,
+   `execute`, or any of the background shell tools.
+
+3. **`before_tool_execute`** — checks per-path permissions before each tool call.
    If a specific path is denied (e.g., `.env` files), the call is blocked even if
    the operation is generally allowed.
+
+A denied `execute` removes **every** shell tool — `execute`, `run_in_background`,
+`read_output`, `kill_shell` and `list_shells` — because they are one operation
+reached different ways. Leaving the background ones behind meant a read-only
+agent could still run arbitrary commands.
+
+### Answering an "ask"
+
+An operation resolving to `"ask"` needs somebody to ask. Give the capability an
+`ask_callback`, or set `ask_fallback="deny"` to refuse instead:
+
+```python
+async def approve(operation: str, target: str, reason: str) -> bool:
+    return await my_ui.confirm(f"Allow {operation} on {target}?")
+
+
+capability = ConsoleCapability(permissions=DEFAULT_RULESET, ask_callback=approve)
+```
+
+Without either, an "ask" raises `PermissionAskError` — which is what you want in
+a batch job and not what you want in an interactive one. Every shipped preset
+except `PERMISSIVE_RULESET` has at least one operation defaulting to `"ask"`.
 
 ## Constructor Parameters
 
 [`ConsoleCapability`][pydantic_ai_backends.ConsoleCapability] is a dataclass with
-four fields:
+these fields:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `backend` | `BackendProtocol \| AsyncBackendProtocol \| None` | `None` | Backend the tools operate on. When `None`, each call reads `ctx.deps.backend`. See [Where the Backend Comes From](#where-the-backend-comes-from). |
 | `include_execute` | `bool` | `True` | Whether to register the `execute` shell tool. |
+| `include_background` | `bool` | `True` | Whether to register the background-shell tools (`run_in_background`, `read_output`, `kill_shell`, `list_shells`). |
 | `edit_format` | `"str_replace" \| "hashline"` | `"str_replace"` | File-editing format. `"hashline"` registers `hashline_edit` instead of `edit_file` and changes the injected instructions. See [Hashline Edit Format](console-toolset.md#hashline-edit-format). |
 | `permissions` | `PermissionRuleset \| None` | `None` | Ruleset controlling which operations are allowed, asked, or denied. When `None`, all tools are exposed and no permission checks run. |
+| `ask_callback` | `AskCallback \| None` | `None` | Async `(operation, target, reason) -> bool` answering an operation that resolves to `"ask"`. |
+| `ask_fallback` | `"deny" \| "error"` | `"error"` | What an unanswerable `"ask"` does when there is no callback. |
 
 ```python
 from pydantic_ai_backends import ConsoleCapability

@@ -12,8 +12,8 @@ The names are public inside this private module so call sites read as prose:
 
 from __future__ import annotations
 
+import base64
 import shlex
-import uuid
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -107,21 +107,23 @@ def parse_read(result: ExecuteResponse) -> str:
     return result.output
 
 
-def write_command(path: str, content: str) -> str:
-    """Write a file with `cat` and a quoted heredoc.
+def write_command(path: str, content: str | bytes) -> str:
+    """Write a file, carrying the content base64-encoded.
 
-    The delimiter is quoted (`<< 'DELIM'`) so the shell expands nothing inside
-    the body and the content lands verbatim. Pre-escaping backslashes or `$` here
-    would corrupt it instead. The delimiter is random so it cannot collide with a
-    line of the content.
+    Base64 rather than the quoted heredoc this used to be, for two reasons the
+    heredoc could not fix. It cannot carry arbitrary bytes: `content` is typed
+    `str | bytes` by the protocol, and interpolating `bytes` into the body wrote
+    the Python repr — `b'\\x89PNG\\r\\n'` — into the file with no error. And a
+    heredoc's terminator must start a line, so writing `"x\\n"` produced `"x\\n\\n"`;
+    `LocalBackend` and `StateBackend` both store exactly what they are given.
+
+    The payload needs no quoting of its own, base64 being `[A-Za-z0-9+/=]`.
+    Requires `base64` in the image, which GNU coreutils and BusyBox both provide.
     """
-    delimiter = f"EOF_{uuid.uuid4().hex[:8]}"
+    raw = content if isinstance(content, bytes) else content.encode("utf-8")
+    payload = base64.b64encode(raw).decode("ascii")
     quoted_path = shlex.quote(path)
-    return (
-        f"mkdir -p $(dirname {quoted_path}) && cat > {quoted_path} << '{delimiter}'\n"
-        f"{content}\n"
-        f"{delimiter}"
-    )
+    return f"mkdir -p $(dirname {quoted_path}) && printf %s {payload} | base64 -d > {quoted_path}"
 
 
 def parse_write(result: ExecuteResponse, path: str) -> WriteResult:
@@ -161,13 +163,23 @@ def grep_command(
     glob: str | None = None,
     ignore_hidden: bool = True,
 ) -> str:
-    """Search file contents with `grep`."""
+    """Search file contents with `grep`.
+
+    The pattern and the glob are quoted like every other value here. Wrapping
+    them in literal single quotes instead let one of their own close the quoting:
+    a search for `don't` produced an unterminated command, and a crafted pattern
+    ran whatever followed it. `-e` for the same reason a pattern is quoted — a
+    pattern starting with `-` is a pattern, not an option.
+    """
     options = ["-rn"]
     if ignore_hidden:
-        options.extend(["--exclude='.*'", "--exclude-dir='.*'"])
+        # Quoted, or the shell expands `.*` against the working directory before
+        # grep ever sees it.
+        hidden = shlex.quote(".*")
+        options.extend([f"--exclude={hidden}", f"--exclude-dir={hidden}"])
     if glob:
-        options.append(f"--include='{glob}'")
-    return f"grep {' '.join(options)} '{pattern}' {shlex.quote(path or '.')}"
+        options.append(f"--include={shlex.quote(glob)}")
+    return f"grep {' '.join(options)} -e {shlex.quote(pattern)} {shlex.quote(path or '.')}"
 
 
 def parse_grep(result: ExecuteResponse) -> list[GrepMatch] | str:

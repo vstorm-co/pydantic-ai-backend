@@ -256,11 +256,20 @@ class LocalBackend:
             for entry in full_path.iterdir():
                 try:
                     self._resolve(str(entry))
+                    if self._is_denied("ls", str(entry)):
+                        continue
+                    info = _entry_info(entry)
                 except PermissionError:
                     continue
-                if not self._is_denied("ls", str(entry)):
-                    results.append(_entry_info(entry))
-        except PermissionError:
+                except OSError:
+                    # Per entry, not per listing, matching `glob_info`: a file
+                    # that vanished or cannot be stat'd between `iterdir` and
+                    # `_entry_info` used to abort the whole loop and take the
+                    # directory's other rows with it.
+                    continue
+                results.append(info)
+        except (PermissionError, OSError):
+            # The walk itself failed, so there is nothing left to collect.
             return []
 
         return sorted(results, key=lambda x: (not x["is_dir"], x["name"]))
@@ -360,6 +369,12 @@ class LocalBackend:
 
         try:
             content = full_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # Refused rather than decoded with replacement characters: writing the
+            # result back would substitute every undecodable byte for U+FFFD and
+            # destroy the file. `read` can afford `errors="replace"` because it
+            # only displays the content; `edit` stores it again.
+            return EditResult(error=f"'{path}' is not valid UTF-8 text and cannot be edited")
         except PermissionError:
             return EditResult(error=f"Permission denied for '{path}'")
         except OSError as e:

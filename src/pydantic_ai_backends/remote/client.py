@@ -35,7 +35,10 @@ TRANSPORT_SLACK_SECONDS = 10.0
 gives up before the command it is waiting for."""
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
-"""Request timeout for operations that carry no timeout of their own."""
+"""Request timeout for operations that carry no timeout of their own.
+
+Only the floor. A command with no explicit timeout runs under the *service's*
+ceiling, which is larger — see :attr:`RemoteSandbox.server_timeout`."""
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -130,6 +133,9 @@ class RemoteSandbox(BaseSandbox):
             session_id=self._id, runtime=runtime, tenant=tenant, reuse=reuse
         )
         self._timeout = timeout
+        # Learned from the service when the session opens. Until then the local
+        # default stands, which is the right answer for a service we cannot ask.
+        self._server_timeout = timeout
         self._started = False
         # Operations run on a thread pool, so two of them can arrive at an
         # unopened session at once; without this both would POST /sessions and
@@ -166,6 +172,14 @@ class RemoteSandbox(BaseSandbox):
 
         Opens the session first if this is the first operation.
 
+        Args:
+            url: Operation path.
+            payload: JSON body.
+            timeout: Transport timeout. `None` waits out the service's own
+                ceiling plus slack, because every operation here runs a shell
+                command on the far side and giving up first reports a running
+                command as an unreachable service.
+
         Returns:
             The `httpx.Response`, or `None` when the request could not be made
             or the service answered with an error status.
@@ -179,7 +193,11 @@ class RemoteSandbox(BaseSandbox):
                 url,
                 json=payload,
                 headers={wire.TOKEN_HEADER: self._session_token},
-                timeout=timeout if timeout is not None else self._timeout,
+                timeout=(
+                    timeout
+                    if timeout is not None
+                    else self._server_timeout + TRANSPORT_SLACK_SECONDS
+                ),
             )
         except Exception:
             return None
@@ -255,6 +273,36 @@ class RemoteSandbox(BaseSandbox):
         self._id = created.session.session_id
         self._session_token = created.token
         self._started = True
+        self._server_timeout = self._fetch_server_timeout()
+
+    @property
+    def server_timeout(self) -> float:
+        """How long the service lets an operation run, once the session is open.
+
+        Read from `GET /policy` when the session opens, falling back to this
+        sandbox's own `timeout` when the service will not say. It exists because
+        the two numbers are one contract and were set independently: the client
+        gave up after 60s while the service happily ran a command for its default
+        300s, so anything in between was reported to the agent as "sandbox
+        service unavailable" while it was in fact still running — and typically
+        retried, starting a second one.
+        """
+        return self._server_timeout
+
+    def _fetch_server_timeout(self) -> float:
+        """The service's own operation ceiling, or this sandbox's default."""
+        try:
+            response = self._http.get(
+                "/policy",
+                headers={wire.TOKEN_HEADER: self._service_token},
+                timeout=self._timeout,
+            )
+        except Exception:
+            return self._timeout
+        policy = _parse(response if response.status_code < 400 else None, wire.ServicePolicy)
+        if policy is None or policy.execute_timeout <= 0:
+            return self._timeout
+        return float(policy.execute_timeout)
 
     def is_alive(self) -> bool:
         """Whether the remote session exists and its sandbox is running."""
@@ -317,11 +365,16 @@ class RemoteSandbox(BaseSandbox):
                 self._http.close()
 
     def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
-        """Run a command in the remote sandbox."""
+        """Run a command in the remote sandbox.
+
+        Without an explicit `timeout` the command runs under the service's
+        ceiling, and the transport waits that long plus slack — the two are one
+        contract, and the client giving up first turned a slow-but-successful
+        command into a reported outage.
+        """
         body = wire.ExecRequest(command=command, timeout_seconds=timeout)
-        transport_timeout = (
-            timeout + TRANSPORT_SLACK_SECONDS if timeout is not None else self._timeout
-        )
+        effective = float(timeout) if timeout is not None else self._server_timeout
+        transport_timeout = effective + TRANSPORT_SLACK_SECONDS
         response = self._post(self._url("exec"), body.model_dump(mode="json"), transport_timeout)
         parsed = _parse(response, wire.ExecResponse)
         if parsed is None:

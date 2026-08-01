@@ -118,6 +118,21 @@ toolset = create_console_toolset(permissions=custom)
 
 When `permissions` is provided, it overrides the legacy `require_write_approval` and `require_execute_approval` flags.
 
+An operation whose default is `"deny"` has its tools removed outright. For
+`execute` that means **all five** shell tools — `execute`, `run_in_background`,
+`read_output`, `kill_shell` and `list_shells` — since they are the same operation
+reached different ways.
+
+Note what this does and does not do. The ruleset decides which tools *exist* and
+which need approval; it does not filter individual paths. Per-path enforcement is
+the backend's job, so pass the ruleset to the backend as well when you want it:
+
+```python
+ruleset = READONLY_RULESET
+toolset = create_console_toolset(permissions=ruleset)
+backend = LocalBackend(root_dir="/workspace", permissions=ruleset)
+```
+
 See [Permissions](permissions.md) for full documentation.
 
 ## Image Support

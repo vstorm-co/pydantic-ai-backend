@@ -31,6 +31,25 @@ from pydantic_ai_backends.types import (
 LS_FIELD_COUNT = _shell.LS_FIELD_COUNT
 """Re-exported from `_shell`, where the parsing that uses it lives."""
 
+FILE_OP_TIMEOUT = 30
+"""Ceiling on the shell commands `ls`, `read`, `read_bytes` and `write` derive from.
+
+Every operation here runs a command, and a command with no timeout is one
+nothing can reclaim: `DockerSandbox.execute` only wraps the `timeout` utility
+around a command it was given a limit for, and `exec_run` has no deadline of its
+own. A single uncapped operation therefore pins a worker thread for good, which
+is how a handful of requests wedged a whole sandbox service. A listing or a read
+that has not answered in thirty seconds is not going to.
+"""
+
+SEARCH_TIMEOUT = 120
+"""Ceiling on `glob_info` and `grep_raw`, which walk a tree rather than one file.
+
+Separate from :data:`FILE_OP_TIMEOUT` because a legitimate `grep` over a large
+repository is slow in a way a `ls` never is, and capping both at the same number
+would mean choosing between a useless search and an unbounded listing.
+"""
+
 
 class _SandboxIdentity:
     """The identity and idle bookkeeping both base sandboxes share.
@@ -116,23 +135,28 @@ class BaseSandbox(_SandboxIdentity, ABC):
 
     def ls_info(self, path: str) -> list[FileInfo]:
         """List one directory using `ls -la`."""
-        return _shell.parse_ls(self.execute(_shell.ls_command(path)), path)
+        command = _shell.ls_command(path)
+        return _shell.parse_ls(self.execute(command, timeout=FILE_OP_TIMEOUT), path)
 
     def read_bytes(self, path: str) -> bytes:
         """Read a whole file with `cat`, or `b""` on any failure."""
-        return _shell.parse_read_bytes(self.execute(_shell.read_bytes_command(path)))
+        command = _shell.read_bytes_command(path)
+        return _shell.parse_read_bytes(self.execute(command, timeout=FILE_OP_TIMEOUT))
 
     def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
         """Read a slice of a file, numbered by its real line positions."""
-        return _shell.parse_read(self.execute(_shell.read_command(path, offset, limit)))
+        command = _shell.read_command(path, offset, limit)
+        return _shell.parse_read(self.execute(command, timeout=FILE_OP_TIMEOUT))
 
-    def write(self, path: str, content: str) -> WriteResult:
-        """Write a file with `cat` and a quoted heredoc."""
-        return _shell.parse_write(self.execute(_shell.write_command(path, content)), path)
+    def write(self, path: str, content: str | bytes) -> WriteResult:
+        """Write a file, carrying the content base64-encoded."""
+        command = _shell.write_command(path, content)
+        return _shell.parse_write(self.execute(command, timeout=FILE_OP_TIMEOUT), path)
 
     def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
         """Match files with `find`."""
-        return _shell.parse_glob(self.execute(_shell.glob_command(pattern, path)))
+        command = _shell.glob_command(pattern, path)
+        return _shell.parse_glob(self.execute(command, timeout=SEARCH_TIMEOUT))
 
     def grep_raw(
         self,
@@ -143,7 +167,7 @@ class BaseSandbox(_SandboxIdentity, ABC):
     ) -> list[GrepMatch] | str:
         """Search file contents with `grep`."""
         command = _shell.grep_command(pattern, path, glob, ignore_hidden)
-        return _shell.parse_grep(self.execute(command))
+        return _shell.parse_grep(self.execute(command, timeout=SEARCH_TIMEOUT))
 
 
 class AsyncBaseSandbox(_SandboxIdentity, ABC):
@@ -240,24 +264,28 @@ class AsyncBaseSandbox(_SandboxIdentity, ABC):
 
     async def ls_info(self, path: str) -> list[FileInfo]:
         """List one directory using `ls -la`."""
-        return _shell.parse_ls(await self.execute(_shell.ls_command(path)), path)
+        result = await self.execute(_shell.ls_command(path), timeout=FILE_OP_TIMEOUT)
+        return _shell.parse_ls(result, path)
 
     async def read_bytes(self, path: str) -> bytes:
         """Read a whole file with `cat`, or `b""` on any failure."""
-        return _shell.parse_read_bytes(await self.execute(_shell.read_bytes_command(path)))
+        command = _shell.read_bytes_command(path)
+        return _shell.parse_read_bytes(await self.execute(command, timeout=FILE_OP_TIMEOUT))
 
     async def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
         """Read a slice of a file, numbered by its real line positions."""
-        return _shell.parse_read(await self.execute(_shell.read_command(path, offset, limit)))
+        command = _shell.read_command(path, offset, limit)
+        return _shell.parse_read(await self.execute(command, timeout=FILE_OP_TIMEOUT))
 
-    async def write(self, path: str, content: str) -> WriteResult:
-        """Write a file with `cat` and a quoted heredoc."""
-        result = await self.execute(_shell.write_command(path, content))
+    async def write(self, path: str, content: str | bytes) -> WriteResult:
+        """Write a file, carrying the content base64-encoded."""
+        result = await self.execute(_shell.write_command(path, content), timeout=FILE_OP_TIMEOUT)
         return _shell.parse_write(result, path)
 
     async def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
         """Match files with `find`."""
-        return _shell.parse_glob(await self.execute(_shell.glob_command(pattern, path)))
+        command = _shell.glob_command(pattern, path)
+        return _shell.parse_glob(await self.execute(command, timeout=SEARCH_TIMEOUT))
 
     async def grep_raw(
         self,
@@ -268,4 +296,4 @@ class AsyncBaseSandbox(_SandboxIdentity, ABC):
     ) -> list[GrepMatch] | str:
         """Search file contents with `grep`."""
         command = _shell.grep_command(pattern, path, glob, ignore_hidden)
-        return _shell.parse_grep(await self.execute(command))
+        return _shell.parse_grep(await self.execute(command, timeout=SEARCH_TIMEOUT))

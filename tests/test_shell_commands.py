@@ -7,6 +7,10 @@ Kubernetes, and any third-party one — contributed nothing to the coverage gate
 
 from __future__ import annotations
 
+import base64
+import re
+import shlex
+
 import pytest
 
 from pydantic_ai_backends.backends import _shell
@@ -147,19 +151,34 @@ class TestRead:
 
 
 class TestWrite:
-    def test_the_delimiter_is_quoted_so_the_shell_expands_nothing(self):
+    @staticmethod
+    def _payload(command: str) -> bytes:
+        """What the command actually writes, decoded back out of it."""
+        encoded = command.split("printf %s ", 1)[1].split(" ", 1)[0]
+        return base64.b64decode(encoded)
+
+    def test_the_content_is_carried_encoded_so_the_shell_expands_nothing(self):
         command = _shell.write_command("/f.sh", "echo $HOME `id` \\n")
 
-        assert "<< 'EOF_" in command
-        # The body is verbatim: pre-escaping it here would corrupt it.
-        assert "echo $HOME `id` \\n" in command
+        assert "echo $HOME" not in command
+        assert self._payload(command) == b"echo $HOME `id` \\n"
 
-    def test_the_delimiter_is_random_per_call(self):
-        """A fixed delimiter could collide with a line of the content."""
-        first = _shell.write_command("/f", "x")
-        second = _shell.write_command("/f", "x")
+    def test_bytes_are_written_as_bytes(self):
+        """`b'\\x89PNG'` used to be interpolated as its Python repr."""
+        command = _shell.write_command("/img.png", b"\x89PNG\r\n\x1a\n")
 
-        assert first != second
+        assert self._payload(command) == b"\x89PNG\r\n\x1a\n"
+
+    def test_content_is_written_with_no_newline_added(self):
+        """A heredoc's terminator starts a line, so it appended one."""
+        assert self._payload(_shell.write_command("/f", "x")) == b"x"
+        assert self._payload(_shell.write_command("/f", "x\n")) == b"x\n"
+
+    def test_the_payload_needs_no_quoting(self):
+        """base64 is [A-Za-z0-9+/=], so nothing in it can reach the shell."""
+        command = _shell.write_command("/f", "'; id; echo '")
+
+        assert re.fullmatch(r"[A-Za-z0-9+/=]*", command.split("printf %s ", 1)[1].split(" ")[0])
 
     def test_the_parent_directory_is_created(self):
         assert "mkdir -p $(dirname" in _shell.write_command("/deep/f", "x")
@@ -232,3 +251,38 @@ class TestGrep:
         found = _shell.parse_grep(_ok("no colons here\na.py:notanumber:x\nb.py:2:kept"))
 
         assert found == [{"path": "b.py", "line_number": 2, "line": "kept"}]
+
+
+class TestGrepQuoting:
+    """The pattern and glob were wrapped in literal quotes, not `shlex.quote`d.
+
+    One of their own then closed the quoting: a search for `don't` produced an
+    unterminated command, and a crafted pattern ran whatever followed it.
+    """
+
+    def test_a_pattern_containing_a_quote_stays_one_argument(self):
+        command = _shell.grep_command("don't", "/w")
+
+        assert shlex.split(command)[-2:] == ["don't", "/w"]
+
+    def test_a_pattern_cannot_break_out_into_another_command(self):
+        command = _shell.grep_command("x'; id; echo '", "/w")
+
+        assert ";" not in shlex.split(command)
+        assert "id" not in shlex.split(command)
+        assert shlex.split(command)[-2] == "x'; id; echo '"
+
+    def test_a_glob_containing_a_quote_stays_one_argument(self):
+        command = _shell.grep_command("x", "/w", glob="a'b*.py")
+
+        assert "--include=a'b*.py" in shlex.split(command)
+
+    def test_a_pattern_starting_with_a_dash_is_a_pattern_not_an_option(self):
+        command = _shell.grep_command("-v", "/w")
+
+        assert shlex.split(command)[-3:] == ["-e", "-v", "/w"]
+
+    def test_the_hidden_excludes_stay_quoted(self):
+        """Unquoted, the shell expands `.*` against the working directory."""
+        assert "--exclude=.*" in shlex.split(_shell.grep_command("x", "/w"))
+        assert "'.*'" in _shell.grep_command("x", "/w")

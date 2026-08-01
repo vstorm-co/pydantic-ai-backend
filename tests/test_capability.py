@@ -12,8 +12,14 @@ from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_backends import LocalBackend
-from pydantic_ai_backends.capability import ConsoleCapability
-from pydantic_ai_backends.permissions.presets import PERMISSIVE_RULESET, READONLY_RULESET
+from pydantic_ai_backends.capability import TOOL_OPERATIONS, ConsoleCapability
+from pydantic_ai_backends.permissions.checker import PermissionDeniedError
+from pydantic_ai_backends.permissions.presets import (
+    DEFAULT_RULESET,
+    PERMISSIVE_RULESET,
+    READONLY_RULESET,
+)
+from pydantic_ai_backends.toolsets.console import EXECUTE_TOOLS, create_console_toolset
 
 
 def _make_ctx():
@@ -326,3 +332,91 @@ class TestCapabilityOwnedBackend:
 
         assert "edit_file" in toolset.tools
         assert "hashline_edit" not in toolset.tools
+
+
+class TestDeniedExecuteRemovesEveryShellTool:
+    """A denied `execute` used to leave the background shells behind.
+
+    `_denied_tools` listed only `execute`, and `TOOL_OPERATIONS` had no entry for
+    the background tools at all — so `prepare_tools` kept them and
+    `before_tool_execute` waved them through unchecked. The result was an agent
+    on `READONLY_RULESET`, whose docstring reads "nothing may change or run",
+    holding `run_in_background`, which runs an arbitrary shell command.
+    """
+
+    def test_the_toolset_drops_all_five(self):
+        toolset = create_console_toolset(permissions=READONLY_RULESET)
+
+        assert not EXECUTE_TOOLS & set(toolset.tools)
+
+    async def test_the_capability_drops_all_five(self):
+        cap = ConsoleCapability(permissions=READONLY_RULESET)
+        defs = [ToolDefinition(name=name) for name in sorted(EXECUTE_TOOLS)]
+
+        kept = await cap.prepare_tools(_make_ctx(), defs)
+
+        assert kept == []
+
+    @pytest.mark.parametrize("tool_name", sorted(EXECUTE_TOOLS))
+    async def test_every_shell_tool_is_refused_before_it_runs(self, tool_name: str):
+        """Belt and braces: even reached directly, the check must deny it."""
+        cap = ConsoleCapability(permissions=READONLY_RULESET)
+
+        with pytest.raises(PermissionDeniedError):
+            await cap.before_tool_execute(
+                _make_ctx(),
+                call=ToolCallPart(tool_name=tool_name, args={"command": "id"}),
+                tool_def=ToolDefinition(name=tool_name),
+                args={"command": "id"},
+            )
+
+    def test_every_registered_tool_maps_to_an_operation(self):
+        """An unmapped name is kept *and* unchecked, so the map must be total.
+
+        This is the assertion that would have caught the finding: the background
+        tools were registered by the toolset and absent from `TOOL_OPERATIONS`.
+        """
+        registered = set(create_console_toolset(edit_format="hashline").tools)
+        registered |= set(create_console_toolset(edit_format="str_replace").tools)
+
+        assert registered <= set(TOOL_OPERATIONS)
+
+
+class TestCapabilityApproval:
+    """`permissions` without `ask_callback` made every "ask" ruleset unusable."""
+
+    async def test_an_ask_reaches_the_callback(self):
+        asked: list[tuple[str, str]] = []
+
+        async def approve(operation: str, target: str, reason: str) -> bool:
+            asked.append((operation, target))
+            return True
+
+        cap = ConsoleCapability(permissions=DEFAULT_RULESET, ask_callback=approve)
+
+        args = await cap.before_tool_execute(
+            _make_ctx(),
+            call=ToolCallPart(tool_name="write_file", args={"path": "/a.txt"}),
+            tool_def=ToolDefinition(name="write_file"),
+            args={"path": "/a.txt"},
+        )
+
+        assert args == {"path": "/a.txt"}
+        assert asked == [("write", "/a.txt")]
+
+    async def test_ask_fallback_deny_refuses_instead_of_raising_an_ask_error(self):
+        cap = ConsoleCapability(permissions=DEFAULT_RULESET, ask_fallback="deny")
+
+        with pytest.raises(PermissionDeniedError):
+            await cap.before_tool_execute(
+                _make_ctx(),
+                call=ToolCallPart(tool_name="write_file", args={"path": "/a.txt"}),
+                tool_def=ToolDefinition(name="write_file"),
+                args={"path": "/a.txt"},
+            )
+
+    def test_background_tools_can_be_left_out(self):
+        cap = ConsoleCapability(include_background=False)
+
+        assert "run_in_background" not in cap.get_toolset().tools
+        assert "execute" in cap.get_toolset().tools

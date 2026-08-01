@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pydantic_ai_backends import RuntimeConfig, SessionManager
-from pydantic_ai_backends.backends.docker.session import SessionLimitExceeded
+from pydantic_ai_backends.backends.docker.session import SessionLimitExceeded, _SessionLock
 
 
 class MockDockerSandbox:
@@ -612,15 +612,39 @@ class TestSessionLockPruning:
 
         assert set(manager._locks) == {"kept"}
 
-    async def test_a_held_lock_is_never_pruned(self):
-        """A waiter depends on that exact object for mutual exclusion."""
+    async def test_a_lock_in_use_is_never_pruned(self):
+        """Whoever is inside depends on that exact object for mutual exclusion."""
         manager = SessionManager(sandbox_factory=lambda sid: MockCustomSandbox(sid))
-        manager._locks["in-flight"] = asyncio.Lock()
-        await manager._locks["in-flight"].acquire()
+
+        async def hold() -> None:
+            async with manager._session_lock("in-flight"):
+                await asyncio.sleep(0.05)
+
+        holder = asyncio.create_task(hold())
+        await asyncio.sleep(0)
 
         manager._prune_locks()
 
         assert "in-flight" in manager._locks
+        await holder
+
+    async def test_a_queued_waiter_is_never_pruned(self):
+        """`Lock.locked()` reads False between a release and the waiter resuming.
+
+        Pruning on that alone hands the next caller a fresh lock while a task is
+        still queued on the old one — two tasks in the critical section at once,
+        which is precisely what the lock exists to prevent.
+        """
+        manager = SessionManager(sandbox_factory=lambda sid: MockCustomSandbox(sid))
+        entry = manager._locks.setdefault("contended", _SessionLock())
+        # One holder, one waiter — the state where `locked()` is about to lie.
+        entry.users = 2
+        await entry.lock.acquire()
+        entry.lock.release()
+
+        manager._prune_locks()
+
+        assert manager._locks["contended"] is entry
 
 
 class TestSessionIdleLimits:
@@ -1035,3 +1059,100 @@ class TestAliveOf:
                 return "running"
 
         assert await alive_of(Odd()) is True
+
+
+class TestReleaseIsSerializedWithCreation:
+    """`release` used to mutate `_sessions` and `_locks` with no lock at all.
+
+    `get_or_create` documents its lock as the thing stopping two tasks from each
+    creating a sandbox for one id. A concurrent `release` walked straight past
+    it: it deleted the entry the creating task was about to delete — a `KeyError`
+    out of a public coroutine — and deleted the lock that task was holding, after
+    which the next caller interned a fresh one and both ran at once.
+    """
+
+    class SlowProbe:
+        """A sandbox whose `is_alive` genuinely awaits, as a real one's does.
+
+        The await is the whole point: `DockerSandbox.is_alive` is synchronous, so
+        `get_or_create` never suspends inside its critical section for one and
+        the race is invisible. An `AsyncBaseSandbox` subclass — an SSH or HTTP
+        probe, `RemoteSandbox` over a slow link — does suspend there.
+        """
+
+        built = 0
+
+        def __init__(self, session_id: str) -> None:
+            self.session_id = session_id
+            self.stopped = False
+            self.last_activity = 0.0
+            self._alive = False
+            type(self).built += 1
+
+        async def start(self) -> None:
+            self._alive = True
+
+        async def stop(self) -> None:
+            self._alive = False
+            self.stopped = True
+
+        async def is_alive(self) -> bool:
+            await asyncio.sleep(0)
+            return self._alive
+
+    async def test_a_release_mid_creation_does_not_raise(self):
+        """This raised `KeyError('X')` out of `get_or_create` before the fix."""
+        manager = SessionManager(sandbox_factory=self.SlowProbe)
+        first = await manager.get_or_create("X")
+        first._alive = False  # Dead, so the creator takes the replacement path.
+
+        creating = asyncio.create_task(manager.get_or_create("X"))
+        await asyncio.sleep(0)  # Park the creator inside the critical section.
+        released = await manager.release("X")
+
+        sandbox = await creating
+
+        assert released is True
+        assert sandbox is not None
+        # Serialized: the release ran to completion after the creation did, so
+        # the session is gone and nothing was left running behind it.
+        assert "X" not in manager
+        assert sandbox.stopped is True
+
+    async def test_concurrent_creations_still_share_one_sandbox(self):
+        manager = SessionManager(sandbox_factory=self.SlowProbe)
+        self.SlowProbe.built = 0
+
+        created = await asyncio.gather(*(manager.get_or_create("X") for _ in range(5)))
+
+        assert manager.session_count == 1
+        assert self.SlowProbe.built == 1
+        assert {id(sandbox) for sandbox in created} == {id(manager.sessions["X"])}
+
+    async def test_releasing_a_session_that_is_gone_reports_it(self):
+        manager = SessionManager(sandbox_factory=self.SlowProbe)
+
+        assert await manager.release("never-opened") is False
+
+    async def test_on_release_may_reopen_the_same_session(self):
+        """Called outside the lock, or a callback doing this would deadlock."""
+        manager: SessionManager = SessionManager(sandbox_factory=self.SlowProbe)
+        reopened: list[str] = []
+
+        def reopen(session_id: str) -> None:
+            reopened.append(session_id)
+
+        manager._on_release = reopen
+        await manager.get_or_create("X")
+
+        await asyncio.wait_for(manager.release("X"), timeout=1)
+
+        assert reopened == ["X"]
+
+    async def test_a_released_session_leaves_no_lock_behind(self):
+        manager = SessionManager(sandbox_factory=self.SlowProbe)
+        await manager.get_or_create("X")
+
+        await manager.release("X")
+
+        assert manager._locks == {}

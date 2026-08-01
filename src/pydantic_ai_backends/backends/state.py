@@ -89,7 +89,7 @@ class StateBackend:
         stored = self._files.get(normalize_path(path))
         if stored is None:
             return b""
-        return "\n".join(stored["content"]).encode("utf-8", errors="replace")
+        return _encode("\n".join(stored["content"]))
 
     def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
         """Read a slice of a file with line numbers."""
@@ -120,7 +120,7 @@ class StateBackend:
 
         path = normalize_path(path)
         if isinstance(content, bytes):
-            content = content.decode("utf-8", errors="replace")
+            content = _decode(content)
 
         now = _timestamp()
         existing = self._files.get(path)
@@ -227,10 +227,38 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+BYTES_ERRORS = "surrogateescape"
+"""How bytes cross into the `str` lines this backend stores, and back.
+
+Files here are lines of text, so binary content has to survive a `str` round
+trip. `errors="replace"` did not: every byte that is not UTF-8 became U+FFFD, so
+a PNG written through `write` came back from `read_bytes` as different bytes,
+with a `WriteResult` reporting success. `surrogateescape` maps those bytes to
+lone surrogates and maps them back unchanged, which makes the round trip exact.
+
+The cost is that `read` and `grep` show a surrogate where the undecodable byte
+was — no worse than the replacement character they showed before, and only for
+content that was never text.
+"""
+
+
+def _decode(data: bytes) -> str:
+    """Bytes as the `str` this backend stores, reversibly."""
+    return data.decode("utf-8", errors=BYTES_ERRORS)
+
+
+def _encode(text: str) -> bytes:
+    """Stored text back as the bytes it was written from."""
+    return text.encode("utf-8", errors=BYTES_ERRORS)
+
+
 def _file_entry(name: str, path: str, data: FileData) -> FileInfo:
     return FileInfo(
         name=name,
         path=path,
         is_dir=False,
-        size=sum(len(line) for line in data["content"]),
+        # The separators count: content is stored split on "\n" and rejoined on
+        # the way out, so summing the lines alone reported one byte less per line
+        # than `read_bytes` returns.
+        size=len(_encode("\n".join(data["content"]))),
     )

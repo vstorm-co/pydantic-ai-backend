@@ -31,10 +31,13 @@ import inspect
 import logging
 import time
 from collections.abc import Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
     from concurrent.futures import Executor
 
     from pydantic_ai_backends.types import RuntimeConfig
@@ -50,6 +53,14 @@ LEGACY_ACTIVITY_ATTR = "_last_activity"
 LEGACY_IDLE_TIMEOUT_ATTR = "_idle_timeout"
 """Attributes read as a fallback: custom factory sandboxes were documented
 against these before `BaseSandbox` exposed `last_activity` and `touch`."""
+
+
+@dataclass
+class _SessionLock:
+    """One session id's lock, plus how many tasks are holding or awaiting it."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
 
 
 class SessionLimitExceeded(RuntimeError):
@@ -130,10 +141,11 @@ class SessionManager:
         self._max_sessions = max_sessions
         self._on_release = on_release
         self.executor = executor
-        # Per-session locks serialize concurrent get_or_create calls for the
-        # same id, so two awaits cannot each create and start a sandbox — one of
-        # which would be overwritten in the dict and leaked.
-        self._locks: dict[str, asyncio.Lock] = {}
+        # Per-session locks serialize every lifecycle change for one id —
+        # `get_or_create` and `release` both — so two awaits cannot each create
+        # and start a sandbox (one of which would be overwritten in the dict and
+        # leaked), and a release cannot land in the middle of a creation.
+        self._locks: dict[str, _SessionLock] = {}
 
     @property
     def sessions(self) -> dict[str, Any]:
@@ -160,8 +172,7 @@ class SessionManager:
             SessionLimitExceeded: If `max_sessions` is reached and `session_id`
                 is not an existing live session.
         """
-        lock = self._locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
+        async with self._session_lock(session_id):
             existing = self._sessions.get(session_id)
             if existing is not None:
                 if await alive_of(existing):
@@ -172,7 +183,11 @@ class SessionManager:
                 # reference alone leaks those until garbage collection, which for
                 # an `httpx.Client` means a warning and an unclosed socket. It is
                 # already dead, so a failing stop is expected and ignored.
-                del self._sessions[session_id]
+                #
+                # `pop`, not `del`: `release` holds the same lock now, but a
+                # caller reaching into `_sessions` directly must not turn a
+                # missing key into a KeyError out of a public coroutine.
+                self._sessions.pop(session_id, None)
                 with contextlib.suppress(Exception):
                     await self._lifecycle(existing.stop)
 
@@ -236,14 +251,45 @@ class SessionManager:
             volumes=volumes,
         )
 
-    async def release(self, session_id: str) -> bool:
-        """Stop a session's sandbox. Returns whether the session existed."""
-        if session_id not in self._sessions:
-            return False
+    @asynccontextmanager
+    async def _session_lock(self, session_id: str) -> AsyncIterator[None]:
+        """Hold the lock serializing every lifecycle change for one session id.
 
-        sandbox = self._sessions.pop(session_id)
-        self._locks.pop(session_id, None)
-        await self._lifecycle(sandbox.stop)
+        Interned rather than created per call, so `get_or_create` and `release`
+        contend on the same object — and reference-counted while entered, so
+        :meth:`_prune_locks` cannot drop one out from under a task. Counting
+        rather than asking `Lock.locked()`: between a holder releasing and the
+        woken waiter resuming, a lock reads as unlocked while a task is very much
+        still queued on it, and interning a fresh one for the next caller is how
+        two of them end up creating a sandbox for the same session at once.
+        """
+        entry = self._locks.setdefault(session_id, _SessionLock())
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+
+    async def release(self, session_id: str) -> bool:
+        """Stop a session's sandbox. Returns whether the session existed.
+
+        Takes the session's lock, so a release cannot land in the middle of a
+        `get_or_create` for the same id. Without it the two interleaved: the
+        release removed the entry `get_or_create` was about to delete (a
+        `KeyError` out of a public coroutine) and removed the lock it was
+        holding, after which a third caller interned a new lock and created a
+        second sandbox for one session — the leak the lock is meant to prevent.
+        """
+        async with self._session_lock(session_id):
+            sandbox = self._sessions.pop(session_id, None)
+            if sandbox is None:
+                return False
+            await self._lifecycle(sandbox.stop)
+
+        self._prune_locks()
+        # Outside the lock: `on_release` belongs to the caller, and one that
+        # opens or releases a session from it would otherwise deadlock.
         if self._on_release is not None:
             self._on_release(session_id)
         return True
@@ -294,13 +340,14 @@ class SessionManager:
 
         `get_or_create` interns a lock before it knows whether the sandbox can
         be created, so every rejected or failed creation would otherwise leave
-        an entry behind for good. Held locks are left alone — a waiter is
-        relying on that exact object for mutual exclusion.
+        an entry behind for good. A lock any task is inside — holding it, or
+        queued for it — is left alone: that entry is what mutual exclusion for
+        the id currently is, and replacing it means two tasks proceed at once.
         """
         stale = [
             session_id
-            for session_id, lock in self._locks.items()
-            if session_id not in self._sessions and not lock.locked()
+            for session_id, entry in self._locks.items()
+            if session_id not in self._sessions and entry.users == 0
         ]
         for session_id in stale:
             del self._locks[session_id]

@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 
 from pydantic_ai_backends import StateBackend
 from pydantic_ai_backends.remote import RemoteSandbox, wire
+from pydantic_ai_backends.remote.client import TRANSPORT_SLACK_SECONDS
 from pydantic_ai_backends.remote.server import (
     SandboxdConfig,
     SandboxRuntime,
@@ -75,6 +76,14 @@ class FakeSandbox:
         # Lets a test hold an open inside `start()`, which is where a real one
         # spends its seconds pulling an image.
         self.start_gate: threading.Event | None = None
+        # Seconds every operation blocks for, standing in for a slow command or
+        # a grep over a large tree. Blocking rather than sleeping on the loop,
+        # because that is what a real sandbox does to its worker thread.
+        self.stall = 0.0
+
+    def _work(self) -> None:
+        if self.stall:
+            time.sleep(self.stall)
 
     # lifecycle -----------------------------------------------------------
     @property
@@ -110,18 +119,22 @@ class FakeSandbox:
 
     # operations ----------------------------------------------------------
     def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
+        self._work()
         self.commands.append((command, timeout))
         return ExecuteResponse(output=f"ran {command}", exit_code=0, truncated=False)
 
     def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
+        self._work()
         return self._store.read(path, offset, limit)
 
     def read_bytes(self, path: str) -> bytes:
+        self._work()
         if path in self._blobs:
             return self._blobs[path]
         return self._store.read_bytes(path)
 
     def write(self, path: str, content: str | bytes) -> WriteResult:
+        self._work()
         raw = content if isinstance(content, bytes) else content.encode("utf-8")
         self._blobs[path] = raw
         return self._store.write(path, content)
@@ -129,15 +142,19 @@ class FakeSandbox:
     def edit(
         self, path: str, old_string: str, new_string: str, replace_all: bool = False
     ) -> EditResult:
+        self._work()
         return self._store.edit(path, old_string, new_string, replace_all)
 
     def exists(self, path: str) -> bool:
+        self._work()
         return self._store.exists(path)
 
     def ls_info(self, path: str) -> list[Any]:
+        self._work()
         return self._store.ls_info(path)
 
     def glob_info(self, pattern: str, path: str = "/") -> list[Any]:
+        self._work()
         return self._store.glob_info(pattern, path)
 
     def grep_raw(
@@ -147,6 +164,7 @@ class FakeSandbox:
         glob: str | None = None,
         ignore_hidden: bool = True,
     ) -> Any:
+        self._work()
         return self._store.grep_raw(pattern, path, glob, ignore_hidden)
 
 
@@ -3797,3 +3815,207 @@ class TestUnprivilegedSandboxes:
             )
 
         assert policy.sandbox_uid == os.getuid()
+
+
+class TestOperationsAreBoundedByTheServiceCeiling:
+    """`execute_timeout` is documented as applying to *every* command.
+
+    It was applied on `/exec` and nowhere else. `ls`, `glob`, `grep`, `read` and
+    `write` all reach the sandbox's shell too, so one slow search occupied a
+    worker of the `max_workers` pool with nothing able to reclaim it — and
+    `max_workers` of them wedged the service for every session.
+    """
+
+    @pytest.fixture
+    def slow(self):
+        harness = Harness(execute_timeout=1)
+        with harness.client() as running:
+            yield harness, running
+
+    @staticmethod
+    def _open(client: TestClient) -> tuple[str, dict[str, str]]:
+        created = client.post(
+            "/sessions", json={"session_id": "slow"}, headers=_service_headers()
+        ).json()
+        return created["session"]["session_id"], {wire.TOKEN_HEADER: created["token"]}
+
+    @pytest.mark.parametrize(
+        ("route", "body"),
+        [
+            ("exec", {"command": "sleep 60"}),
+            ("ls", {"path": "/"}),
+            ("read", {"path": "/f"}),
+            ("read_bytes", {"path": "/f"}),
+            ("write", {"path": "/f", "content_b64": "eA=="}),
+            ("edit", {"path": "/f", "old_string": "a", "new_string": "b"}),
+            ("exists", {"path": "/f"}),
+            ("glob", {"pattern": "*.py", "path": "/"}),
+            ("grep", {"pattern": "x"}),
+        ],
+    )
+    def test_an_operation_past_the_ceiling_is_a_504(self, slow, route: str, body: dict[str, Any]):
+        harness, client = slow
+        session_id, headers = self._open(client)
+        # Just past the ceiling: the worker thread cannot be interrupted, so a
+        # longer stall only makes the service's shutdown wait for it.
+        harness.built[session_id].stall = 1.2
+
+        response = client.post(f"/sessions/{session_id}/{route}", json=body, headers=headers)
+
+        assert response.status_code == 504
+        assert "service ceiling" in response.json()["detail"]
+
+    def test_an_operation_inside_the_ceiling_still_answers(self, slow):
+        harness, client = slow
+        session_id, headers = self._open(client)
+
+        response = client.post(f"/sessions/{session_id}/ls", json={"path": "/"}, headers=headers)
+
+        assert response.status_code == 200
+
+
+class TestClientWaitsOutTheServiceCeiling:
+    """The client's transport timeout and the service's ceiling are one contract.
+
+    `TRANSPORT_SLACK_SECONDS` exists so "the transport never gives up before the
+    command it is waiting for", but the two defaults were set independently — 60s
+    against 300s. Anything in between was reported to the agent as an unavailable
+    service while the command was in fact still running, and typically retried.
+    """
+
+    def test_the_ceiling_is_read_from_the_service(self, client: TestClient):
+        sandbox = RemoteSandbox(token=SERVICE_TOKEN, session_id="paired", client=client)
+
+        sandbox.start()
+
+        assert sandbox.server_timeout == float(SandboxdConfig(token="x").execute_timeout)
+
+    def test_a_command_with_no_timeout_waits_that_long_plus_slack(self, client: TestClient):
+        sandbox = RemoteSandbox(token=SERVICE_TOKEN, session_id="paired", client=client)
+        sandbox.start()
+        seen: list[float | None] = []
+        original = client.post
+
+        def record(url: str, **kwargs: Any):
+            seen.append(kwargs.get("timeout"))
+            return original(url, **kwargs)
+
+        sandbox._http.post = record  # type: ignore[method-assign]
+        sandbox.execute("sleep 120")
+
+        assert seen == [sandbox.server_timeout + TRANSPORT_SLACK_SECONDS]
+
+    def test_an_explicit_timeout_still_wins(self, client: TestClient):
+        sandbox = RemoteSandbox(token=SERVICE_TOKEN, session_id="paired", client=client)
+        sandbox.start()
+        seen: list[float | None] = []
+        original = client.post
+
+        def record(url: str, **kwargs: Any):
+            seen.append(kwargs.get("timeout"))
+            return original(url, **kwargs)
+
+        sandbox._http.post = record  # type: ignore[method-assign]
+        sandbox.execute("echo hi", timeout=5)
+
+        assert seen == [5 + TRANSPORT_SLACK_SECONDS]
+
+    def test_a_service_that_will_not_say_falls_back_to_the_local_default(self):
+        """No `/policy`, no pairing — the local timeout is the only answer left."""
+        harness = Harness()
+        with harness.client() as running:
+            sandbox = RemoteSandbox(
+                token=SERVICE_TOKEN, session_id="unpaired", timeout=12.0, client=running
+            )
+            sandbox._http = _NoPolicy(running)
+
+            sandbox.start()
+
+            assert sandbox.server_timeout == 12.0
+
+    def test_a_policy_that_is_not_one_falls_back_too(self):
+        """A proxy in front of the service answers 200 with an HTML page."""
+        harness = Harness()
+        with harness.client() as running:
+            sandbox = RemoteSandbox(
+                token=SERVICE_TOKEN, session_id="proxied", timeout=9.0, client=running
+            )
+            sandbox._http = _NonsensePolicy(running)
+
+            sandbox.start()
+
+            assert sandbox.server_timeout == 9.0
+
+    def test_a_forbidden_policy_falls_back_too(self):
+        """The session token cannot read `/policy`; only the service token can."""
+        harness = Harness()
+        with harness.client() as running:
+            sandbox = RemoteSandbox(
+                token="wrong-token", session_id="denied", timeout=7.0, client=running
+            )
+            sandbox._service_token = SERVICE_TOKEN
+            sandbox._http = _ForbiddenPolicy(running)
+
+            sandbox.start()
+
+            assert sandbox.server_timeout == 7.0
+
+
+class _PolicyProxy:
+    """Passes everything to the real client except `/policy`."""
+
+    def __init__(self, inner: TestClient) -> None:
+        self._inner = inner
+
+    def get(self, url: str, **kwargs: Any):
+        raise NotImplementedError
+
+    def post(self, url: str, **kwargs: Any):
+        return self._inner.post(url, **kwargs)
+
+    def delete(self, url: str, **kwargs: Any):
+        return self._inner.delete(url, **kwargs)
+
+    @property
+    def is_closed(self) -> bool:
+        return False
+
+    def close(self) -> None: ...
+
+
+class _NoPolicy(_PolicyProxy):
+    """A client whose `/policy` is unreachable, as one behind a proxy may be."""
+
+    def get(self, url: str, **kwargs: Any):
+        raise RuntimeError("no route to /policy")
+
+
+class _NonsensePolicy(_PolicyProxy):
+    """A 200 carrying something that is not a policy."""
+
+    def get(self, url: str, **kwargs: Any):
+        return self._inner.get("/healthz")
+
+
+class _ForbiddenPolicy(_PolicyProxy):
+    """A 403, which `_parse` is handed as no answer at all."""
+
+    def get(self, url: str, **kwargs: Any):
+        return self._inner.get("/policy", headers={wire.TOKEN_HEADER: "nope"})
+
+
+class TestEventsRaceWithTheReaper:
+    """`describe` re-looks-up and 404s; `events`, its sibling, subscripted."""
+
+    def test_a_session_reaped_mid_request_is_a_404_not_a_500(self, client: TestClient):
+        created = client.post(
+            "/sessions", json={"session_id": "vanishing"}, headers=_service_headers()
+        ).json()
+        service = client.app.state.service
+        service._sessions.pop("vanishing")
+
+        with pytest.raises(HTTPException) as raised:
+            service.events("vanishing", 0)
+
+        assert raised.value.status_code == 404
+        assert created["token"]

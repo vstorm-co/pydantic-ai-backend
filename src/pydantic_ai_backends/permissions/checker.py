@@ -26,6 +26,9 @@ PATTERN_CACHE_SIZE = 512
 """Compiled patterns kept around. Every check walks a ruleset's rules, so
 recompiling them per call showed up in profiles of read-heavy agent runs."""
 
+MATCHES_NOTHING = re.compile(r"(?!)")
+"""What an unrenderable glob compiles to, so a bad rule is inert, not an error."""
+
 
 class PermissionAskError(Exception):
     """Raised when an operation needs approval and `ask_fallback="error"`.
@@ -89,6 +92,12 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
 
     Supports `*` (anything but `/`), `**` (anything, including `/`), `?` (one
     character but `/`) and `[seq]` character classes with `!` or `^` negation.
+
+    A pattern whose character class is malformed beyond rescue — `[\\]`, whose
+    only `]` is escaped — renders to a regex `re` rejects. It compiles to a
+    pattern matching nothing, so the rule is inert and the operation's own
+    default decides. The alternative was `re.error` escaping the permission
+    check, which every caller here is promised will only ever return an action.
     """
     parts: list[str] = []
     index = 0
@@ -113,7 +122,10 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
             parts.append(re.escape(pattern[index]))
             index += 1
 
-    return re.compile("^" + "".join(parts) + "$")
+    try:
+        return re.compile("^" + "".join(parts) + "$")
+    except re.error:
+        return MATCHES_NOTHING
 
 
 def _character_class(pattern: str, start: int) -> tuple[str, int]:
