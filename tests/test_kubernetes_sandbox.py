@@ -73,6 +73,10 @@ class FakePod:
 
 
 class FakeCoreV1Api:
+    # `stream()` is handed this as its callable; the fake stream ignores it.
+    def connect_get_namespaced_pod_exec(self, *args: Any, **kwargs: Any) -> Any:
+        return None
+
     def __init__(self) -> None:
         self.pods: dict[tuple[str, str], FakePod] = {}
         self.deletes: list[tuple[str, str]] = []
@@ -625,3 +629,437 @@ def test_edit_surfaces_write_error() -> None:
     sb._http.handler = handler
     result = sb.edit("/f.txt", "alpha", "beta")
     assert result.error is not None
+
+
+class _ScriptedStream:
+    """A pod-exec stream whose behaviour a test dictates."""
+
+    def __init__(
+        self,
+        chunks: list[str] | None = None,
+        returncode: int | None = 0,
+        raise_on_update: Exception | None = None,
+        raise_on_close: Exception | None = None,
+    ) -> None:
+        self._chunks = list(chunks or [])
+        self.returncode = returncode
+        self._raise_on_update = raise_on_update
+        self._raise_on_close = raise_on_close
+        self.closed = 0
+        self._pending: str | None = None
+
+    def is_open(self) -> bool:
+        return bool(self._chunks) or self._pending is not None
+
+    def update(self, timeout: int = 1) -> None:
+        if self._raise_on_update is not None:
+            raise self._raise_on_update
+        self._pending = self._chunks.pop(0) if self._chunks else None
+
+    def peek_stdout(self) -> bool:
+        return self._pending is not None
+
+    def read_stdout(self) -> str:
+        payload, self._pending = self._pending or "", None
+        return payload
+
+    def peek_stderr(self) -> bool:
+        return False
+
+    def read_stderr(self) -> str:  # pragma: no cover - stderr never peeks true here
+        return ""
+
+    def close(self) -> None:
+        self.closed += 1
+        if self._raise_on_close is not None:
+            raise self._raise_on_close
+
+
+class TestExecOverTheApi:
+    """The `mode="api"` exec path: pod-exec over a websocket."""
+
+    def _sandbox(self, stream: _ScriptedStream):
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", mode="api", startup_timeout=2)
+        sandbox.start()
+        fake_k8s_stream_mod.stream = lambda *a, **k: stream
+        return sandbox
+
+    def teardown_method(self) -> None:
+        fake_k8s_stream_mod.stream = _stream_fn
+
+    def test_output_is_collected_and_the_stream_closed(self):
+        stream = _ScriptedStream(chunks=["hello ", "world"], returncode=0)
+        sandbox = self._sandbox(stream)
+
+        result = sandbox.execute("echo hello world")
+
+        assert result.output == "hello world"
+        assert result.exit_code == 0
+        assert stream.closed == 1
+
+    def test_an_unknown_status_is_a_failure_not_a_success(self):
+        """The loop also exits on the output cap, with the command still running."""
+        stream = _ScriptedStream(chunks=["partial"], returncode=None)
+        sandbox = self._sandbox(stream)
+
+        result = sandbox.execute("some-command")
+
+        assert result.exit_code == 1
+
+    def test_a_nonzero_status_is_reported(self):
+        stream = _ScriptedStream(chunks=["nope"], returncode=127)
+
+        assert self._sandbox(stream).execute("missing").exit_code == 127
+
+    def test_a_dropped_connection_still_closes_the_stream(self):
+        """Otherwise one websocket leaks for every failed command."""
+        stream = _ScriptedStream(chunks=["x"], raise_on_update=OSError("connection reset"))
+        sandbox = self._sandbox(stream)
+
+        result = sandbox.execute("echo hi")
+
+        assert result.exit_code == 1
+        assert "connection reset" in result.output
+        assert stream.closed == 1
+
+    def test_a_failing_close_does_not_mask_the_result(self):
+        stream = _ScriptedStream(chunks=["done"], returncode=0, raise_on_close=OSError("already"))
+        sandbox = self._sandbox(stream)
+
+        result = sandbox.execute("echo done")
+
+        assert result.exit_code == 0
+        assert result.output == "done"
+
+    def test_a_stream_that_cannot_be_opened_is_reported(self):
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", mode="api", startup_timeout=2)
+        sandbox.start()
+
+        def refuse(*args, **kwargs):
+            raise OSError("no route to host")
+
+        fake_k8s_stream_mod.stream = refuse
+
+        result = sandbox.execute("echo hi")
+
+        assert result.exit_code == 1
+        assert "no route to host" in result.output
+
+
+class TestApiModeFallsBackToTheShell:
+    """In `mode="api"` the file operations come from `BaseSandbox`, over exec."""
+
+    def _sandbox(self, output: str, returncode: int | None = 0):
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", mode="api", startup_timeout=2)
+        sandbox.start()
+        fake_k8s_stream_mod.stream = lambda *a, **k: _ScriptedStream(
+            chunks=[output], returncode=returncode
+        )
+        return sandbox
+
+    def teardown_method(self) -> None:
+        fake_k8s_stream_mod.stream = _stream_fn
+
+    def test_read_bytes_goes_through_cat(self):
+        assert self._sandbox("payload").read_bytes("/f.txt") == b"payload"
+
+    def test_read_goes_through_awk(self):
+        assert self._sandbox("     1\thello").read("/f.txt") == "     1\thello"
+
+    def test_ls_info_parses_a_listing(self):
+        listing = "total 4\n-rw-r--r-- 1 root root 12 Jan  1 00:00 notes.md\n"
+
+        rows = self._sandbox(listing).ls_info("/work")
+
+        assert [row["name"] for row in rows] == ["notes.md"]
+        assert rows[0]["path"] == "/work/notes.md"
+
+    def test_glob_info_parses_find_output(self):
+        rows = self._sandbox("/w/a.py\n").glob_info("*.py", "/w")
+
+        assert [row["path"] for row in rows] == ["/w/a.py"]
+
+    def test_write_goes_through_a_heredoc(self):
+        assert self._sandbox("").write("/f.txt", "body").path == "/f.txt"
+
+
+class TestPodReadiness:
+    def test_a_terminal_phase_is_reported_and_cleaned_up(self, monkeypatch):
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", startup_timeout=2)
+
+        real_read = FakeCoreV1Api.read_namespaced_pod
+
+        def terminal(self, name: str, namespace: str):
+            pod = real_read(self, name, namespace)
+            pod.status = FakePodStatus(phase="Failed", pod_ip=None, conditions=[])
+            return pod
+
+        monkeypatch.setattr(FakeCoreV1Api, "read_namespaced_pod", terminal)
+
+        with pytest.raises(RuntimeError, match="terminal phase Failed"):
+            sandbox.start()
+
+        assert sandbox._core.deletes  # cleaned up rather than left behind
+
+    def test_a_pod_that_never_becomes_ready_times_out(self, monkeypatch):
+        from pydantic_ai_backends.backends import kubernetes as module
+
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", startup_timeout=0)
+        real_read = FakeCoreV1Api.read_namespaced_pod
+
+        def pending(self, name: str, namespace: str):
+            pod = real_read(self, name, namespace)
+            pod.status = FakePodStatus(phase="Pending", pod_ip=None, conditions=[])
+            return pod
+
+        monkeypatch.setattr(FakeCoreV1Api, "read_namespaced_pod", pending)
+        monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+        with pytest.raises(RuntimeError, match="not ready"):
+            sandbox.start()
+
+    def test_a_running_pod_without_a_ready_condition_keeps_waiting(self, monkeypatch):
+        from pydantic_ai_backends.backends import kubernetes as module
+
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", startup_timeout=0)
+        real_read = FakeCoreV1Api.read_namespaced_pod
+
+        def not_ready(self, name: str, namespace: str):
+            pod = real_read(self, name, namespace)
+            pod.status = FakePodStatus(
+                phase="Running",
+                pod_ip="10.0.0.1",
+                conditions=[FakePodCondition(type="Ready", status="False")],
+            )
+            return pod
+
+        monkeypatch.setattr(FakeCoreV1Api, "read_namespaced_pod", not_ready)
+        monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+        with pytest.raises(RuntimeError, match="not ready"):
+            sandbox.start()
+
+
+class TestLiveness:
+    def test_a_stopped_sandbox_is_not_alive(self):
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", startup_timeout=2)
+        sandbox.start()
+        sandbox.stop()
+
+        assert sandbox.is_alive() is False
+
+    def test_an_unreachable_api_is_not_alive(self, monkeypatch):
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", startup_timeout=2)
+        sandbox.start()
+
+        def refuse(self, name: str, namespace: str):
+            raise OSError("no route to host")
+
+        monkeypatch.setattr(FakeCoreV1Api, "read_namespaced_pod", refuse)
+
+        assert sandbox.is_alive() is False
+
+    def test_a_pod_not_running_is_not_alive(self, monkeypatch):
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", startup_timeout=2)
+        sandbox.start()
+        real_read = FakeCoreV1Api.read_namespaced_pod
+
+        def pending(self, name: str, namespace: str):
+            pod = real_read(self, name, namespace)
+            pod.status = FakePodStatus(phase="Pending", pod_ip=None, conditions=[])
+            return pod
+
+        monkeypatch.setattr(FakeCoreV1Api, "read_namespaced_pod", pending)
+
+        assert sandbox.is_alive() is False
+
+
+class TestConfigLoading:
+    def test_an_explicit_kube_config_path_is_used(self, monkeypatch):
+        seen: list[str | None] = []
+        monkeypatch.setattr(
+            fake_k8s_config, "load_kube_config", lambda config_file=None: seen.append(config_file)
+        )
+
+        KubernetesPodSandbox("img:1", sandbox_id="abc", kube_config_path="/tmp/kube.yaml")
+
+        assert seen == ["/tmp/kube.yaml"]
+
+    def test_in_cluster_config_is_used_when_asked(self, monkeypatch):
+        called: list[int] = []
+        monkeypatch.setattr(fake_k8s_config, "load_incluster_config", lambda: called.append(1))
+
+        KubernetesPodSandbox("img:1", sandbox_id="abc", in_cluster=True)
+
+        assert called == [1]
+
+    def test_a_failing_config_load_is_reported(self, monkeypatch):
+        def refuse(*args, **kwargs):
+            raise OSError("no kubeconfig")
+
+        monkeypatch.setattr(fake_k8s_config, "load_kube_config", refuse)
+
+        with pytest.raises(RuntimeError, match="failed to load kubernetes config"):
+            KubernetesPodSandbox("img:1", sandbox_id="abc", in_cluster=False)
+
+
+class TestHttpModeListingFailures:
+    """`mode="http"` talks to the in-pod agent; a failure there yields `[]`."""
+
+    def _sandbox(self):
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", startup_timeout=2)
+        sandbox.start()
+        return sandbox
+
+    def test_a_transport_failure_on_ls_is_empty(self):
+        sandbox = self._sandbox()
+
+        def refuse(path: str, payload: Any) -> Any:
+            raise OSError("connection reset")
+
+        sandbox._http.handler = refuse
+
+        assert sandbox.ls_info("/") == []
+
+    def test_an_error_status_on_ls_is_empty(self):
+        sandbox = self._sandbox()
+        sandbox._http.handler = lambda path, payload: FakeHttpResponse(status_code=500)
+
+        assert sandbox.ls_info("/") == []
+
+    def test_a_transport_failure_on_glob_is_empty(self):
+        sandbox = self._sandbox()
+
+        def refuse(path: str, payload: Any) -> Any:
+            raise OSError("connection reset")
+
+        sandbox._http.handler = refuse
+
+        assert sandbox.glob_info("*.py") == []
+
+    def test_an_error_status_on_glob_is_empty(self):
+        sandbox = self._sandbox()
+        sandbox._http.handler = lambda path, payload: FakeHttpResponse(status_code=503)
+
+        assert sandbox.glob_info("*.py") == []
+
+
+class TestGeneratedIdentity:
+    def test_an_id_is_generated_when_none_is_given(self):
+        first = KubernetesPodSandbox("img:1")
+        second = KubernetesPodSandbox("img:1")
+
+        assert first.id and second.id
+        assert first.id != second.id
+
+
+class TestStderrIsCollected:
+    def teardown_method(self) -> None:
+        fake_k8s_stream_mod.stream = _stream_fn
+
+    def test_stderr_lands_in_the_output(self):
+        class WithStderr(_ScriptedStream):
+            def __init__(self) -> None:
+                super().__init__(chunks=["out "], returncode=1)
+                self._stderr: str | None = "boom"
+
+            def peek_stderr(self) -> bool:
+                return self._stderr is not None
+
+            def read_stderr(self) -> str:
+                payload, self._stderr = self._stderr or "", None
+                return payload
+
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", mode="api", startup_timeout=2)
+        sandbox.start()
+        fake_k8s_stream_mod.stream = lambda *a, **k: WithStderr()
+
+        result = sandbox.execute("failing")
+
+        assert "boom" in result.output
+        assert result.exit_code == 1
+
+    def test_an_update_with_no_output_is_tolerated(self):
+        """`resp.update` can return with neither channel ready."""
+
+        class Quiet(_ScriptedStream):
+            def __init__(self) -> None:
+                super().__init__(chunks=["", "done"], returncode=0)
+
+            def peek_stdout(self) -> bool:
+                return bool(self._pending)
+
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", mode="api", startup_timeout=2)
+        sandbox.start()
+        fake_k8s_stream_mod.stream = lambda *a, **k: Quiet()
+
+        assert sandbox.execute("quiet").output == "done"
+
+
+class TestHttpModeGlobSuccess:
+    def test_rows_are_converted(self):
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", startup_timeout=2)
+        sandbox.start()
+        sandbox._http.handler = lambda path, payload: FakeHttpResponse(
+            status_code=200,
+            json_data=[{"name": "a.py", "path": "/w/a.py", "is_dir": False, "size": 3}],
+        )
+
+        rows = sandbox.glob_info("*.py")
+
+        assert [row["path"] for row in rows] == ["/w/a.py"]
+
+
+class TestReadinessPolling:
+    def test_it_waits_between_polls_until_the_pod_is_ready(self, monkeypatch):
+        from pydantic_ai_backends.backends import kubernetes as module
+
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", startup_timeout=30)
+        real_read = FakeCoreV1Api.read_namespaced_pod
+        polls: list[int] = []
+        slept: list[float] = []
+
+        def eventually(self, name: str, namespace: str):
+            pod = real_read(self, name, namespace)
+            polls.append(1)
+            if len(polls) == 1:
+                pod.status = FakePodStatus(phase="Pending", pod_ip=None, conditions=[])
+            else:
+                pod.status = FakePodStatus()
+            return pod
+
+        monkeypatch.setattr(FakeCoreV1Api, "read_namespaced_pod", eventually)
+        monkeypatch.setattr(module.time, "sleep", lambda seconds: slept.append(seconds))
+
+        sandbox.start()
+
+        assert len(polls) == 2
+        assert slept == [0.5]
+
+    def test_a_running_pod_not_yet_ready_is_waited_out(self, monkeypatch):
+        """Running with an IP but no Ready condition means keep polling."""
+        from pydantic_ai_backends.backends import kubernetes as module
+
+        sandbox = KubernetesPodSandbox("img:1", sandbox_id="abc", startup_timeout=30)
+        real_read = FakeCoreV1Api.read_namespaced_pod
+        polls: list[int] = []
+
+        def eventually_ready(self, name: str, namespace: str):
+            pod = real_read(self, name, namespace)
+            polls.append(1)
+            if len(polls) == 1:
+                pod.status = FakePodStatus(
+                    phase="Running",
+                    pod_ip="10.0.0.9",
+                    conditions=[FakePodCondition(type="Ready", status="False")],
+                )
+            else:
+                pod.status = FakePodStatus()
+            return pod
+
+        monkeypatch.setattr(FakeCoreV1Api, "read_namespaced_pod", eventually_ready)
+        monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+        sandbox.start()
+
+        assert len(polls) == 2

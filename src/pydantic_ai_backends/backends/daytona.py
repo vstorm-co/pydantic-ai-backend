@@ -32,7 +32,7 @@ from pydantic_ai_backends.types import EditResult, ExecuteResponse, WriteResult
 DEFAULT_EXEC_TIMEOUT = 30 * 60
 
 
-class DaytonaSandbox(BaseSandbox):  # pragma: no cover
+class DaytonaSandbox(BaseSandbox):
     """Daytona cloud sandbox backend.
 
     Creates an ephemeral Daytona sandbox for running commands and managing

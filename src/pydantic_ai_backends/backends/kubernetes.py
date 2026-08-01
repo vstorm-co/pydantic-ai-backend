@@ -40,7 +40,7 @@ DEFAULT_STARTUP_TIMEOUT = 60
 DEFAULT_PORT = 8080
 
 
-class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
+class KubernetesPodSandbox(BaseSandbox):
     """Sandbox backed by a Kubernetes pod.
 
     Args:
@@ -322,6 +322,13 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
                 tty=False,
                 _preload_content=False,
             )
+        except Exception as exc:
+            return ExecuteResponse(output=f"Error: {exc}", exit_code=1, truncated=False)
+
+        # `close` in `finally`: the read loop below can raise on a dropped
+        # connection, and the websocket would then stay open for the life of the
+        # process — one leaked socket per failed command.
+        try:
             output = bytearray()
             while resp.is_open() and len(output) < MAX_EXECUTE_OUTPUT_BYTES:
                 resp.update(timeout=1)
@@ -329,16 +336,23 @@ class KubernetesPodSandbox(BaseSandbox):  # pragma: no cover
                     output.extend(resp.read_stdout().encode("utf-8", errors="replace"))
                 if resp.peek_stderr():
                     output.extend(resp.read_stderr().encode("utf-8", errors="replace"))
-            exit_code = resp.returncode if resp.returncode is not None else 0
-            resp.close()
-            truncated = len(output) >= MAX_EXECUTE_OUTPUT_BYTES
-            return ExecuteResponse(
-                output=bytes(output[:MAX_EXECUTE_OUTPUT_BYTES]).decode("utf-8", errors="replace"),
-                exit_code=exit_code,
-                truncated=truncated,
-            )
+            # `1` for an unknown status, never `0`. The loop also exits once the
+            # output cap is hit, with the command still running and no return
+            # code yet — reporting that as success told the caller a truncated
+            # command had passed. `LocalBackend` already defaults to `1`.
+            exit_code = resp.returncode if resp.returncode is not None else 1
         except Exception as exc:
             return ExecuteResponse(output=f"Error: {exc}", exit_code=1, truncated=False)
+        finally:
+            with contextlib.suppress(Exception):
+                resp.close()
+
+        truncated = len(output) >= MAX_EXECUTE_OUTPUT_BYTES
+        return ExecuteResponse(
+            output=bytes(output[:MAX_EXECUTE_OUTPUT_BYTES]).decode("utf-8", errors="replace"),
+            exit_code=exit_code,
+            truncated=truncated,
+        )
 
     def read_bytes(self, path: str) -> bytes:
         # Match LocalBackend semantics: return b"" on missing / transport /
