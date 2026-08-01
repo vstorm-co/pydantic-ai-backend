@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A listing no longer reports paths the sandbox cannot read back.** `ls_info` built each row's `path` from the *shell-quoted* directory, so listing `/my work` returned `'/my work'/notes.md` — a path that does not exist. A model handed that row and asking to read it got a failure it could not recover from, and the directory was effectively unreachable. Plain paths quote to themselves, which is why it went unnoticed. Affects every shell-derived sandbox: Docker, Daytona, Kubernetes and any third-party one.
+
 - **`is_async_backend` is importable from the package root**, alongside `ensure_async`. 0.2.17 announced it as public API and documented it, but only added it to `adapter.py` — so `from pydantic_ai_backends import is_async_backend` raised `ImportError` and the only way in was the submodule path.
 
 ## [0.2.17] - 2026-08-01

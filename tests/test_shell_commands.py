@@ -96,6 +96,25 @@ drwxr-xr-x 2 root root 4096 Jan  1 00:00 src
     def test_a_failed_listing_is_empty(self):
         assert _shell.parse_ls(_failed(), "/w") == []
 
+    @pytest.mark.parametrize(
+        "root,expected",
+        [
+            ("/work", "/work/notes.md"),
+            ("/work/", "/work/notes.md"),
+            ("/", "/notes.md"),
+            # Built from the shell-quoted root this was `'/my work'/notes.md`,
+            # which the model then sent back to `read` and which does not exist.
+            ("/my work", "/my work/notes.md"),
+            ("/it's mine", "/it's mine/notes.md"),
+        ],
+    )
+    def test_the_reported_path_is_usable_not_shell_quoted(self, root: str, expected: str):
+        listing = "total 4\n-rw-r--r-- 1 root root 1 Jan  1 00:00 notes.md\n"
+
+        rows = _shell.parse_ls(_ok(listing), root)
+
+        assert rows[0]["path"] == expected
+
 
 class TestReadBytes:
     def test_content_is_returned(self):
