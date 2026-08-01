@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The console tools' own rendering is covered.** Every tool body sat behind a blanket `# pragma: no cover`, so how a listing, a glob, a grep or a background shell is actually *rendered for the model* was unmeasured — and both `hashline` variants, which register only under `edit_format="hashline"`, had no coverage at all. 29 tests now cover them: the empty and truncated forms of `ls`, `glob` and `grep`, `grep`'s count mode and its error passthrough, a hashline read and a full hashline edit round trip including a stale hash and a failing write-back, and the background tools with and without a sandbox that has a shell.
 - **`LocalBackend`'s failure and denial paths are covered.** 30 of its methods' error handlers sat behind a blanket `# pragma: no cover`, so in the backend most users touch, the code that turns a denied path or a filesystem error into a reportable result was never run by a test — including every `PermissionError` handler on its permission boundary. The pragmas are gone and 45 tests cover it: a path outside the allowed directories for every operation, an unreadable file and directory, an offset past the end, a read of a directory, `OSError` on read, write, edit and glob, and both grep implementations forced explicitly rather than left to whether `rg` happens to be installed — which is what made this file's coverage depend on the machine. The glob truncation above is what the pass found.
 
 ### Fixed

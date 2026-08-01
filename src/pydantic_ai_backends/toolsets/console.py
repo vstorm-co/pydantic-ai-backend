@@ -278,7 +278,7 @@ def create_console_toolset(  # noqa: C901
 
     @toolset.tool(description=described.get("ls", LS_DESCRIPTION))
     @_degrade_on_error
-    async def ls(  # pragma: no cover
+    async def ls(
         ctx: RunContext[ConsoleDeps],
         path: str = ".",
     ) -> str:
@@ -304,7 +304,7 @@ def create_console_toolset(  # noqa: C901
 
         @toolset.tool(description=described.get("read_file", HASHLINE_READ_FILE_DESCRIPTION))
         @_degrade_on_error
-        async def read_file(  # pragma: no cover
+        async def read_file(
             ctx: RunContext[ConsoleDeps],
             path: str,
             offset: int = 0,
@@ -335,7 +335,7 @@ def create_console_toolset(  # noqa: C901
 
         @toolset.tool(description=described.get("read_file", READ_FILE_DESCRIPTION))
         @_degrade_on_error
-        async def read_file(  # pragma: no cover
+        async def read_file(
             ctx: RunContext[ConsoleDeps],
             path: str,
             offset: int = 0,
@@ -363,7 +363,7 @@ def create_console_toolset(  # noqa: C901
         requires_approval=write_approval,
     )
     @_degrade_on_error
-    async def write_file(  # pragma: no cover
+    async def write_file(
         ctx: RunContext[ConsoleDeps],
         path: str,
         content: str,
@@ -390,7 +390,7 @@ def create_console_toolset(  # noqa: C901
             requires_approval=write_approval,
         )
         @_degrade_on_error
-        async def hashline_edit(  # pragma: no cover
+        async def hashline_edit(
             ctx: RunContext[ConsoleDeps],
             path: str,
             start_line: int,
@@ -446,7 +446,7 @@ of replacing it.
             requires_approval=write_approval,
         )
         @_degrade_on_error
-        async def edit_file(  # pragma: no cover
+        async def edit_file(
             ctx: RunContext[ConsoleDeps],
             path: str,
             old_string: str,
@@ -481,7 +481,7 @@ the old_string must appear exactly once in the file.
 
     @toolset.tool(description=described.get("glob", GLOB_DESCRIPTION))
     @_degrade_on_error
-    async def glob(  # pragma: no cover
+    async def glob(
         ctx: RunContext[ConsoleDeps],
         pattern: str,
         path: str = ".",
@@ -504,7 +504,7 @@ the old_string must appear exactly once in the file.
 
     @toolset.tool(description=described.get("grep", GREP_DESCRIPTION))
     @_degrade_on_error
-    async def grep(  # pragma: no cover
+    async def grep(
         ctx: RunContext[ConsoleDeps],
         pattern: str,
         path: str | None = None,
@@ -587,7 +587,7 @@ for long-running builds or test suites.
 
     if include_execute and include_background:
 
-        def background(ctx: RunContext[ConsoleDeps]) -> Any | None:  # pragma: no cover
+        def background(ctx: RunContext[ConsoleDeps]) -> Any | None:
             """The async background sandbox, or `None` when unsupported."""
             backend = ensure_async(backend_for(ctx))
             return backend if hasattr(backend, "execute_background") else None
@@ -597,7 +597,7 @@ for long-running builds or test suites.
             requires_approval=execute_approval,
         )
         @_degrade_on_error
-        async def run_in_background(  # pragma: no cover
+        async def run_in_background(
             ctx: RunContext[ConsoleDeps],
             command: str,
         ) -> str:
@@ -618,7 +618,7 @@ for long-running builds or test suites.
 
         @toolset.tool(description=described.get("read_output", READ_OUTPUT_DESCRIPTION))
         @_degrade_on_error
-        async def read_output(  # pragma: no cover
+        async def read_output(
             ctx: RunContext[ConsoleDeps],
             shell_id: str,
         ) -> str:
@@ -641,7 +641,7 @@ for long-running builds or test suites.
             requires_approval=execute_approval,
         )
         @_degrade_on_error
-        async def kill_shell(  # pragma: no cover
+        async def kill_shell(
             ctx: RunContext[ConsoleDeps],
             shell_id: str,
         ) -> str:
@@ -659,7 +659,7 @@ for long-running builds or test suites.
 
         @toolset.tool(description=described.get("list_shells", LIST_SHELLS_DESCRIPTION))
         @_degrade_on_error
-        async def list_shells(  # pragma: no cover
+        async def list_shells(
             ctx: RunContext[ConsoleDeps],
         ) -> str:
             """List the background shells started this session."""
