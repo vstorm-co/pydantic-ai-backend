@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`LocalBackend`'s failure and denial paths are covered.** 30 of its methods' error handlers sat behind a blanket `# pragma: no cover`, so in the backend most users touch, the code that turns a denied path or a filesystem error into a reportable result was never run by a test — including every `PermissionError` handler on its permission boundary. The pragmas are gone and 45 tests cover it: a path outside the allowed directories for every operation, an unreadable file and directory, an offset past the end, a read of a directory, `OSError` on read, write, edit and glob, and both grep implementations forced explicitly rather than left to whether `rg` happens to be installed — which is what made this file's coverage depend on the machine. The glob truncation above is what the pass found.
+
 ### Fixed
+
+- **A glob no longer silently returns a short answer.** `LocalBackend.glob_info` wrapped its whole walk in one `try`, so a single entry that could not be stat'd — deleted between the glob and the stat, or in a directory the process cannot read — aborted the loop and returned whatever had been collected. Measured on four matching files with one bad entry: **one** came back. The model gets an incomplete answer with nothing to indicate it, which is worse than a missing row and worse than an error. Now skipped per entry, matching `ls_info` and `grep_raw`, which both already carried on.
 
 - **A listing no longer reports paths the sandbox cannot read back.** `ls_info` built each row's `path` from the *shell-quoted* directory, so listing `/my work` returned `'/my work'/notes.md` — a path that does not exist. A model handed that row and asking to read it got a failure it could not recover from, and the directory was effectively unreachable. Plain paths quote to themselves, which is why it went unnoticed. Affects every shell-derived sandbox: Docker, Daytona, Kubernetes and any third-party one.
 
