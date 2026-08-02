@@ -8,6 +8,12 @@ on:
     branches:
       - main
 
+# Nothing here writes to the repository: it lints, types, tests, and builds an
+# image it does not push. Declared at the top so a job added later starts from
+# read-only rather than inheriting whatever the repository default happens to be.
+permissions:
+  contents: read
+
 env:
   COLUMNS: 150
 
