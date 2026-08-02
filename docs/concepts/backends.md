@@ -164,7 +164,7 @@ back:
 ```python
 import json
 
-stored = json.dumps(backend.files, ensure_ascii=False)   # into a jsonb column
+stored = json.dumps(backend.files, ensure_ascii=False)  # into a jsonb column
 restored = StateBackend(files=json.loads(stored))
 ```
 
