@@ -38,6 +38,8 @@ from pydantic_ai_backends.permissions.types import (
 )
 from pydantic_ai_backends.protocol import AsyncBackendProtocol, BackendProtocol
 from pydantic_ai_backends.toolsets.console import (
+    DEFAULT_MAX_DOCUMENT_BYTES,
+    DEFAULT_MAX_IMAGE_BYTES,
     EditFormat,
     create_console_toolset,
     get_console_system_prompt,
@@ -132,6 +134,37 @@ class ConsoleCapability(AbstractCapability[Any]):
     edit_format: EditFormat = "str_replace"
     """Edit format: 'str_replace' or 'hashline'."""
 
+    image_support: bool = False
+    """Return recognized images from `read_file` as `BinaryContent`.
+
+    Without it a multimodal model reading a `.png` gets the bytes as garbled
+    text. With it the agent can look at a chart it rendered a moment ago, which
+    is the loop that makes producing one useful.
+    """
+
+    max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES
+    """Largest image returned; bigger ones yield an error."""
+
+    document_support: bool = False
+    """Return recognized documents (`.pdf`) as `BinaryContent`.
+
+    Separate from `image_support` because the model support is separate: a model
+    that sees images does not necessarily read PDFs natively.
+    """
+
+    max_document_bytes: int = DEFAULT_MAX_DOCUMENT_BYTES
+    """Largest document returned; bigger ones yield an error."""
+
+    descriptions: dict[str, str] | None = None
+    """Per-tool description overrides, keyed by tool name.
+
+    A host that lists these tools in its own catalogue needs the text it shows
+    and the text the model reads to be the same string. Without this the two are
+    written in different repositories and drift, and the drift is invisible: the
+    person choosing what to allow and the model choosing when to act are reading
+    different descriptions of the same tool.
+    """
+
     permissions: PermissionRuleset | None = None
     """Permission ruleset for controlling tool access."""
 
@@ -157,6 +190,11 @@ class ConsoleCapability(AbstractCapability[Any]):
             include_execute=self.include_execute,
             include_background=self.include_background,
             edit_format=self.edit_format,
+            image_support=self.image_support,
+            max_image_bytes=self.max_image_bytes,
+            document_support=self.document_support,
+            max_document_bytes=self.max_document_bytes,
+            descriptions=self.descriptions,
             # Passed through as well as being enforced in `prepare_tools`: the
             # toolset drops a denied operation's tools outright, so they are gone
             # rather than merely hidden from one request's tool definitions.

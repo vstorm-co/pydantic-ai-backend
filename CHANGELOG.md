@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.24] - 2026-08-03
+
+### Added
+
+- **`ConsoleCapability` forwards the toolset options it was hiding**:
+  `image_support`, `max_image_bytes`, `document_support`, `max_document_bytes`
+  and `descriptions`. The capability is the recommended entry point and builds
+  the toolset itself, so an option it did not forward was an option nobody using
+  it could reach — `edit_format` was the same bug one step later, reaching the
+  instructions while the toolset kept registering `edit_file`.
+
+  `image_support` is the one that changes what an agent can do: without it a
+  multimodal model reading a `.png` gets the bytes as garbled text, so an agent
+  cannot look at a chart it rendered a moment ago. `descriptions` matters to a
+  host that lists these tools in its own catalogue — without it the text shown
+  to whoever decides what to allow and the text read by the model deciding when
+  to act are written in different repositories, and drift silently.
+
 ## [0.2.23] - 2026-08-03
 
 Dependency updates to the pieces 0.2.22 introduced. No library code changed.

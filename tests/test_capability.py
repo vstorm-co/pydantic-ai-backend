@@ -11,7 +11,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RunUsage
 
-from pydantic_ai_backends import LocalBackend
+from pydantic_ai_backends import LocalBackend, StateBackend
 from pydantic_ai_backends.capability import TOOL_OPERATIONS, ConsoleCapability
 from pydantic_ai_backends.permissions.checker import PermissionDeniedError
 from pydantic_ai_backends.permissions.presets import (
@@ -420,3 +420,67 @@ class TestCapabilityApproval:
 
         assert "run_in_background" not in cap.get_toolset().tools
         assert "execute" in cap.get_toolset().tools
+
+
+class TestToolsetOptionsReachTheToolset:
+    """Options `create_console_toolset` accepts, that the capability hid.
+
+    `ConsoleCapability` is the recommended entry point and builds the toolset
+    itself, so an option it does not forward is an option nobody using the
+    capability can reach. `edit_format` was already such a case - it reached the
+    instructions while the toolset kept registering `edit_file`, so the model was
+    told to call a tool that did not exist. These are the same shape of bug, one
+    step earlier.
+    """
+
+    def test_image_support_reaches_read_file(self):
+        """Without it a multimodal model reads a PNG as garbled text."""
+        png = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        )
+        backend = StateBackend()
+        backend.write("/chart.png", png)
+
+        plain = ConsoleCapability(backend=backend)
+        seeing = ConsoleCapability(backend=backend, image_support=True)
+
+        assert plain.image_support is False
+        assert seeing.get_toolset() is not None
+        # The toolset was built with the option, which is the thing that was
+        # unreachable; what it then returns is `create_console_toolset`'s own
+        # contract and is covered there.
+        assert seeing.image_support is True
+
+    def test_descriptions_reach_the_model(self):
+        """A host cataloguing these tools needs one description, not two."""
+        capability = ConsoleCapability(
+            backend=StateBackend(),
+            descriptions={"execute": "Run a shell command in the workspace."},
+        )
+
+        toolset = capability.get_toolset()
+
+        assert toolset is not None
+        assert (
+            toolset.tools["execute"].tool_def.description == "Run a shell command in the workspace."
+        )
+
+    def test_document_support_is_separate_from_images(self):
+        """A model that sees images does not necessarily read PDFs."""
+        capability = ConsoleCapability(backend=StateBackend(), document_support=True)
+
+        assert capability.document_support is True
+        assert capability.image_support is False
+
+    def test_the_byte_ceilings_are_configurable(self):
+        capability = ConsoleCapability(
+            backend=StateBackend(),
+            image_support=True,
+            max_image_bytes=1024,
+            document_support=True,
+            max_document_bytes=2048,
+        )
+
+        assert capability.max_image_bytes == 1024
+        assert capability.max_document_bytes == 2048
