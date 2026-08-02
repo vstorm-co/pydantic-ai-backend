@@ -77,6 +77,25 @@ ceilings.
     options:
       show_root_heading: true
 
+## Configuration from the environment
+
+Every field of `SandboxdConfig` is `SANDBOXD_` plus its name in upper case. The
+shipped entrypoint — `python -m pydantic_ai_backends.remote.server` — is this
+plus uvicorn, and it is importable so a service embedded in something larger can
+parse the environment and then adjust what it produced.
+
+::: pydantic_ai_backends.remote.env.config_from_env
+    options:
+      show_root_heading: true
+
+::: pydantic_ai_backends.remote.env.bind_from_env
+    options:
+      show_root_heading: true
+
+::: pydantic_ai_backends.remote.env.SandboxdConfigError
+    options:
+      show_root_heading: true
+
 ## Wire protocol
 
 The HTTP contract as Pydantic models — one source of truth for both sides.

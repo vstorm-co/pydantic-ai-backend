@@ -944,6 +944,13 @@ class _Service:
         self._sweep_task: asyncio.Task[None] | None = None
         self._prewarm_task: asyncio.Task[None] | None = None
         self._usage_cache: dict[str, tuple[float, wire.SessionUsage | None]] = {}
+        # The clock the usage cache ages against, as an attribute so a test can
+        # advance it. Patching `time.monotonic` in this module instead reaches
+        # the *global* function, which is also what the event loop schedules
+        # against — freezing it stalls timers and makes anything running
+        # concurrently racy, which is how the expiry test came to fail only under
+        # the newer stack.
+        self.now: Callable[[], float] = time.monotonic
         # Operations in flight per session. `last_activity` is stamped when a
         # command *starts*, so a long exec looks idle while it runs — evicting on
         # that alone would kill work mid-command.
@@ -1219,7 +1226,7 @@ class _Service:
         second-long blocking round trip to the daemon, and holding the loop for
         it would stall every agent's command while a dashboard polls.
         """
-        now = time.monotonic()
+        now = self.now()
         cached = self._usage_cache.get(session_id)
         if cached is not None and now - cached[0] < USAGE_CACHE_SECONDS:
             return cached[1]
@@ -2133,36 +2140,33 @@ def create_app(
 
 
 def run() -> None:  # pragma: no cover - thin CLI wrapper around uvicorn
-    """Serve the app configured from environment variables.
+    """Serve the service described by the environment.
 
-    Reads `SANDBOXD_TOKEN` (required), `SANDBOXD_RUNTIMES` (comma-separated
-    `alias=image` pairs), `SANDBOXD_HOST` and `SANDBOXD_PORT`.
+    Every field of :class:`SandboxdConfig` is `SANDBOXD_` plus its name in upper
+    case; :mod:`pydantic_ai_backends.remote.env` documents the parsing and does
+    all of it, so this is uvicorn and an exit code. A configuration problem is
+    reported as one line rather than a traceback, because the reader is looking
+    at container logs.
+
+    ```bash
+    SANDBOXD_TOKEN=... python -m pydantic_ai_backends.remote.server
+    ```
     """
     import uvicorn
 
-    token = os.environ.get("SANDBOXD_TOKEN", "")
-    if not token:
-        raise SystemExit("SANDBOXD_TOKEN is required")
-
-    raw_runtimes = os.environ.get("SANDBOXD_RUNTIMES", "python=python:3.12-slim")
-    runtimes: dict[str, str] = {}
-    for pair in raw_runtimes.split(","):
-        if not pair:
-            continue
-        if "=" not in pair:
-            raise SystemExit(
-                f"SANDBOXD_RUNTIMES entry {pair!r} is not 'alias=image'. "
-                "Example: SANDBOXD_RUNTIMES=python=python:3.12-slim,node=node:20-slim"
-            )
-        alias, image = pair.split("=", 1)
-        runtimes[alias] = image
-    uvicorn.run(
-        create_app(
-            SandboxdConfig(token=token, runtimes=runtimes, default_runtime=next(iter(runtimes)))
-        ),
-        host=os.environ.get("SANDBOXD_HOST", "127.0.0.1"),
-        port=int(os.environ.get("SANDBOXD_PORT", "8080")),
+    from pydantic_ai_backends.remote.env import (
+        SandboxdConfigError,
+        bind_from_env,
+        config_from_env,
     )
+
+    try:
+        config = config_from_env(os.environ)
+        host, port = bind_from_env(os.environ)
+    except SandboxdConfigError as e:
+        raise SystemExit(str(e)) from e
+
+    uvicorn.run(create_app(config), host=host, port=port)
 
 
 __all__ = [
@@ -2174,3 +2178,7 @@ __all__ = [
     "create_app",
     "run",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - module entrypoint
+    run()

@@ -171,9 +171,9 @@ class TestStateBackend:
     def test_read_bytes(self):
         """Test reading raw bytes from files.
 
-        Note: StateBackend stores content as text lines, so binary data
-        with invalid UTF-8 sequences will be converted with errors='replace'.
-        This is expected behavior for a text-based in-memory backend.
+        Only text and bytes that decode as UTF-8 here — those are stored as
+        lines. Content that is not valid UTF-8 takes the base64 path and is
+        covered in `tests/test_state_binary.py`.
         """
         backend = StateBackend()
 

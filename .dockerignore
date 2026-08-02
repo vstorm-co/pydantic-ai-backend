@@ -1,0 +1,29 @@
+# The image needs the package and nothing else. Everything below either bloats
+# the build context or invalidates its cache on a change that cannot affect the
+# built wheel.
+.git
+.github
+.venv*
+.ruff_cache
+.mypy_cache
+.pytest_cache
+.coverage
+htmlcov
+dist
+build
+*.egg-info
+__pycache__
+**/__pycache__
+docs
+examples
+tests
+playground
+assets
+site
+notes
+uv.lock
+Makefile
+mkdocs.yml
+CHANGELOG.md
+CONTRIBUTING.md
+CLAUDE.md

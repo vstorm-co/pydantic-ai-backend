@@ -27,12 +27,30 @@ file_info: FileInfo = {
 ```python
 from pydantic_ai_backends import FileData
 
-# Example (used internally by StateBackend)
+# Text: lines, and no encoding key.
 file_data: FileData = {
     "content": ["line 1", "line 2", "line 3"],
     "created_at": "2024-01-15T10:30:00Z",
     "modified_at": "2024-01-15T11:00:00Z",
 }
+
+# Content that is not valid UTF-8: one base64 entry, marked.
+image_data: FileData = {
+    "content": ["iVBORw0KGgo..."],
+    "created_at": "2024-01-15T10:30:00Z",
+    "modified_at": "2024-01-15T11:00:00Z",
+    "encoding": "base64",
+}
+```
+
+A dictionary of these is always a JSON document, which is what lets a host
+persist a `StateBackend` and restore it:
+
+```python
+import json
+
+stored = json.dumps(backend.files, ensure_ascii=False)
+restored = StateBackend(files=json.loads(stored))
 ```
 
 ## WriteResult

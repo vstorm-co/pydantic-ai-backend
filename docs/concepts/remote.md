@@ -41,6 +41,65 @@ pip install pydantic-ai-backend[server]   # sandboxd (service)
 
 ## Running the service
 
+The shipped entrypoint configures itself from the environment, so a compose file
+is all a deployment needs:
+
+```bash
+SANDBOXD_TOKEN=a-long-random-secret python -m pydantic_ai_backends.remote.server
+```
+
+Every field of [`SandboxdConfig`](../api/remote.md) is `SANDBOXD_` plus its name
+in upper case — `SANDBOXD_MAX_SESSIONS`, `SANDBOXD_WORKSPACE_ROOT`,
+`SANDBOXD_PERSIST_CONTAINERS`, and so on. There is no separate vocabulary to
+learn and nothing to keep in step: the dataclass *is* the documentation.
+
+Three rules cover the parsing:
+
+| | |
+|---|---|
+| **Absent** | takes the shipped default |
+| **Empty**, on a field that may be `None` | turns it off — `SANDBOXD_CPUS=` means no hard CPU ceiling, which absent cannot say |
+| **Booleans** | `1/0`, `true/false`, `yes/no`, `on/off`, any case |
+
+A value that will not parse, or a combination the service refuses — hibernation
+without a workspace root, a default runtime no entry defines — fails at startup
+with one line naming the variable, rather than at the first request.
+
+`SANDBOXD_HOST` and `SANDBOXD_PORT` decide where it listens; they default to
+`127.0.0.1:8080`, so a container needs `SANDBOXD_HOST=0.0.0.0`.
+
+### The allowlist from the environment
+
+`SANDBOXD_RUNTIMES` takes a compact form for what a compose file usually wants:
+
+```bash
+SANDBOXD_RUNTIMES=python=python:3.12-slim,node=node:20-slim
+```
+
+`@name` builds one of the [shipped catalogues](#shipped-catalogues) instead of
+pulling an image, and `;field=value` sets that runtime's own ceilings — the
+field names are `SandboxRuntime`'s:
+
+```bash
+SANDBOXD_RUNTIMES=data=@python-datascience;mem_limit=4g;cpus=3,shell=python:3.12-slim
+```
+
+A JSON object is accepted too, and is the only form that can express a runtime
+whose package list is written out rather than named:
+
+```bash
+SANDBOXD_RUNTIMES='{"ml": {"runtime": {"name": "ml", "base_image": "python:3.12-slim",
+                    "packages": ["torch"]}, "mem_limit": "8g"}}'
+```
+
+Unset it and the service takes its own default allowlist.
+
+### Configuring it in Python instead
+
+`create_app` takes a `SandboxdConfig` directly, for a service embedded in
+something larger. `config_from_env` is importable on its own if you want the
+environment parsed and then adjusted:
+
 ```python
 # sandboxd_app.py
 from pydantic_ai_backends.remote.server import SandboxdConfig, create_app
@@ -85,17 +144,26 @@ services:
     networks: [backend]
 
   sandboxd:
-    build: ./sandboxd
+    image: ghcr.io/vstorm-co/sandboxd:latest
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - sandbox_workspaces:/workspaces
     environment:
-      SANDBOXD_TOKEN: ${SANDBOXD_TOKEN}
+      SANDBOXD_TOKEN: ${SANDBOXD_TOKEN:?generate a long random value}
+      SANDBOXD_HOST: 0.0.0.0
+      SANDBOXD_WORKSPACE_ROOT: /workspaces
+      SANDBOXD_PERSIST_CONTAINERS: "true"
+      SANDBOXD_MAX_SESSIONS_PER_TENANT: "5"
     networks: [backend]        # deliberately no `ports:`
 
 volumes:
   sandbox_workspaces:
 ```
+
+Pin the tag in production — `ghcr.io/vstorm-co/sandboxd:0.2` tracks patches of
+one minor version, and a bare digest pins it exactly. The image is published
+from this repository on every release and contains only the package and its
+`server` extra.
 
 ## The runtime allowlist
 

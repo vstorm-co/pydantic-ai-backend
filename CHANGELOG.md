@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.22] - 2026-08-02
+
+Everything a deployment needs to run `sandboxd` without writing Python, and the
+fix for a `StateBackend` that could not actually be persisted.
+
+### Added
+
+- **A published image: `ghcr.io/vstorm-co/sandboxd`.** The service exists so an
+  application never needs the Docker socket, and the answer to "how do I run it"
+  was "write a Dockerfile" — friction at exactly the point where somebody decides
+  whether the safe path is worth taking. Built from the tag's source, tagged
+  `X.Y.Z`, `X.Y` and `latest`, `linux/amd64` and `linux/arm64`.
+
+  It runs as uid 10001, so reaching the socket needs `group_add: ["${DOCKER_GID}"]`
+  — that is the one failure to expect. Running unprivileged does not stop the
+  process being host-root-equivalent (anything that can reach the daemon can
+  start a privileged container), but it does bound a bug in the service itself to
+  files it owns. CI builds the image and starts it on every pull request, because
+  a Dockerfile only built at release time is one that breaks at release time.
+
+- **Every `SandboxdConfig` field is configurable from the environment.** The
+  entrypoint read four variables while the dataclass models thirty, so any
+  deployment needing the other twenty-six wrote its own launcher — and each got a
+  different subset right. Each field is now `SANDBOXD_` plus its name in upper
+  case, with one vocabulary across the dataclass, the environment and the docs.
+
+  ```bash
+  SANDBOXD_TOKEN=... python -m pydantic_ai_backends.remote.server
+  ```
+
+  Absent takes the shipped default; **empty means `None`** on a field that has
+  one, so `SANDBOXD_CPUS=` says "no hard ceiling" — something absent cannot say.
+  Booleans take `1/0`, `true/false`, `yes/no`, `on/off`. `SANDBOXD_RUNTIMES`
+  grew past `alias=image`: `@name` builds one of the shipped catalogues,
+  `;field=value` sets that runtime's own ceilings, and a JSON object expresses a
+  runtime whose package list is written out rather than named. A bad value, or a
+  combination the service refuses, fails at startup naming the variable instead
+  of at the first request.
+
+  The parsing is `config_from_env` — a pure function of a mapping, so a
+  deployment's configuration can be asserted in a test rather than discovered by
+  starting a container.
+
+- **CI now tests both ends of the declared `pydantic-ai` range.** The `console`
+  extra says `>=1.74.0` and every job installed whatever `uv.lock` pinned, so the
+  range was never exercised at either end. An application on 2.x installed this
+  library cleanly and found out at runtime whether the capability hooks still
+  behaved — quietly, in the direction that matters: a `prepare_tools` signature
+  that no longer matches stops hiding the tools a ruleset denied. Both 1.74.0 and
+  the newest release are now tested on every pull request. Both pass today; no
+  code change was needed, only the job that proves it.
+
+### Fixed
+
+- **A `StateBackend` holding a binary file could not be serialised.**
+  `FileData.content` is lines of text and `write` decoded bytes with
+  `errors="surrogateescape"`, which round-trips exactly *in Python* — which is
+  why it survived. `json.dumps` emits the lone surrogates without complaint and
+  `json.loads` reads them back, so a Python-only test sees nothing wrong. Nothing
+  stricter accepts them: PostgreSQL `jsonb` rejects an unpaired escape outright,
+  a `text` column cannot hold one, and encoding the document as UTF-8 — what any
+  driver does — raises.
+
+  So the one thing this backend is otherwise ideal for, a workspace a host
+  persists between turns, broke the moment an agent wrote a PNG into it, and it
+  broke at the storage layer rather than at the write that caused it.
+
+  Content that is not valid UTF-8 is now stored base64 with `encoding: "base64"`
+  on the entry, and `backend.files` is a JSON document whatever is in it. Text is
+  unchanged, including bytes that decode as UTF-8 — a script written as bytes
+  stays readable, greppable and editable. `read`, `edit` and `grep` decline to
+  treat a binary file as text rather than showing its encoded form; `read_bytes`
+  returns exactly what was written. A document written before `encoding` existed
+  still loads, and its surrogates still encode back to the bytes they stand for.
+
+### Changed
+
+- `read` on a binary file in `StateBackend` returns `Error: ... is binary` rather
+  than mojibake, `edit` refuses it, and `grep` skips it. Previously each operated
+  on the surrogate-escaped text, which produced matches at line numbers the file
+  does not have.
+- `ls_info` and `glob_info` report a binary file's decoded size, not the length
+  of its base64.
+- `SANDBOXD_RUNTIMES` unset now takes the shipped `DEFAULT_RUNTIMES` allowlist
+  rather than a single hardcoded `python=python:3.12-slim`.
+
 ## [0.2.21] - 2026-08-01
 
 A full audit of the codebase, and the ten findings it produced. Nothing here is a
@@ -156,7 +242,7 @@ before upgrading is deferred.
 - **A `coding` runtime, and it is the shipped default.** Python with git, ripgrep, fd, jq, less, procps and `uv` — 99.7 MB, eleven seconds to build, measured. `git` is 33.1 MB of that and unavoidable; the five tools an agent looks at a codebase with come to 4.3 MB between them. `build-essential` is deliberately absent at 94 MB to compile wheels manylinux already ships built. It is the first entry in `DEFAULT_RUNTIMES`, with `python` and `node` staying beside it as ready-made fallbacks for a host that cannot reach a Debian mirror.
 - **Every sandbox starts with a working environment**, applied at the container so it reaches images we did not build: `PYTHONUNBUFFERED` so a command killed by the timeout still returns what it printed, `NO_COLOR` and `PAGER=cat` so escape sequences do not fill the model's context, `LANG=C.UTF-8` because `node:20-slim` ships no locale, and `UV_CONCURRENT_DOWNLOADS=2` — uv's parallelism is memory, and uncapped it is OOM-killed by a 128 MB ceiling that pip survives, where capped it fits and stays 6.6× faster than pip. A runtime overrides any of it through its own `env_vars`.
 - **`polyglot` now carries npm 10.** Debian 13 ships a current Node (20.19.2 against `node:20-slim`'s 20.20.2) but an npm a major version behind, so the generalist runtime quietly behaved differently from the dedicated Node ones.
-- **`scripts/bench_density.py`**, which measures on the host being sized what no blog post can: marginal `MemAvailable` per session, per-container management overhead, time to first command, and wake latency from hibernation. Reasoning behind it in [`docs/plans/sandbox-density-on-small-hosts.md`](docs/plans/sandbox-density-on-small-hosts.md).
+- **`scripts/bench_density.py`**, which measures on the host being sized what no blog post can: marginal `MemAvailable` per session, per-container management overhead, time to first command, and wake latency from hibernation. Reasoning behind it in [`docs/plans/sandbox-density-on-small-hosts.md`](https://github.com/vstorm-co/pydantic-ai-backend/blob/main/docs/plans/sandbox-density-on-small-hosts.md).
 
 ## [0.2.18] - 2026-08-01
 

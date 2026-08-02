@@ -151,8 +151,28 @@ def test_agent_creates_file():
 - ✅ Isolated - no side effects
 - ✅ Perfect for unit testing
 - ✅ Access files via `backend.files`
-- ❌ Data lost when process ends
+- ✅ That dictionary is JSON — store it and restore it
+- ❌ Data lost when process ends, unless you store it
 - ❌ No command execution
+
+### Persisting a workspace
+
+`backend.files` is a plain JSON document, so an application that wants a
+workspace to outlive one process — or one worker — can store it and hand it
+back:
+
+```python
+import json
+
+stored = json.dumps(backend.files, ensure_ascii=False)  # into a jsonb column
+restored = StateBackend(files=json.loads(stored))
+```
+
+Binary content is held base64 with `encoding: "base64"` on the entry, which is
+what keeps that guarantee true for a workspace an agent wrote an image into.
+`read_bytes` returns exactly what was written; `read`, `edit` and `grep` decline
+to treat such a file as text rather than showing its encoded form. A document
+written before `encoding` existed still loads.
 
 ## CompositeBackend
 
