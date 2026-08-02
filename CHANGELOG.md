@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.23] - 2026-08-03
+
+Dependency updates to the pieces 0.2.22 introduced. No library code changed.
+
+### Changed
+
+- The `sandboxd` image is built on `python:3.14-slim` (#87). It is the runtime
+  for the service process only and has nothing to do with the sandboxes it
+  starts, or with the Python versions the library supports. CI builds the image
+  and starts it on every pull request, so the `[server]` extra installing and
+  the service serving `/healthz` on 3.14 is checked rather than assumed.
+- `docker/build-push-action` v6 → v7 (#88). The major is Node 24, an ESM switch
+  and the removal of two deprecated environment variables and the legacy build
+  summary tool — none of which touch the inputs used here.
+
 ## [0.2.22] - 2026-08-02
 
 Everything a deployment needs to run `sandboxd` without writing Python, and the
