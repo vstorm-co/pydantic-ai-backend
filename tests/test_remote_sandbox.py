@@ -2487,6 +2487,14 @@ class TestUsageSamplingScales:
         assert sandbox.usage_calls == 1
 
     async def test_the_cache_expires(self, monkeypatch):
+        """Advance the service's clock, not the process's.
+
+        This patched `server_mod.time.monotonic`, which is the global function —
+        and therefore the one the event loop schedules against. Freezing it to a
+        constant behind real time stalls timers and makes everything running
+        concurrently racy; the test failed under a newer starlette/httpx stack
+        while passing under the older one, on a change that touched neither.
+        """
         from pydantic_ai_backends.remote import server as server_mod
 
         harness = Harness()
@@ -2496,8 +2504,11 @@ class TestUsageSamplingScales:
             sandbox.usage = SandboxUsage(memory_bytes=2048)
             service = harness.app.state.service
 
-            clock = [1000.0]
-            monkeypatch.setattr(server_mod.time, "monotonic", lambda: clock[0])
+            # Seeded from where the service already is, so the clock only ever
+            # moves forwards: a sample taken before the patch must not read as
+            # newer than "now" and stay fresh for good.
+            clock = [service.now()]
+            monkeypatch.setattr(service, "now", lambda: clock[0])
             await service.listing(usage=True)
             clock[0] += server_mod.USAGE_CACHE_SECONDS + 0.1
             await service.listing(usage=True)

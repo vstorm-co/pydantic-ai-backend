@@ -944,6 +944,13 @@ class _Service:
         self._sweep_task: asyncio.Task[None] | None = None
         self._prewarm_task: asyncio.Task[None] | None = None
         self._usage_cache: dict[str, tuple[float, wire.SessionUsage | None]] = {}
+        # The clock the usage cache ages against, as an attribute so a test can
+        # advance it. Patching `time.monotonic` in this module instead reaches
+        # the *global* function, which is also what the event loop schedules
+        # against — freezing it stalls timers and makes anything running
+        # concurrently racy, which is how the expiry test came to fail only under
+        # the newer stack.
+        self.now: Callable[[], float] = time.monotonic
         # Operations in flight per session. `last_activity` is stamped when a
         # command *starts*, so a long exec looks idle while it runs — evicting on
         # that alone would kill work mid-command.
@@ -1219,7 +1226,7 @@ class _Service:
         second-long blocking round trip to the daemon, and holding the loop for
         it would stall every agent's command while a dashboard polls.
         """
-        now = time.monotonic()
+        now = self.now()
         cached = self._usage_cache.get(session_id)
         if cached is not None and now - cached[0] < USAGE_CACHE_SECONDS:
             return cached[1]
