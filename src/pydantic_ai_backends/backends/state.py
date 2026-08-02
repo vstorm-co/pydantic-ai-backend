@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 from datetime import datetime, timezone
+from typing import Literal
 
 from wcmatch import glob as wcglob
 
@@ -20,8 +23,15 @@ def is_hidden_path(path: str) -> bool:
 class StateBackend:
     """In-memory file storage backend.
 
-    Files live in a dictionary and are ephemeral — lost when the process ends.
-    Useful for testing and for scratch space alongside a real backend.
+    Files live in a dictionary and are ephemeral — lost when the process ends,
+    unless a host persists :attr:`files` and hands it back. Useful for testing,
+    for scratch space alongside a real backend, and as the whole storage layer
+    for an application that keeps the document itself.
+
+    Binary content is stored base64 (see :class:`~pydantic_ai_backends.FileData`)
+    so that document is always JSON. `read` and `grep` decline to treat such a
+    file as text rather than showing its encoded form; `read_bytes` returns
+    exactly what was written.
 
     Example:
         ```python
@@ -32,6 +42,8 @@ class StateBackend:
         content = backend.read("/src/app.py")
         print(content)  # "     1\\tprint('hello')"
         matches = backend.grep_raw("print")
+
+        restored = StateBackend(files=json.loads(json.dumps(backend.files)))
         ```
     """
 
@@ -39,13 +51,19 @@ class StateBackend:
         """Initialize the backend.
 
         Args:
-            files: Optional initial file dictionary.
+            files: Optional initial file dictionary. A document a previous
+                instance produced, including one that has been through JSON,
+                loads unchanged — as does one written before `encoding` existed.
         """
         self._files: dict[str, FileData] = files if files is not None else {}
 
     @property
     def files(self) -> dict[str, FileData]:
-        """The internal files dictionary."""
+        """The internal files dictionary.
+
+        Always a JSON-serialisable document: `json.loads(json.dumps(files))`
+        round-trips, and so does storing it in a PostgreSQL `jsonb` column.
+        """
         return self._files
 
     def exists(self, path: str) -> bool:
@@ -89,10 +107,15 @@ class StateBackend:
         stored = self._files.get(normalize_path(path))
         if stored is None:
             return b""
-        return _encode("\n".join(stored["content"]))
+        return _content_bytes(stored)
 
     def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
-        """Read a slice of a file with line numbers."""
+        """Read a slice of a file with line numbers.
+
+        A binary file is refused rather than rendered: its stored form is
+        base64, and handing that to a model as if it were the file's text is
+        worse than saying there is nothing here to read.
+        """
         reason = unsafe_path_reason(path)
         if reason is not None:
             return f"Error: {reason}"
@@ -101,6 +124,8 @@ class StateBackend:
         stored = self._files.get(path)
         if stored is None:
             return f"Error: File '{path}' not found"
+        if _is_binary(stored):
+            return f"Error: File '{path}' is binary; read it as bytes instead"
 
         lines = stored["content"]
         if offset >= len(lines):
@@ -119,16 +144,18 @@ class StateBackend:
             return WriteResult(error=reason)
 
         path = normalize_path(path)
-        if isinstance(content, bytes):
-            content = _decode(content)
+        lines, encoding = _to_storage(content)
 
         now = _timestamp()
         existing = self._files.get(path)
-        self._files[path] = FileData(
-            content=content.split("\n"),
+        entry = FileData(
+            content=lines,
             created_at=existing["created_at"] if existing else now,
             modified_at=now,
         )
+        if encoding is not None:
+            entry["encoding"] = encoding
+        self._files[path] = entry
         return WriteResult(path=path)
 
     def edit(
@@ -143,6 +170,8 @@ class StateBackend:
         stored = self._files.get(path)
         if stored is None:
             return EditResult(error=f"File '{path}' not found")
+        if _is_binary(stored):
+            return EditResult(error=f"File '{path}' is binary and cannot be edited as text")
 
         outcome = replace_in_content(
             "\n".join(stored["content"]), old_string, new_string, replace_all
@@ -193,9 +222,13 @@ class StateBackend:
                 p for p in searchable if wcglob.globmatch(p, glob_pattern, flags=wcglob.GLOBSTAR)
             ]
 
+        # Binary files are skipped rather than searched: their stored form is
+        # base64, so a pattern would be matched against an encoding nobody wrote
+        # and the hit would name a line number that does not exist in the file.
         return [
             GrepMatch(path=file_path, line_number=i + 1, line=line)
             for file_path in searchable
+            if not _is_binary(self._files[file_path])
             for i, line in enumerate(self._files[file_path]["content"])
             if regex.search(line)
         ]
@@ -228,23 +261,64 @@ def _timestamp() -> str:
 
 
 BYTES_ERRORS = "surrogateescape"
-"""How bytes cross into the `str` lines this backend stores, and back.
+"""How a *legacy* document's text is encoded back to the bytes it was written from.
 
-Files here are lines of text, so binary content has to survive a `str` round
-trip. `errors="replace"` did not: every byte that is not UTF-8 became U+FFFD, so
-a PNG written through `write` came back from `read_bytes` as different bytes,
-with a `WriteResult` reporting success. `surrogateescape` maps those bytes to
-lone surrogates and maps them back unchanged, which makes the round trip exact.
+Nothing written by this version needs it. Before `FileData.encoding` existed,
+binary content was decoded with `errors="surrogateescape"` and stored as lines
+of text — exact on the way back out, and the reason the resulting document could
+not be serialised (see :class:`~pydantic_ai_backends.FileData`). A host that
+persisted such a document and loads it here still gets its bytes back, because
+encoding with the same handler is the inverse of how they went in.
 
-The cost is that `read` and `grep` show a surrogate where the undecodable byte
-was — no worse than the replacement character they showed before, and only for
-content that was never text.
+Kept for that alone. New binary content never reaches this path: `_to_storage`
+sends it to base64 instead.
 """
 
 
-def _decode(data: bytes) -> str:
-    """Bytes as the `str` this backend stores, reversibly."""
-    return data.decode("utf-8", errors=BYTES_ERRORS)
+def _to_storage(content: str | bytes) -> tuple[list[str], Literal["base64"] | None]:
+    """The lines to store for `content`, and the encoding marker they need.
+
+    Text — including bytes that decode as UTF-8 — is stored as lines, because a
+    file written as `b"print(1)"` should still be readable, greppable and
+    editable as the text it is. Only content that cannot be UTF-8 becomes
+    base64, which is what keeps the stored document valid JSON.
+    """
+    if isinstance(content, bytes):
+        try:
+            return content.decode("utf-8").split("\n"), None
+        except UnicodeDecodeError:
+            return [base64.b64encode(content).decode("ascii")], "base64"
+
+    try:
+        content.encode("utf-8")
+    except UnicodeEncodeError:
+        # A `str` carrying lone surrogates — what a caller gets from decoding
+        # bytes with `surrogateescape`, and the one way text could still put an
+        # unserialisable value into the document. Store the bytes it stands for.
+        raw = content.encode("utf-8", errors=BYTES_ERRORS)
+        return [base64.b64encode(raw).decode("ascii")], "base64"
+    return content.split("\n"), None
+
+
+def _is_binary(data: FileData) -> bool:
+    """Whether this entry's `content` is base64 rather than lines of text."""
+    return data.get("encoding") == "base64"
+
+
+def _content_bytes(data: FileData) -> bytes:
+    """The file's bytes, whichever way its content is stored.
+
+    Returns `b""` for a base64 entry that does not decode, per the protocol's
+    contract that `read_bytes` never reports an error it could be confused for
+    content. Reachable because `files=` accepts a document this backend did not
+    write, and a truncated one is a real way to arrive here.
+    """
+    if _is_binary(data):
+        try:
+            return base64.b64decode("".join(data["content"]), validate=True)
+        except binascii.Error:
+            return b""
+    return _encode("\n".join(data["content"]))
 
 
 def _encode(text: str) -> bytes:
@@ -257,8 +331,9 @@ def _file_entry(name: str, path: str, data: FileData) -> FileInfo:
         name=name,
         path=path,
         is_dir=False,
-        # The separators count: content is stored split on "\n" and rejoined on
-        # the way out, so summing the lines alone reported one byte less per line
-        # than `read_bytes` returns.
-        size=len(_encode("\n".join(data["content"]))),
+        # The size a reader gets from `read_bytes`, which for a base64 entry is
+        # the decoded length and not the length of the encoding. The separators
+        # count too: text is stored split on "\n" and rejoined on the way out,
+        # so summing the lines alone reported one byte less per line.
+        size=len(_content_bytes(data)),
     )

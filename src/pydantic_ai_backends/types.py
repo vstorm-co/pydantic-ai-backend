@@ -8,12 +8,45 @@ from typing import Literal, TypedDict
 from pydantic import BaseModel
 
 
-class FileData(TypedDict):
-    """Data structure for storing file content in StateBackend."""
+class _FileDataFields(TypedDict):
+    """The keys every stored file has. Split out so `encoding` can be optional."""
 
-    content: list[str]  # Lines of the file
+    content: list[str]  # Lines of the file, or one base64 chunk when encoded
     created_at: str  # ISO 8601 timestamp
     modified_at: str  # ISO 8601 timestamp
+
+
+class FileData(_FileDataFields, total=False):
+    """One file as `StateBackend` stores it.
+
+    **A dictionary of these is a JSON document**, and callers depend on that:
+    the backend's whole use beyond a single process is that a host can persist
+    `StateBackend.files` and hand it back to `StateBackend(files=...)` later.
+    That guarantee is what `encoding` exists for.
+
+    Text is stored as `content`, split on newlines, with no `encoding` key.
+    Content that is not valid UTF-8 — a PNG, a zip — is stored base64 in a
+    single `content` entry with `encoding="base64"`, and only the backend's own
+    readers ever see the difference.
+
+    It used to be lines of text unconditionally, with bytes decoded using
+    `errors="surrogateescape"`. That round-tripped correctly *in Python*, which
+    is exactly why it survived: the lone surrogates it produces are re-encoded
+    by `read_bytes` into the original bytes, and `json.dumps` emits them without
+    complaint while `json.loads` reads them back. Nothing stricter accepts them.
+    PostgreSQL `jsonb` rejects an unpaired escape outright, a `text` column
+    cannot hold one because it is not valid UTF-8, and any non-Python reader of
+    the same document refuses it. So a workspace was serialisable right up until
+    an agent wrote an image into it, and the failure landed at the storage layer
+    rather than at the write that caused it.
+
+    A document written before `encoding` existed still loads: no key means text,
+    and the surrogates such a document may contain are encoded back to their
+    original bytes as they always were.
+    """
+
+    encoding: Literal["base64"]
+    """Present only when `content` holds base64 rather than lines of text."""
 
 
 class FileInfo(TypedDict):

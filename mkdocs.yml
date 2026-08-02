@@ -108,6 +108,12 @@ markdown_extensions:
   - pymdownx.mark
   - pymdownx.smartsymbols
   - pymdownx.snippets:
+      # The repository root, so `changelog.md` can include CHANGELOG.md itself
+      # rather than being a second copy of it — the two had already drifted five
+      # releases apart.
+      base_path:
+        - .
+        - docs
       auto_append:
         - includes/abbreviations.md
   - pymdownx.superfences:

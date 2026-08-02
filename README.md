@@ -156,6 +156,11 @@ backend = StateBackend()
 # Files stored in memory, perfect for tests
 ```
 
+`backend.files` is a JSON document, so a host can store a workspace and hand it
+back — `StateBackend(files=...)` — which is what makes the in-memory backend
+usable across turns, workers and processes. Binary content is held base64 so
+that stays true for a workspace an agent wrote an image into.
+
 ### Local Filesystem (LocalBackend)
 
 ```python
@@ -217,8 +222,33 @@ container and not even a round trip.
 into a console toolset or `SessionManager` unchanged. Failures degrade (`b""`,
 `[]`, `Error: ...`) instead of raising — a socket blip must not end an agent run.
 
-The service is a few lines, and the client chooses **nothing** about the
-container:
+The service is published as an image, and the client chooses **nothing** about
+the container:
+
+```yaml
+services:
+  app:
+    environment: { SANDBOXD_URL: http://sandboxd:8080 }
+    networks: [backend]          # no docker.sock here
+
+  sandboxd:
+    image: ghcr.io/vstorm-co/sandboxd:latest
+    environment:
+      SANDBOXD_TOKEN: ${SANDBOXD_TOKEN:?}
+      SANDBOXD_HOST: 0.0.0.0
+      SANDBOXD_WORKSPACE_ROOT: /workspaces      # files survive idle reaping
+      SANDBOXD_MAX_SESSIONS_PER_TENANT: "5"     # one tenant cannot take the pool
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    group_add: ["${DOCKER_GID}"]  # it runs unprivileged; this reaches the socket
+    networks: [backend]          # and no `ports:` either
+```
+
+Every field of `SandboxdConfig` is `SANDBOXD_` plus its name in upper case —
+runtimes, ceilings, retention, the lot — so the whole policy is a compose file
+and there is no launcher to write. A value that will not parse, or a combination
+the service refuses, fails at startup naming the variable.
+
+To embed it in something larger, `create_app` still takes the config directly:
 
 ```python
 from pydantic_ai_backends.remote.server import SandboxdConfig, create_app
@@ -234,17 +264,6 @@ app = create_app(
         workspace_root="/workspaces",  # files survive idle reaping
     )
 )
-```
-
-```yaml
-services:
-  app:
-    environment: { SANDBOXD_URL: http://sandboxd:8080 }
-    networks: [backend]          # no docker.sock here
-
-  sandboxd:
-    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
-    networks: [backend]          # and no `ports:` either
 ```
 
 Sessions can outlive the run that created them — pass `reuse=True` and the same

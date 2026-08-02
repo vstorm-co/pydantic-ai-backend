@@ -90,10 +90,88 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           file: coverage.lcov
 
+  pydantic-ai-range:
+    # The `console` extra declares `pydantic-ai-slim>=1.74.0`, and every job
+    # above installs whatever `uv.lock` pins — so the *declared* range was never
+    # exercised at either end. A floor is satisfiable by any 2.x release, which
+    # meant an application on 2.x installed this library cleanly and found out at
+    # runtime whether `prepare_tools` and `before_tool_execute` still behaved.
+    #
+    # That failure is quiet in the direction that matters: a hook whose signature
+    # no longer matches stops hiding the tools a ruleset denied, and the
+    # capability hands the model `execute` with nothing reporting it.
+    name: pydantic-ai ${{ matrix.pydantic-ai }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pydantic-ai: ["1.74.0", "latest"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Install pydantic-ai ${{ matrix.pydantic-ai }}
+        run: |
+          if [ "${{ matrix.pydantic-ai }}" = "latest" ]; then
+            uv pip install --upgrade pydantic-ai-slim
+          else
+            uv pip install 'pydantic-ai-slim==${{ matrix.pydantic-ai }}'
+          fi
+          uv run --no-sync python -c "import pydantic_ai; print(pydantic_ai.__version__)"
+
+      # `--no-sync`, or uv restores the locked version and the job tests nothing.
+      - name: Run tests
+        run: uv run --no-sync pytest -q
+
+  image:
+    # A Dockerfile only built at release time is one that breaks at release time.
+    # Single platform and no push: this answers "does it still build and start",
+    # and `publish.yml` does the rest.
+    name: Sandboxd Image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: sandboxd:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: It refuses to start without a token, and says so
+        run: |
+          output=$(docker run --rm sandboxd:ci 2>&1 || true)
+          echo "$output"
+          echo "$output" | grep -q SANDBOXD_TOKEN
+
+      - name: It serves /healthz
+        run: |
+          docker run -d --name sandboxd-ci -p 8080:8080 \
+            -e SANDBOXD_TOKEN=ci-token -e SANDBOXD_PREWARM=false sandboxd:ci
+          for _ in $(seq 30); do
+            curl -fsS localhost:8080/healthz && break
+            sleep 1
+          done
+          curl -fsS localhost:8080/healthz
+          docker rm -f sandboxd-ci
+
   all-checks:
     name: All Checks Passed
     runs-on: ubuntu-latest
-    needs: [lint, typecheck, test]
+    needs: [lint, typecheck, test, pydantic-ai-range, image]
     steps:
       - name: All checks passed
         run: echo "All CI checks passed successfully!"
