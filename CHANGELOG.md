@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-08-02
+## [0.2.22] - 2026-08-02
 
 Everything a deployment needs to run `sandboxd` without writing Python, and the
 fix for a `StateBackend` that could not actually be persisted.

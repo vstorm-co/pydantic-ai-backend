@@ -1,6 +1,6 @@
 [project]
 name = "pydantic-ai-backend"
-version = "0.3.0"
+version = "0.2.22"
 description = "File storage and sandbox backends for AI agents"
 readme = "README.md"
 license = "MIT"

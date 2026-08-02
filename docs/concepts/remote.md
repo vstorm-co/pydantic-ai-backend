@@ -160,7 +160,7 @@ volumes:
   sandbox_workspaces:
 ```
 
-Pin the tag in production — `ghcr.io/vstorm-co/sandboxd:0.3` tracks patches of
+Pin the tag in production — `ghcr.io/vstorm-co/sandboxd:0.2` tracks patches of
 one minor version, and a bare digest pins it exactly. The image is published
 from this repository on every release and contains only the package and its
 `server` extra.
