@@ -55,7 +55,7 @@ from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar, cast
@@ -506,6 +506,14 @@ class SandboxdConfig:
     execute_timeout: int = 300
     max_workers: int = 32
     ui_enabled: bool = False
+    policy_overrides: str | None = None
+    """JSON file holding a `PolicyUpdate`, re-read while the service runs.
+
+    The alternative to `PUT /policy` for a deployment that would rather not expose
+    a write endpoint. Both go through the same validation and write the same live
+    configuration, so neither can put the service in a state the other cannot
+    describe. `None` disables it, which is the default.
+    """
 
     def __post_init__(self) -> None:
         if not self.token:
@@ -573,6 +581,207 @@ class SandboxdConfig:
                 runtime.oci_runtime if runtime.oci_runtime is not None else self.oci_runtime
             ),
         }
+
+
+POLICY_SCALARS: tuple[str, ...] = (
+    "max_sessions",
+    "max_open_sessions",
+    "max_sessions_per_tenant",
+    "evict_idle_after",
+    "idle_timeout",
+    "execute_timeout",
+    "max_read_bytes",
+    "workspace_ttl",
+    "container_ttl",
+    "mem_limit",
+    "memswap_limit",
+    "cpus",
+    "cpu_shares",
+    "pids_limit",
+    "tmpfs_size",
+)
+"""Service-wide fields `PolicyUpdate` may write, and the only ones.
+
+Listed here rather than derived from the model's fields, so that adding a field
+to `PolicyUpdate` is a deliberate act in two places. The model is a wire shape
+somebody could widen without thinking about what it lets a caller reach; this is
+the list that decides what actually gets written, and `test_policy_updates.py`
+fails if the two drift.
+"""
+
+
+class PolicyUpdateError(ValueError):
+    """A policy update named something that does not exist, or may not change.
+
+    A `ValueError` because both the endpoint and the file watcher raise it, and
+    only one of them has an HTTP response to put it in.
+    """
+
+
+def apply_policy_update(config: SandboxdConfig, update: wire.PolicyUpdate) -> list[str]:
+    """Write an update onto the live configuration, and say what changed.
+
+    **One function for both entrances.** The endpoint and the overrides file are
+    two ways to ask for the same thing, and two code paths applying the same
+    update would eventually disagree about what is in force. So there is one
+    place that writes, one place that validates, and one definition of what may
+    be written.
+
+    Takes effect without a restart because the sandbox builder reads these fields
+    when it builds a sandbox rather than capturing them at startup. Sandboxes
+    *already resident* keep the ceilings they were created with — Docker sets them
+    on the container, and this does not reach in and change one. Worth knowing
+    rather than discovering: lowering a memory ceiling applies to the next
+    sandbox, not to the one currently using too much.
+
+    Args:
+        config: The live configuration, mutated in place.
+        update: What to change. Absent fields are left alone.
+
+    Returns:
+        The names of the fields that actually changed, for the caller to log.
+        Empty when the update asked for nothing new, which is not an error.
+
+    Raises:
+        PolicyUpdateError: If `default_runtime` or a `runtimes` key names an alias
+            the allowlist does not hold. Refused rather than created: an alias
+            that does not exist has no image, and inventing one here is exactly
+            the door this endpoint is not.
+    """
+    named = update.model_dump(exclude_unset=True)
+    changed: list[str] = []
+
+    if "default_runtime" in named:
+        alias = update.default_runtime
+        if alias not in config.runtimes:
+            raise PolicyUpdateError(
+                f"Unknown runtime '{alias}'. The default has to be one of: "
+                f"{', '.join(sorted(config.runtimes)) or '(none allowed)'}"
+            )
+        if config.default_runtime != alias:
+            config.default_runtime = alias or ""
+            changed.append("default_runtime")
+
+    for name in POLICY_SCALARS:
+        if name not in named:
+            continue
+        value = getattr(update, name)
+        if getattr(config, name) != value:
+            setattr(config, name, value)
+            changed.append(name)
+
+    replaced: dict[str, str | SandboxRuntime] = {}
+    for alias, limits in (update.runtimes or {}).items():
+        if alias not in config.runtimes:
+            raise PolicyUpdateError(
+                f"Unknown runtime '{alias}'. Ceilings can be changed for an allowed "
+                "runtime; a new one is a deployment change, because it names an image."
+            )
+        runtime = _as_runtime(config.runtimes[alias])
+        wanted = {
+            name: value
+            for name, value in limits.model_dump(exclude_unset=True).items()
+            if getattr(runtime, name) != value
+        }
+        if not wanted:
+            continue
+        # `replace`, because `SandboxRuntime` is frozen - which is the right shape
+        # for a thing an allowlist holds.
+        replaced[alias] = replace(runtime, **wanted)
+        changed.extend(f"runtimes.{alias}.{name}" for name in wanted)
+
+    if replaced:
+        # A whole new mapping rather than writes into the old one. `runtimes` is
+        # declared `Mapping` deliberately - an allowlist is not a thing to mutate -
+        # and swapping it means a reader that already holds one sees a consistent
+        # snapshot instead of a half-applied update. It is also what carries a
+        # change to an alias stored as a bare image string, which `_as_runtime`
+        # turned into a fresh object nothing else would ever have seen.
+        config.runtimes = {**config.runtimes, **replaced}
+
+    return changed
+
+
+def load_policy_overrides(config: SandboxdConfig, path: Path) -> list[str]:
+    """Apply the overrides file onto the live configuration, if it is there.
+
+    The second way in, for a deployment that would rather not expose a write
+    endpoint at all. It reaches `apply_policy_update` — the same validation, the
+    same writable set, the same refusal for an alias that does not exist — so the
+    two entrances cannot drift into disagreeing about what is in force.
+
+    An absent file is not an error: it is the normal state, and the setting exists
+    so an operator *can* drop one in later without restarting.
+
+    Args:
+        config: The live configuration, mutated in place.
+        path: JSON file holding a :class:`wire.PolicyUpdate`.
+
+    Returns:
+        The names of the fields that changed. Empty when the file is absent, holds
+        nothing new, or could not be read — the last of those is logged.
+
+    Raises:
+        Nothing. A malformed file must not be able to stop a running service or
+        prevent one from starting: an operator who mistypes a ceiling should get a
+        log line and the previous value, not a daemon that will not boot and takes
+        every resident sandbox with it.
+    """
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        _logger.warning("Could not read the policy overrides at %s: %s", path, exc)
+        return []
+
+    try:
+        update = wire.PolicyUpdate.model_validate_json(raw)
+    except ValueError as exc:
+        _logger.warning("Ignoring the policy overrides at %s: %s", path, exc)
+        return []
+
+    try:
+        changed = apply_policy_update(config, update)
+    except PolicyUpdateError as exc:
+        _logger.warning("Ignoring the policy overrides at %s: %s", path, exc)
+        return []
+
+    if changed:
+        _logger.info("Policy overrides from %s applied: %s", path, ", ".join(changed))
+    return changed
+
+
+class PolicyOverridesWatcher:
+    """Re-reads the overrides file when its modification time moves.
+
+    Polling its `stat` rather than watching the filesystem, deliberately: it is one
+    `stat` per interval against a dependency-free implementation, and the
+    alternatives (`inotify`, `watchdog`) buy sub-second latency for a file an
+    operator edits by hand. The service already runs a cleanup loop on a timer, so
+    there is a place for this to live and nothing new to shut down.
+
+    A file that has been deleted since it was last read is left alone rather than
+    reverted. Reverting would mean remembering the environment's values and putting
+    them back, which is a second source of truth — and the honest reading of a
+    deleted overrides file is "stop overriding from here", which is a restart.
+    """
+
+    def __init__(self, config: SandboxdConfig, path: Path) -> None:
+        self._config = config
+        self._path = path
+        self._seen: float | None = None
+
+    def poll(self) -> list[str]:
+        """Apply the file if it has changed since the last look."""
+        try:
+            stamp = self._path.stat().st_mtime
+        except OSError:
+            return []
+        if stamp == self._seen:
+            return []
+        self._seen = stamp
+        return load_policy_overrides(self._config, self._path)
 
 
 _EVENT_HISTORY = 200
@@ -944,6 +1153,13 @@ class _Service:
         self._executor: ThreadPoolExecutor | None = None
         self._sweep_task: asyncio.Task[None] | None = None
         self._prewarm_task: asyncio.Task[None] | None = None
+        # `None` when no overrides file is configured, which is the default - so
+        # the sweep loop skips even the `stat` for every deployment not using it.
+        self._policy_watcher = (
+            None
+            if config.policy_overrides is None
+            else PolicyOverridesWatcher(config, Path(config.policy_overrides))
+        )
         self._usage_cache: dict[str, tuple[float, wire.SessionUsage | None]] = {}
         # The clock the usage cache ages against, as an attribute so a test can
         # advance it. Patching `time.monotonic` in this module instead reaches
@@ -997,6 +1213,10 @@ class _Service:
         # Starting and stopping a sandbox blocks for seconds; the manager runs
         # both on this pool rather than on the loop every request shares.
         self.manager.executor = self._executor
+        # Read once before anything is served, so the first session is held to the
+        # ceilings the file names rather than to the environment's for one interval.
+        if self._policy_watcher is not None:
+            self._policy_watcher.poll()
         self.manager.start_cleanup_loop(interval=self.config.cleanup_interval)
         # Always: the manager only reaps sessions it holds a sandbox for, so
         # ending the hibernated ones is this loop's job whatever the TTLs say.
@@ -1029,6 +1249,11 @@ class _Service:
         while True:
             await asyncio.sleep(self.config.cleanup_interval)
             try:
+                # Before the sweep, so a ceiling raised in the overrides file is in
+                # force for this pass rather than the next one. A `stat` when no
+                # file is configured is skipped entirely.
+                if self._policy_watcher is not None:
+                    await self._in_thread(self._policy_watcher.poll)
                 await self._reap_hibernated()
                 await self._in_thread(self._sweep_once)
             except Exception:
@@ -1886,6 +2111,32 @@ def _register_session_routes(app: FastAPI, service: _Service) -> None:
     @app.get("/policy", response_model=wire.ServicePolicy, dependencies=[ServiceAuth])
     async def get_policy() -> wire.ServicePolicy:
         """The ceilings and allowlist every sandbox is held to."""
+        return service.policy()
+
+    @app.put("/policy", response_model=wire.ServicePolicy, dependencies=[ServiceAuth])
+    async def put_policy(body: wire.PolicyUpdate) -> wire.ServicePolicy:
+        """Change the ceilings and lifetimes, without a restart.
+
+        Ceilings and lifetimes *only* — see :class:`wire.PolicyUpdate` for what is
+        deliberately absent and why. The short version: how much a sandbox may
+        consume and how long it may live are an operator's to tune; what a runtime
+        *is*, and whether it is isolated, stay in the environment where changing
+        them is a deployment action.
+
+        Answers with the whole policy rather than an acknowledgement, so a caller
+        sees what is now in force including the fields it did not touch — which is
+        also how it learns that a ceiling it set was already the value there.
+
+        Restarting used to be the only way, and a restart drops every resident
+        sandbox: an operator raising one memory ceiling ended every conversation
+        on the host.
+        """
+        try:
+            changed = apply_policy_update(service.config, body)
+        except PolicyUpdateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if changed:
+            _logger.info("Policy updated: %s", ", ".join(changed))
         return service.policy()
 
     @app.post("/sessions", response_model=wire.SessionCreated, dependencies=[ServiceAuth])

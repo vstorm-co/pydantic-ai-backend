@@ -708,6 +708,7 @@ all needs to know why.
 | `GET /` | none | What the service is, and its mounted endpoints |
 | `GET /healthz` | none | Liveness, session count, capacity |
 | `GET /policy` | service token | The ceilings and image allowlist actually in force |
+| `PUT /policy` | service token | Change the ceilings and lifetimes, without a restart |
 | `GET /sessions` | service token | Every open session; `?usage=true` also samples memory and CPU |
 | `GET /sessions/{id}` | session or service token | One session, without reviving a dead sandbox |
 | `GET /sessions/{id}/events?after=<seq>` | session or service token | The session's operation log, for incremental polling |
@@ -716,6 +717,76 @@ The activity log records what each operation addressed, whether it succeeded and
 how long it took — never file contents or command output, which would turn an
 audit trail into a data leak that also grows without bound. It is a bounded ring
 buffer per session.
+
+### Changing the ceilings without a restart
+
+`PUT /policy` writes the ceilings and lifetimes onto the running service, and
+answers with the whole policy so a caller sees what is now in force — including
+the fields it did not touch. Before it, every one of the thirty-odd knobs was
+reachable only through the environment, and a restart drops every resident
+sandbox: raising one memory ceiling ended every conversation on the host.
+
+```bash
+curl -X PUT http://sandboxd:8080/policy \
+  -H "X-Sandbox-Token: $SANDBOXD_TOKEN" \
+  -d '{"mem_limit": "2g", "workspace_ttl": 86400,
+       "runtimes": {"coding": {"cpus": 4.0}}}'
+```
+
+**Ceilings and lifetimes only, and the omissions are the point.** A client cannot
+name an image, a mount or a device when it creates a session, because a process
+holding the Docker socket can start a privileged container that mounts the host.
+That reasoning does not stop applying because the caller holds the service token:
+in a multi-tenant deployment the token is held by an application, per tenant, and
+an organization's administrator is not the person who runs the host.
+
+So what may change is how much a sandbox may consume and how long it may live:
+
+`max_sessions`, `max_open_sessions`, `max_sessions_per_tenant`,
+`evict_idle_after`, `idle_timeout`, `execute_timeout`, `max_read_bytes`,
+`workspace_ttl`, `container_ttl`, `mem_limit`, `memswap_limit`, `cpus`,
+`cpu_shares`, `pids_limit`, `tmpfs_size`, `default_runtime`, and the same
+ceilings per already-allowed runtime under `runtimes`.
+
+What may **not**, and stays in the environment where changing it is a deployment
+action:
+
+| Refused | Because |
+|---|---|
+| `runtimes` membership | Adding an alias means naming an image |
+| `network_mode` | `host` is not a ceiling, it is an escape |
+| `oci_runtime` | The same, one level lower |
+| `sandbox_uid` | 0 is root |
+| `work_dir` | It is where the workspace volume mounts and the archive reads |
+| `persist_containers`, `prewarm` | Startup shape, not ceilings |
+
+Sending one of those is a `422` naming the field, not a key quietly dropped — an
+operator who tries to widen the network is told no rather than left believing they
+have. An unknown runtime, in `default_runtime` or under `runtimes`, is a `400`:
+refused rather than created.
+
+A change applies to the **next** sandbox. Docker sets a ceiling on the container,
+so one already running keeps what it was created with — lowering a memory limit
+does not reach into the sandbox currently using too much.
+
+### The overrides file
+
+`SANDBOXD_POLICY_OVERRIDES=/etc/sandboxd/policy.json` is the same thing without a
+write endpoint, for a deployment that would rather not have one. The file holds
+exactly what `PUT /policy` accepts, it is read once before anything is served, and
+re-read whenever its modification time moves — the service already sweeps on a
+timer, so this rides along with that and adds nothing to shut down.
+
+Both go through one function, so neither can put the service in a state the other
+cannot describe: the same writable set, the same validation, the same refusal for
+an alias that does not exist.
+
+A malformed file is logged and ignored, and the previous values stand. That is
+deliberate: an operator who mistypes a ceiling should get a log line, not a daemon
+that will not boot and takes every resident sandbox with it. A file *deleted*
+after being read is left alone rather than reverted — reverting would mean keeping
+a second copy of the environment's values to put back, and the honest reading of a
+deleted overrides file is "stop overriding from here", which is a restart.
 
 ### Dashboard
 
