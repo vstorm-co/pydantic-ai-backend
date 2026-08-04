@@ -78,6 +78,7 @@ from pydantic_ai_backends.remote._workspace import (
     WorkspacePathError,
     list_workspace,
     read_workspace,
+    read_workspace_bytes,
     relative_request_path,
     workspace_root_for,
 )
@@ -1753,6 +1754,28 @@ class _Service:
         )
         return wire.ReadResponse(content=content)
 
+    async def archive_read_bytes(
+        self, session_id: str, body: wire.ReadBytesRequest
+    ) -> wire.ReadBytesResponse:
+        """Read a stored workspace file as bytes, without starting a sandbox.
+
+        The sibling of :meth:`archive_read`, for the files that are not text. A
+        chart or a PDF read through `archive_read` comes back decoded and
+        re-encoded, which is a corrupt file rather than an error - so a consumer
+        serving downloads had to allowlist text suffixes and refuse everything
+        an agent is most likely to have produced.
+
+        Raises:
+            HTTPException: 400 for a path outside the workspace or a file over
+                the read ceiling, 404 when it is not a file.
+        """
+        workspace = self.workspace_of(session_id)
+        relative = relative_request_path(body.path, self.config.work_dir)
+        raw = await self._off_loop(
+            read_workspace_bytes, workspace, relative, self.config.max_read_bytes
+        )
+        return wire.ReadBytesResponse(content_b64=base64.b64encode(raw).decode("ascii"))
+
     async def _in_thread(self, call: Callable[[], Any]) -> Any:
         """Run one blocking call on the service's worker pool."""
         return await asyncio.get_running_loop().run_in_executor(self._executor, call)
@@ -1952,6 +1975,23 @@ def _register_workspace_routes(app: FastAPI, service: _Service) -> None:
     ) -> wire.ReadResponse:
         """Read a slice of a stored workspace file."""
         return await service.archive_read(session_id, body)
+
+    @app.post(
+        "/workspaces/{session_id}/read_bytes",
+        response_model=wire.ReadBytesResponse,
+        dependencies=[ServiceAuth],
+    )
+    async def read_archived_bytes(
+        session_id: Annotated[str, PathParam(pattern=wire.SESSION_ID_PATTERN)],
+        body: wire.ReadBytesRequest,
+    ) -> wire.ReadBytesResponse:
+        """Read a whole stored workspace file as base64.
+
+        Beside `read` rather than replacing it: text wants the slicing, the line
+        numbers and the encoding detection that `read` does, and a PNG wants none
+        of it.
+        """
+        return await service.archive_read_bytes(session_id, body)
 
 
 def _register_operation_routes(app: FastAPI, service: _Service) -> None:

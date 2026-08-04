@@ -1887,6 +1887,14 @@ class TestWorkspaceArchiveRoutes:
             assert wire.ReadResponse.model_validate(response.json()).content == "[End of file]"
 
 
+PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+    b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+)
+"""A one-pixel PNG. Bytes that do not survive being decoded as text, which is
+the whole reason `read_bytes` exists."""
+
+
 class TestWorkspaceArchiveClient:
     """The typed client raises, because no model is waiting on it."""
 
@@ -1898,14 +1906,73 @@ class TestWorkspaceArchiveClient:
         workspace = tmp_path / "cold" / "workspace"
         workspace.mkdir(parents=True)
         (workspace / "notes.md").write_text("kept\n")
+        # A real PNG header, because the point of `read_bytes` is the files that
+        # are not text - and "it round-trips" is only meaningful for bytes that
+        # would not have survived a decode.
+        (workspace / "chart.png").write_bytes(PNG_BYTES)
         with harness.client() as client:
             yield WorkspaceArchive(token=SERVICE_TOKEN, client=client)
 
     def test_ls_returns_file_infos(self, archive):
-        assert [row["name"] for row in archive.ls("cold")] == ["notes.md"]
+        assert [row["name"] for row in archive.ls("cold")] == ["chart.png", "notes.md"]
 
     def test_read_returns_the_content(self, archive):
         assert archive.read("cold", "notes.md") == "kept"
+
+    def test_read_bytes_serves_a_file_a_decode_would_have_ruined(self, archive):
+        """The acceptance criterion from the issue: the first four bytes are a PNG.
+
+        `read` decodes and re-encodes, which for a PNG yields a file that
+        downloads successfully and will not open - the worst available outcome, so
+        a consumer serving downloads had to allowlist text suffixes and refuse the
+        one thing an agent is most likely to have made.
+        """
+        raw = archive.read_bytes("cold", "chart.png")
+
+        assert raw == PNG_BYTES
+        assert raw[:4] == b"\x89PNG"
+
+    def test_read_bytes_reads_text_faithfully_too(self, archive):
+        """No suffix allowlist anywhere in it: bytes are bytes, and a caller that
+        wants the decoded, sliced, line-numbered form calls `read`."""
+        assert archive.read_bytes("cold", "notes.md") == b"kept\n"
+
+    def test_read_bytes_raises_for_a_missing_file(self, archive):
+        from pydantic_ai_backends.remote import WorkspaceArchiveError
+
+        with pytest.raises(WorkspaceArchiveError) as excinfo:
+            archive.read_bytes("cold", "nothing.png")
+
+        assert excinfo.value.status_code == 404
+
+    def test_read_bytes_refuses_a_file_over_the_services_read_ceiling(self, tmp_path):
+        """The ceiling is the service's, not the caller's: `read_bytes` returns a
+        whole file, so without it a caller could ask the daemon to hold an
+        arbitrarily large one in memory on their behalf."""
+        from pydantic_ai_backends.remote import WorkspaceArchive, WorkspaceArchiveError
+
+        harness = Harness(workspace_root=str(tmp_path), max_read_bytes=8)
+        workspace = tmp_path / "cold" / "workspace"
+        workspace.mkdir(parents=True)
+        (workspace / "big.png").write_bytes(PNG_BYTES)
+
+        with harness.client() as client:
+            archive = WorkspaceArchive(token=SERVICE_TOKEN, client=client)
+            with pytest.raises(WorkspaceArchiveError) as excinfo:
+                archive.read_bytes("cold", "big.png")
+
+        assert excinfo.value.status_code == 400
+        assert "read limit" in str(excinfo.value)
+
+    def test_read_bytes_refuses_a_path_outside_the_workspace(self, archive):
+        """The archive reads the host volume directly, so this is the one that
+        matters: a session id and a path are both attacker-shaped."""
+        from pydantic_ai_backends.remote import WorkspaceArchiveError
+
+        with pytest.raises(WorkspaceArchiveError) as excinfo:
+            archive.read_bytes("cold", "../../etc/passwd")
+
+        assert excinfo.value.status_code == 400
 
     def test_a_missing_workspace_raises_with_the_status(self, archive):
         from pydantic_ai_backends.remote import WorkspaceArchiveError
