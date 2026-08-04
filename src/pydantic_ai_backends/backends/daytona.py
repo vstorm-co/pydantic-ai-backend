@@ -203,8 +203,16 @@ class DaytonaSandbox(BaseSandbox):
         except Exception:
             return False
 
-    def stop(self) -> None:
-        """Delete the Daytona sandbox."""
+    def stop(self, purge: bool = False) -> None:
+        """Delete the Daytona sandbox.
+
+        Args:
+            purge: Accepted for one signature across every sandbox, and it makes
+                no difference here. Daytona has no "end it but keep the files"
+                state this library can reattach to, so stopping *is* deleting -
+                which is why the parameter is documented rather than quietly
+                ignored.
+        """
         client = getattr(self, "_client", None)
         sandbox = getattr(self, "_sandbox", None)
         if client is not None and sandbox is not None:

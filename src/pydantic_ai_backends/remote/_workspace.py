@@ -149,3 +149,38 @@ def read_workspace(root: Path, path: str, offset: int, limit: int, max_bytes: in
         return chunk
     remaining = len(lines) - end
     return f"{chunk}\n\n[... {remaining} more lines. Use offset={end} to read more.]"
+
+
+def read_workspace_bytes(root: Path, path: str, max_bytes: int) -> bytes:
+    """Read a whole workspace file as bytes.
+
+    The sibling of :func:`read_workspace`, and the reason it exists is that
+    decoding is not always wanted. A chart, a rendered PDF, an image an agent
+    fetched — the most common things it actually produces — are not text, and
+    reading them as text then re-encoding yields a corrupt file that downloads
+    successfully. That is the worst available outcome, so a consumer with only
+    `read` had to refuse the whole class of file instead.
+
+    Whole rather than sliced: a byte range is meaningless for the formats this
+    exists to serve, and the listing already carries `size`, so a caller that
+    needs to bound a read can look before making it.
+
+    Args:
+        root: The session's workspace directory.
+        path: File to read, relative to `root`.
+        max_bytes: Largest file to read into memory.
+
+    Raises:
+        WorkspacePathError: If `path` escapes the workspace.
+        FileNotFoundError: If it is not a regular file.
+        ValueError: If the file is over `max_bytes`.
+    """
+    target = resolve_within(root, path)
+    if not target.is_file():
+        raise FileNotFoundError(f"No such file: {path}")
+
+    size = target.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"File is {size} bytes, over the {max_bytes}-byte read limit")
+
+    return target.read_bytes()

@@ -197,8 +197,14 @@ class ConsoleCapability(AbstractCapability[Any]):
             descriptions=self.descriptions,
             # Passed through as well as being enforced in `prepare_tools`: the
             # toolset drops a denied operation's tools outright, so they are gone
-            # rather than merely hidden from one request's tool definitions.
+            # rather than merely hidden from one request's tool definitions - and
+            # it is what applies the per-path rules, which nothing used to.
             permissions=self.permissions,
+            # So the guard inside the toolset resolves an "ask" the same way this
+            # capability does. Without them a ruleset holding an "ask" would refuse
+            # or raise there on a different rule from the one stated here.
+            ask_callback=self.ask_callback,
+            ask_fallback=self.ask_fallback,
         )
         if self.permissions is not None:
             self._checker = PermissionChecker(

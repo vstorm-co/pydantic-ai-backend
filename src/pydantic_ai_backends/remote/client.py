@@ -526,6 +526,7 @@ class WorkspaceArchive:
         for entry in archive.ls(session_id):
             print(entry["path"], entry["size"])
         print(archive.read(session_id, "report.md"))
+        Path("chart.png").write_bytes(archive.read_bytes(session_id, "chart.png"))
         ```
     """
 
@@ -581,6 +582,29 @@ class WorkspaceArchive:
         payload = wire.ReadRequest(path=path, offset=offset, limit=limit).model_dump(mode="json")
         response = self._post(f"/workspaces/{session_id}/read", payload)
         return wire.ReadResponse.model_validate(response.json()).content
+
+    def read_bytes(self, session_id: str, path: str) -> bytes:
+        """Read a whole stored workspace file as bytes.
+
+        The sibling of :meth:`read`, and the one to use for anything an agent
+        produced that is not text - a chart, a rendered PDF, an image it fetched.
+        Those are the commonest contents of a real workspace, and `read` decodes
+        them: the result re-encodes to a corrupt file that nonetheless downloads
+        successfully, which is worse than an error, so a caller serving downloads
+        had to refuse them instead.
+
+        Whole rather than sliced, because a byte range means nothing for the
+        formats this exists for. `ls` carries `size`, so a caller that wants to
+        bound a read can look first.
+
+        Raises:
+            WorkspaceArchiveError: If the file is absent, over the service's read
+                ceiling, outside the workspace, or the service is unreachable.
+        """
+        payload = wire.ReadBytesRequest(path=path).model_dump(mode="json")
+        response = self._post(f"/workspaces/{session_id}/read_bytes", payload)
+        encoded = wire.ReadBytesResponse.model_validate(response.json()).content_b64
+        return base64.b64decode(encoded)
 
     def close(self) -> None:
         """Close the HTTP client, when this object built it."""

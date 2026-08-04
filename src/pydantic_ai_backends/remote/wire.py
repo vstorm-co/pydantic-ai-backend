@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 TOKEN_HEADER = "X-Sandbox-Token"
 """Header carrying either the service token or a session's own token."""
@@ -361,6 +361,90 @@ class ServicePolicy(BaseModel):
     """Whether the allowlist is pulled and built at startup rather than on demand."""
     buildkit: bool = False
     """Whether image builds use BuildKit, and so keep package caches between them."""
+
+
+class RuntimeLimitsUpdate(BaseModel):
+    """New ceilings for one already-allowed runtime.
+
+    Ceilings only. There is no `image`, no `description` and no `builds`: what a
+    runtime *is* stays the daemon's, set from its environment and never from a
+    request. An operator adjusts what a runtime may consume; nobody adjusts what
+    it runs.
+
+    Every field is optional, and absent means "leave it alone" rather than
+    "clear it" — `None` is a meaningful value for most of these (it pins swap to
+    memory, or takes the daemon's default), so a model that could not tell absent
+    from null would wipe a ceiling every time somebody changed a different one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mem_limit: str | None = None
+    memswap_limit: str | None = None
+    cpus: float | None = Field(default=None, gt=0)
+    cpu_shares: int | None = Field(default=None, gt=0)
+    pids_limit: int | None = Field(default=None, gt=0)
+
+
+class PolicyUpdate(BaseModel):
+    """Ceilings and lifetimes an operator may change without a restart.
+
+    **Deliberately a narrow subset of `ServicePolicy`, and the omissions are the
+    point.** `CreateSessionRequest` carries no container settings because a
+    process holding the Docker socket can start a privileged container that
+    mounts the host — a client that could name its own image or volumes would own
+    the machine. That reasoning does not stop applying because the caller holds
+    the service token: in a multi-tenant deployment the token is held by an
+    application, per tenant, and an organization's administrator is not the
+    person who runs the host.
+
+    So what is writable here is resource ceilings and lifetimes — how much a
+    sandbox may consume and how long it may live. What is **not** writable is
+    anything that decides *isolation*:
+
+    - `runtimes` membership, because adding an alias means naming an image
+    - `network_mode`, because `host` is not a ceiling, it is an escape
+    - `oci_runtime`, for the same reason at a lower level
+    - `sandbox_uid`, because 0 is root
+    - `work_dir`, because it is where the workspace volume mounts and the archive
+      endpoints read
+    - `persist_containers`, `prewarm`, `buildkit` — startup shape, not ceilings
+
+    Those stay in the environment, where changing them is a deployment action
+    with a restart attached. `extra="forbid"`, so an attempt to send one is a 422
+    naming the field rather than a silently ignored key.
+
+    Absent means "leave it alone". Every field is optional for that reason: an
+    operator raising one ceiling must not have to restate the other twenty.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_runtime: str | None = None
+    """Must already be an allowed alias. Changing which of them is the default is
+    not the same as adding one."""
+
+    max_sessions: int | None = Field(default=None, ge=0)
+    max_open_sessions: int | None = Field(default=None, ge=0)
+    max_sessions_per_tenant: int | None = Field(default=None, ge=0)
+    evict_idle_after: int | None = Field(default=None, ge=0)
+    idle_timeout: int | None = Field(default=None, ge=0)
+    execute_timeout: int | None = Field(default=None, gt=0)
+    max_read_bytes: int | None = Field(default=None, gt=0)
+    workspace_ttl: int | None = Field(default=None, ge=0)
+    container_ttl: int | None = Field(default=None, ge=0)
+
+    mem_limit: str | None = None
+    memswap_limit: str | None = None
+    cpus: float | None = Field(default=None, gt=0)
+    cpu_shares: int | None = Field(default=None, gt=0)
+    pids_limit: int | None = Field(default=None, gt=0)
+    tmpfs_size: str | None = None
+
+    runtimes: dict[str, RuntimeLimitsUpdate] | None = None
+    """Per-alias ceilings, keyed by an alias the allowlist already holds. An
+    unknown one is refused rather than created, which is what keeps this from
+    being a way to name an image."""
 
 
 class ServiceIndex(BaseModel):

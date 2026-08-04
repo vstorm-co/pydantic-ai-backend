@@ -871,12 +871,12 @@ class TestDockerSandboxStop:
         assert container.stopped == 1
         assert container.removed == 0
 
-    def test_stop_with_remove_deletes_the_container(self):
+    def test_stop_with_purge_deletes_the_container(self):
         sandbox = _sandbox(container_name="reusable")
         container = TestDockerSandboxLiveness._Container()
         sandbox._container = container
 
-        sandbox.stop(remove=True)
+        sandbox.stop(purge=True)
 
         assert container.stopped == 1
         assert container.removed == 1
@@ -893,10 +893,67 @@ class TestDockerSandboxStop:
         sandbox = _sandbox()
         sandbox._container = Hostile()
 
-        sandbox.stop(remove=True)
-        sandbox.stop(remove=True)
+        sandbox.stop(purge=True)
+        sandbox.stop(purge=True)
 
         assert sandbox._container is None
+
+    def test_purge_is_what_every_other_sandbox_calls_it(self):
+        """One signature across the sandboxes, which is the point of the rename.
+
+        A caller holding "a sandbox" could not call `stop` without knowing which
+        it had: this one took `remove`, `RemoteSandbox` takes `purge`, and
+        `DaytonaSandbox` took nothing at all. Passing the wrong one raised a
+        `TypeError` from inside a teardown that was already wrapped in a broad
+        `except`, so the call that should have released the container was the one
+        that failed - silently.
+        """
+        removed: list[bool] = []
+
+        class Recording(TestDockerSandboxLiveness._Container):
+            def remove(self, force: bool = False) -> None:
+                removed.append(force)
+
+        sandbox = _sandbox()
+        sandbox._container = Recording()
+
+        sandbox.stop(purge=True)
+
+        assert removed == [True]
+
+    def test_the_old_name_still_works_and_says_it_is_going(self):
+        """`remove=` is honoured rather than broken: this is a patch release, and
+        somebody's teardown is calling it."""
+        removed: list[bool] = []
+
+        class Recording(TestDockerSandboxLiveness._Container):
+            def remove(self, force: bool = False) -> None:
+                removed.append(force)
+
+        sandbox = _sandbox()
+        sandbox._container = Recording()
+
+        with pytest.warns(DeprecationWarning, match="pass purge="):
+            sandbox.stop(remove=True)
+
+        assert removed == [True]
+
+    def test_the_old_name_can_also_ask_for_the_container_to_be_kept(self):
+        """`remove=False` is an explicit choice, not an absent one - so it must not
+        read as "no opinion" and fall through to `purge`'s default."""
+        removed: list[bool] = []
+
+        class Recording(TestDockerSandboxLiveness._Container):
+            def remove(self, force: bool = False) -> None:
+                removed.append(force)
+
+        sandbox = _sandbox()
+        sandbox._container = Recording()
+
+        with pytest.warns(DeprecationWarning):
+            sandbox.stop(purge=True, remove=False)
+
+        assert removed == []
 
 
 class TestDockerSandboxResourceUsage:

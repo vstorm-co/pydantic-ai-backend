@@ -19,6 +19,7 @@ from pydantic_ai.exceptions import (
 from pydantic_ai.toolsets import FunctionToolset
 
 from pydantic_ai_backends.adapter import ensure_async
+from pydantic_ai_backends.backends import _guard
 from pydantic_ai_backends.protocol import AsyncBackendProtocol, BackendProtocol
 from pydantic_ai_backends.toolsets import _ruleset, _tracking
 from pydantic_ai_backends.toolsets._content import (
@@ -85,6 +86,7 @@ from pydantic_ai_backends.toolsets.descriptions import (
 from pydantic_ai_backends.types import GrepMatch
 
 if TYPE_CHECKING:
+    from pydantic_ai_backends.permissions.checker import AskCallback, AskFallback
     from pydantic_ai_backends.permissions.types import PermissionRuleset
 
 EditFormat = Literal["str_replace", "hashline"]
@@ -196,6 +198,8 @@ def create_console_toolset(  # noqa: C901
     require_execute_approval: bool = True,
     default_ignore_hidden: bool = True,
     permissions: PermissionRuleset | None = None,
+    ask_callback: AskCallback | None = None,
+    ask_fallback: AskFallback = "error",
     max_retries: int = 1,
     image_support: bool = False,
     max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
@@ -267,8 +271,38 @@ def create_console_toolset(  # noqa: C901
     """
     described = descriptions or {}
 
+    # Wrapped once, here, because the closure backend never changes. `guarding`
+    # answers with the backend untouched when there is no ruleset or when the
+    # backend enforces one of its own, so this is a no-op for every existing
+    # caller.
+    guarded_backend = (
+        None
+        if backend is None
+        else _guard.guarding(
+            backend, permissions, ask_callback=ask_callback, ask_fallback=ask_fallback
+        )
+    )
+
     def backend_for(ctx: RunContext[ConsoleDeps]) -> BackendProtocol | AsyncBackendProtocol:
-        return backend if backend is not None else ctx.deps.backend
+        """The backend this call operates on, with the ruleset applied to it.
+
+        The one place every tool resolves its backend, which is why the guard goes
+        here: a ruleset's per-path rules used to reach nothing at all, because the
+        toolset only ever read an operation's *default* action at construction
+        time. Applying them needs a path, and a path only exists per call.
+
+        The deps backend is wrapped per call rather than once, since it can differ
+        between runs. Cheap: the wrapper holds two references and a checker that
+        does the same.
+        """
+        if backend is not None:
+            return guarded_backend if guarded_backend is not None else backend
+        return _guard.guarding(
+            ctx.deps.backend,
+            permissions,
+            ask_callback=ask_callback,
+            ask_fallback=ask_fallback,
+        )
 
     write_approval = _ruleset.requires_approval(permissions, "write", require_write_approval)
     execute_approval = _ruleset.requires_approval(permissions, "execute", require_execute_approval)

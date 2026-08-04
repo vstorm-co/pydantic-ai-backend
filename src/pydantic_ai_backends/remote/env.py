@@ -121,6 +121,7 @@ def config_from_env(env: Mapping[str, str]) -> SandboxdConfig:
             execute_timeout=_value(env, "EXECUTE_TIMEOUT", defaults.execute_timeout, _as_int),
             max_workers=_value(env, "MAX_WORKERS", defaults.max_workers, _as_int),
             ui_enabled=_flag(env, "UI_ENABLED", defaults.ui_enabled),
+            policy_overrides=_optional(env, "POLICY_OVERRIDES", defaults.policy_overrides, str),
         )
     except ValueError as e:
         # `SandboxdConfig` refuses combinations no single variable is wrong in —
