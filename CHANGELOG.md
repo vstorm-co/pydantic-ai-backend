@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.25] - 2026-08-04
+
+Four open issues, and the first is the one to read.
+
+### Fixed
+
+- **A `PermissionRuleset`'s per-path rules are enforced.** Handing one to
+  `ConsoleCapability` reached two things — `requires_approval`, for the write and
+  execute approval flags, and `_denied_tools`, which drops a tool whose
+  *operation* defaults to `"deny"`. Nothing read `OperationPermissions.rules`. So
+  the shape a caller writes when they want "allow the workspace, deny credentials
+  and the system tree" — every operation `default="allow"`, the patterns in
+  `rules` — was no enforcement at all: `/etc/passwd` and `**/.env` read and wrote
+  freely, and `grep` returned their contents line by line. Worse than rejecting
+  the ruleset, because it looked like a working boundary.
+
+  `PermissionGuard` had been here since `LocalBackend` needed it and only
+  `LocalBackend` ever used it. `GuardedBackend` puts it on any backend, applied
+  where the toolset resolves its backend — the one place every tool passes
+  through. A caller with no ruleset, or a backend enforcing its own, is untouched,
+  so nothing changes for anyone who was not already expecting this to work.
+
+  `grep` is filtered rather than refused, because a match carries the file's line;
+  `ls` and `glob` filter on their own rules and not on `read`, matching
+  `LocalBackend`. Also fixed a symlink hole in the command check: paths were
+  resolved before matching, so on macOS `/etc/passwd` became `/private/etc/passwd`
+  and a rule reading `/etc/**` matched nothing. (#97)
+
+- **One signature for `stop` across every backend.** `RemoteSandbox.stop(purge)`,
+  `DockerSandbox.stop(remove)` and `DaytonaSandbox.stop()` meant a caller holding
+  "a sandbox" could not call it — and the `TypeError` landed inside teardown, which
+  is wrapped in a broad `except`, so the call that should have released the
+  resource was the one that raised. A Daytona sandbox was never deleted on any
+  path, once per run, on the account paying for it.
+
+  `purge` everywhere, `False` by default everywhere. `DockerSandbox.stop(remove=)`
+  still works and warns; nothing that called `stop()` needs to change. (#98)
+
+### Added
+
+- **`WorkspaceArchive.read_bytes`**, and `POST /workspaces/{id}/read_bytes` behind
+  it. `read` returns `str`, so a chart, a rendered PDF or an image came back
+  decoded and re-encoded — a corrupt file that downloads successfully, which is
+  worse than an error. Consumers had to allowlist text suffixes, which left the
+  container backend as the one whose outputs could not be fetched. The service's
+  `max_read_bytes` still applies: this returns a whole file. (#96)
+
+- **`PUT /policy` and `SANDBOXD_POLICY_OVERRIDES`** — change the ceilings and
+  lifetimes without a restart, which used to drop every resident sandbox on the
+  host. Both go through one function, so the endpoint and the file cannot drift
+  into disagreeing about what is in force.
+
+  Ceilings and lifetimes only. `runtimes` membership, `network_mode`,
+  `oci_runtime`, `sandbox_uid`, `work_dir`, `persist_containers` and `prewarm` are
+  refused by name with a `422` — adding an alias means naming an image, and
+  `network_mode: host` is not a ceiling but an escape. A change applies to the
+  next sandbox; Docker sets the limit on the container, so a resident one keeps
+  what it was created with. (#95)
+
 ## [0.2.24] - 2026-08-03
 
 ### Added
