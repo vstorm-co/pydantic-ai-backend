@@ -102,8 +102,20 @@ class BaseSandbox(_SandboxIdentity, ABC):
         """
         return False
 
-    def stop(self) -> None:
-        """Stop and clean up the sandbox."""
+    def stop(self, purge: bool = False) -> None:
+        """Stop and clean up the sandbox.
+
+        Args:
+            purge: Also discard what the sandbox accumulated — its filesystem,
+                and any workspace kept for it outside the container. Left off,
+                the sandbox ends while its files survive for the next attach;
+                turned on, the thing the sandbox belonged to is gone for good.
+
+                Accepted by every sandbox so one call site can end any of them,
+                and the subclasses that cannot tell the two apart say so: a
+                Daytona sandbox and a Kubernetes pod are deleted either way,
+                because neither keeps a filesystem this library can reattach to.
+        """
 
     @abstractmethod
     def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
@@ -230,8 +242,13 @@ class AsyncBaseSandbox(_SandboxIdentity, ABC):
         """
         return False
 
-    async def stop(self) -> None:
-        """Stop and clean up the sandbox."""
+    async def stop(self, purge: bool = False) -> None:
+        """Stop and clean up the sandbox.
+
+        Args:
+            purge: Also discard what the sandbox accumulated. See
+                :meth:`BaseSandbox.stop`.
+        """
 
     @abstractmethod
     async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:

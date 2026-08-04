@@ -236,7 +236,15 @@ class KubernetesPodSandbox(BaseSandbox):
             return False
         return bool(pod.status.phase == "Running")
 
-    def stop(self) -> None:
+    def stop(self, purge: bool = False) -> None:
+        """Close the connection and delete the pod when this sandbox owns it.
+
+        Args:
+            purge: Accepted for one signature across every sandbox, and it makes
+                no difference here. A pod is deleted or it is not, and that is
+                `delete_on_stop`'s decision rather than the caller's - there is
+                no state kept for a later attach to preserve.
+        """
         if self._stopped:
             return
         self._stopped = True

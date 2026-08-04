@@ -7,6 +7,7 @@ import io
 import shlex
 import tarfile
 import time
+import warnings
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, cast
 
@@ -442,7 +443,7 @@ class DockerSandbox(BaseSandbox):
         except Exception:
             return None
 
-    def stop(self, remove: bool = False) -> None:
+    def stop(self, purge: bool = False, *, remove: bool | None = None) -> None:
         """Stop the container.
 
         A container created without `container_name` runs with
@@ -451,15 +452,31 @@ class DockerSandbox(BaseSandbox):
         whole point of naming it.
 
         Args:
-            remove: Also remove the container, discarding its filesystem state.
+            purge: Also remove the container, discarding its filesystem state.
+                Named `purge` so that one call site can end any sandbox this
+                library offers - `RemoteSandbox`, `DaytonaSandbox` and the
+                Kubernetes pod all spell the same idea this way, and this one
+                used to spell it `remove`. A caller holding "a sandbox" could
+                not call `stop` without knowing which it had.
+            remove: The old name for `purge`, still honoured so nothing that
+                passes it breaks. Deprecated; pass `purge` instead.
         """
+        if remove is not None:
+            warnings.warn(
+                "DockerSandbox.stop(remove=...) is deprecated; pass purge=... instead, "
+                "which is what every other sandbox calls the same argument.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            purge = remove
+
         container = getattr(self, "_container", None)
         if container is None:
             return
 
         with contextlib.suppress(Exception):
             container.stop()
-        if remove:
+        if purge:
             with contextlib.suppress(Exception):
                 container.remove(force=True)
         self._container = None
