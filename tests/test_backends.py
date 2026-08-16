@@ -85,6 +85,33 @@ class TestStateBackend:
         assert "file2.txt" in names
         assert "subdir" in names
 
+    def test_ls_info_reports_when_a_file_was_modified(self):
+        """A listing entry carries the timestamp the store records on write."""
+        backend = StateBackend()
+        backend.write("/dir/file.txt", "content")
+
+        entries = backend.ls_info("/dir")
+
+        assert entries[0]["modified_at"] == backend.files["/dir/file.txt"]["modified_at"]
+
+    def test_a_directory_entry_has_no_modified_time(self):
+        """Directories are synthesised from paths; there is nothing to date."""
+        backend = StateBackend()
+        backend.write("/dir/subdir/file.txt", "content")
+
+        (subdir,) = [e for e in backend.ls_info("/dir") if e["is_dir"]]
+
+        assert subdir.get("modified_at") is None
+
+    def test_a_document_from_before_the_timestamp_lists_none(self):
+        """A persisted document written by an older release loads without the key."""
+        legacy = {"/old.txt": {"content": ["hi"], "created_at": "2020-01-01T00:00:00+00:00"}}
+        backend = StateBackend(files=legacy)  # type: ignore[arg-type]  # the old shape, deliberately
+
+        (entry,) = backend.ls_info("/")
+
+        assert entry.get("modified_at") is None
+
     def test_glob_info(self):
         """Test glob pattern matching."""
         backend = StateBackend()

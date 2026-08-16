@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -157,6 +158,19 @@ class TestLocalBackendFileOps:
         assert "file2.txt" in names
         assert "subdir" in names
 
+    def test_ls_info_reports_the_files_mtime(self, tmp_path: Path):
+        """A file's entry carries its `st_mtime` as ISO 8601 UTC; a directory's carries none."""
+        backend = LocalBackend(root_dir=tmp_path)
+        backend.write("file.txt", "a")
+        (tmp_path / "subdir").mkdir()
+
+        entries = {e["name"]: e for e in backend.ls_info(".")}
+
+        stat = (tmp_path / "file.txt").stat()
+        expected = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+        assert entries["file.txt"]["modified_at"] == expected
+        assert entries["subdir"]["modified_at"] is None
+
     def test_glob_info(self, tmp_path: Path):
         """Test finding files with glob pattern."""
         backend = LocalBackend(root_dir=tmp_path)
@@ -167,6 +181,7 @@ class TestLocalBackendFileOps:
 
         entries = backend.glob_info("*.py")
         assert len(entries) == 2
+        assert all(e["modified_at"] is not None for e in entries)
 
     def test_grep_raw(self, tmp_path: Path):
         """Test searching files with grep."""

@@ -16,7 +16,7 @@ import threading
 import time
 import types
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1730,6 +1730,28 @@ class TestWorkspaceArchiveRoutes:
             assert [(r.name, r.is_dir) for r in rows] == [("src", True), ("report.md", False)]
             # Nothing was started to answer that.
             assert harness.built == {}
+
+    def test_listing_reports_when_a_file_was_modified(self, stored):
+        """A stored file's row carries its mtime; a directory's carries none."""
+        harness, workspace = stored
+        with harness.client() as client:
+            response = client.post(
+                "/workspaces/cold/ls", json={"path": "."}, headers=_service_headers()
+            )
+
+            rows = {row["name"]: row for row in response.json()}
+            stat = (workspace / "report.md").stat()
+            expected = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+            assert rows["report.md"]["modified_at"] == expected
+            assert rows["src"]["modified_at"] is None
+
+    def test_a_row_from_an_older_service_still_validates(self):
+        """A service released before `modified_at` sends rows without it."""
+        entry = wire.FileEntry.model_validate(
+            {"name": "a.txt", "path": "a.txt", "is_dir": False, "size": 2}
+        )
+
+        assert entry.modified_at is None
 
     def test_reading_needs_no_container(self, stored):
         harness, _ = stored

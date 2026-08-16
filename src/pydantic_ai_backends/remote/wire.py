@@ -123,6 +123,9 @@ class FileEntry(BaseModel):
     path: str
     is_dir: bool
     size: int | None = None
+    modified_at: str | None = None
+    """ISO 8601, when the backend reports one. Defaults absent so a client and a
+    service on either side of this release keep understanding each other."""
 
 
 class GrepRequest(BaseModel):

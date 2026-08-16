@@ -49,13 +49,27 @@ class FileData(_FileDataFields, total=False):
     """Present only when `content` holds base64 rather than lines of text."""
 
 
-class FileInfo(TypedDict):
-    """Information about a file or directory."""
+class _FileInfoFields(TypedDict):
+    """The keys every listing entry has. Split out so `modified_at` can be optional."""
 
     name: str
     path: str
     is_dir: bool
     size: int | None
+
+
+class FileInfo(_FileInfoFields, total=False):
+    """Information about a file or directory.
+
+    `modified_at` is an ISO 8601 timestamp, present when the backend can report
+    one: `StateBackend` records it on every write, filesystem-backed listings
+    take `st_mtime`, and the remote wire carries it end to end. A backend that
+    derives its listing from shell `ls` output has no reliable timestamp to
+    give, so the key is absent there — read it with `.get("modified_at")` and
+    treat a missing key as unknown, never as "just now".
+    """
+
+    modified_at: str | None
 
 
 @dataclass
