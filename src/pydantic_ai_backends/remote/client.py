@@ -479,7 +479,10 @@ def _to_file_infos(response: Any) -> list[FileInfo]:
         entries = [wire.FileEntry.model_validate(row) for row in response.json()]
     except Exception:
         return []
-    return [FileInfo(name=e.name, path=e.path, is_dir=e.is_dir, size=e.size) for e in entries]
+    return [
+        FileInfo(name=e.name, path=e.path, is_dir=e.is_dir, size=e.size, modified_at=e.modified_at)
+        for e in entries
+    ]
 
 
 class WorkspaceArchiveError(Exception):
@@ -567,7 +570,12 @@ class WorkspaceArchive:
         payload = wire.LsRequest(path=path).model_dump(mode="json")
         response = self._post(f"/workspaces/{session_id}/ls", payload)
         entries = [wire.FileEntry.model_validate(row) for row in response.json()]
-        return [FileInfo(name=e.name, path=e.path, is_dir=e.is_dir, size=e.size) for e in entries]
+        return [
+            FileInfo(
+                name=e.name, path=e.path, is_dir=e.is_dir, size=e.size, modified_at=e.modified_at
+            )
+            for e in entries
+        ]
 
     def read(self, session_id: str, path: str, offset: int = 0, limit: int = 2000) -> str:
         """Read a slice of a stored workspace file.

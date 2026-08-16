@@ -15,6 +15,7 @@ file_info: FileInfo = {
     "path": "/workspace/app.py",
     "is_dir": False,
     "size": 1234,
+    "modified_at": "2026-08-16T12:00:00+00:00",  # absent when the backend cannot report one
 }
 ```
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 
 from pydantic_ai_backends._text import bytes_to_text
+from pydantic_ai_backends._time import iso_mtime
 from pydantic_ai_backends.types import FileInfo
 
 
@@ -103,10 +104,16 @@ def list_workspace(root: Path, path: str) -> list[FileInfo]:
             relative = str(entry.relative_to(resolved_root))
             target = resolve_within(root, relative)
             is_dir = target.is_dir()
-            size = None if is_dir else target.stat().st_size
+            stat = target.stat()
+            size = None if is_dir else stat.st_size
+            modified_at = None if is_dir else iso_mtime(stat.st_mtime)
         except (WorkspacePathError, ValueError, OSError):
             continue
-        entries.append(FileInfo(name=entry.name, path=relative, is_dir=is_dir, size=size))
+        entries.append(
+            FileInfo(
+                name=entry.name, path=relative, is_dir=is_dir, size=size, modified_at=modified_at
+            )
+        )
     return sorted(entries, key=lambda item: (not item["is_dir"], item["name"]))
 
 

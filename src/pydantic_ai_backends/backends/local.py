@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from pydantic_ai_backends._editing import Replacement, replace_in_content
 from pydantic_ai_backends._limits import DEFAULT_READ_LIMIT, MAX_EXECUTE_OUTPUT_BYTES
+from pydantic_ai_backends._time import iso_mtime
 from pydantic_ai_backends.backends._background import BackgroundProcesses
 from pydantic_ai_backends.backends._guard import PermissionGuard
 from pydantic_ai_backends.types import (
@@ -428,7 +429,13 @@ class LocalBackend:
                     # and worse than an error. `ls_info` and grep both skip and
                     # carry on; this now matches them.
                     continue
-                info = FileInfo(name=match.name, path=str(match), is_dir=False, size=stat.st_size)
+                info = FileInfo(
+                    name=match.name,
+                    path=str(match),
+                    is_dir=False,
+                    size=stat.st_size,
+                    modified_at=iso_mtime(stat.st_mtime),
+                )
                 collected.append((stat.st_mtime, str(match), info))
         except (PermissionError, OSError):
             # The walk itself failed, so there is nothing left to collect.
@@ -690,11 +697,14 @@ def _numbered_line(number: int, line: str) -> str:
 
 
 def _entry_info(path: Path) -> FileInfo:
+    stat = path.stat()
+    is_file = path.is_file()
     return FileInfo(
         name=path.name,
         path=str(path),
         is_dir=path.is_dir(),
-        size=path.stat().st_size if path.is_file() else None,
+        size=stat.st_size if is_file else None,
+        modified_at=iso_mtime(stat.st_mtime) if is_file else None,
     )
 
 

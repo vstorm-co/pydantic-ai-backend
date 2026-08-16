@@ -336,4 +336,6 @@ def _file_entry(name: str, path: str, data: FileData) -> FileInfo:
         # count too: text is stored split on "\n" and rejoined on the way out,
         # so summing the lines alone reported one byte less per line.
         size=len(_content_bytes(data)),
+        # `.get`: a document persisted before the key existed loads without it.
+        modified_at=data.get("modified_at"),
     )

@@ -587,4 +587,7 @@ def _to_file_info(row: dict[str, Any]) -> FileInfo:
         path=row.get("path", ""),
         is_dir=bool(row.get("is_dir", False)),
         size=row.get("size"),
+        # The in-pod server ships with the user's image, so an older one simply
+        # does not send this yet.
+        modified_at=row.get("modified_at"),
     )
