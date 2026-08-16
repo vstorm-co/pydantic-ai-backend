@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.26] - 2026-08-16
+
+### Added
+
+- **`FileInfo.modified_at`** — an optional ISO 8601 timestamp, filled by every
+  listing that has a real one to give. `StateBackend` surfaces the time
+  `FileData` already records on each write (a document persisted before the key
+  existed lists `None`); `LocalBackend` reports `st_mtime` on `ls` and `glob`;
+  a stored workspace archive reports it through the wire, where
+  `wire.FileEntry.modified_at` defaults to `None` so a client and a service on
+  either side of this release keep understanding each other; a Kubernetes pod's
+  in-pod server may send one and an older image simply does not.
+
+  Shell-derived listings (docker/daytona exec) leave the key absent: `ls -la`
+  output has no timestamp that survives locale, busybox and timezone, and a
+  guessed time is worse than none. Read it with `.get("modified_at")` and treat
+  a missing key as unknown, never as "just now". (#104)
+
 ## [0.2.25] - 2026-08-04
 
 Four open issues, and the first is the one to read.
