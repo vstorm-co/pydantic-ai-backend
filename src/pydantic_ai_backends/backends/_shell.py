@@ -151,15 +151,46 @@ def parse_write(result: ExecuteResponse, path: str) -> WriteResult:
     return WriteResult(path=path)
 
 
+ROOT_SPELLINGS = frozenset({"", "/", "."})
+"""The three ways a caller spells "the root of this backend".
+
+`normalize_path` collapses all three to `/` for a backend addressing files by
+virtual path, where `/` *is* the top of the namespace. A shell-backed one has a
+real filesystem under it and a working directory inside it, so the same three
+have to become `.` instead - see :func:`glob_command` for what passing `/`
+through cost.
+"""
+
+
 def glob_command(pattern: str, path: str) -> str:
-    """Match files with `find`.
+    """Match files with `find`, rooted where the caller's path means.
+
+    Two things to get right, and this got both wrong.
+
+    **The root.** A path naming the backend's root means the session's working
+    directory here, not the filesystem's. Passed through, `find /` read it as the
+    machine: a glob of `*` in a container answered 2540 paths from `/proc` and
+    `/usr` and not one from the workspace. So the agent's own search tool read
+    the image it was running on - into its context - and a channel's "what did
+    the agent write this turn" snapshot diffed two photographs of `/proc`.
+    Anything genuinely absolute is still passed through: `/etc` is a root a
+    caller may mean.
+
+    **Globstar.** `find -path` matches with fnmatch, where `**` is no different
+    from `*` and every `/` in the pattern must be present in the path. So `**/*`
+    - what anything walking a tree reaches for, including that snapshot - needed
+    two slashes and therefore missed every file at the top level. A leading
+    `**/` means "at any depth", which is exactly what the `*/` prefix below
+    already provides, so it is dropped rather than stacked.
 
     The pattern is matched as `-path '*/{pattern}'` so a basename glob like
     `*.py` matches files anywhere under the root, since `find -path` tests the
     whole pathname.
     """
-    quoted_path = shlex.quote(path)
-    quoted_pattern = shlex.quote(f"*/{pattern}")
+    root = "." if path.strip() in ROOT_SPELLINGS else path
+    anywhere = pattern[3:] if pattern.startswith("**/") else pattern
+    quoted_path = shlex.quote(root)
+    quoted_pattern = shlex.quote(f"*/{anywhere}")
     return f"find {quoted_path} -path {quoted_pattern} -type f 2>/dev/null"
 
 
