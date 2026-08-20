@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.27] - 2026-08-20
+
+### Fixed
+
+- **A glob was rooted in the machine rather than in the workspace.**
+  `glob_command` passed its root through to `find`, and a caller naming the
+  backend's root spells it `/`, `""` or `.` — which is the top of the namespace
+  for a backend addressing files by virtual path and the filesystem root for a
+  shell. Measured against a running `sandboxd` in a session holding three files,
+  `glob("*")` answered **2540 paths, all of them outside the workspace**
+  (`/proc`, `/usr`, the base image), `glob("*.txt")` answered 25 of which 22
+  were, and `glob("./**/*")` answered none at all. So an agent's own search tool
+  read the image it runs on into its context, and any caller diffing two globs
+  to learn what changed during a turn was comparing two photographs of `/proc`.
+  The root resolves to `.` now — the session's working directory — and an
+  absolute path is still passed through, because `/etc` is a root a caller may
+  mean. (#106)
+- **`**/*` missed every file at the top level**, and it is the pattern anything
+  walking a tree reaches for. `find -path` matches with fnmatch, where `**` is no
+  different from `*` and every `/` in the pattern must be present in the path, so
+  the prefix required two slashes. A leading `**/` means "at any depth", which is
+  exactly what the `*/` prefix already provides, so it is dropped rather than
+  stacked. (#106)
+
 ## [0.2.26] - 2026-08-16
 
 ### Added
