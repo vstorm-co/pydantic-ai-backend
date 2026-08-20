@@ -222,6 +222,32 @@ class TestGlob:
         assert "-path '*/*.py'" in command
         assert "-type f" in command
 
+    @pytest.mark.parametrize("root", ["", "/", "."])
+    def test_the_backend_s_root_is_the_working_directory(self, root: str):
+        """Not the machine's root, which is what `/` means to `find`.
+
+        A glob of `*` with `/` passed through answered 2540 paths from `/proc`
+        and `/usr` on a container and none from the workspace - so the agent's
+        own search tool read the image it runs on, and a channel's snapshot of
+        "what did the agent write" diffed two photographs of `/proc`.
+        """
+        assert _shell.glob_command("*.py", root).startswith("find . ")
+
+    def test_an_absolute_root_is_still_absolute(self):
+        # `/etc` is a root a caller may mean, and this is not the place to argue.
+        assert _shell.glob_command("*.conf", "/etc").startswith("find /etc ")
+
+    @pytest.mark.parametrize(
+        ("pattern", "expected"),
+        [("**/*", "*/*"), ("**/*.py", "*/*.py"), ("*.py", "*/*.py"), ("src/*.py", "*/src/*.py")],
+    )
+    def test_a_leading_globstar_is_dropped_rather_than_stacked(self, pattern: str, expected: str):
+        """`find -path` matches with fnmatch: `**` is `*`, and every `/` in the
+        pattern must be in the path. So `**/*` needed two slashes and missed
+        every file at the top level - and `**/*` is what anything walking a tree
+        reaches for."""
+        assert f"-path '{expected}'" in _shell.glob_command(pattern, "/")
+
     def test_matches_are_sorted_by_path(self):
         rows = _shell.parse_glob(_ok("/w/b.py\n/w/a.py\n"))
 
