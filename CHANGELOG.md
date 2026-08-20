@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Foreground shell execution could hang on Windows waiting for stdin.**
+  `LocalBackend` wraps commands in `cmd /c` on Windows, and built-ins such as
+  `date` and `time` print the current value then prompt for a new one. Agent
+  sessions inherit an open stdin, so `execute("date")` waited until the
+  backend timeout instead of returning. Background processes already close
+  stdin with `DEVNULL`; sync `execute()` and `async_execute()` now do the
+  same, so interactive prompts see EOF immediately. (#103)
+
 ## [0.2.27] - 2026-08-20
 
 ### Fixed

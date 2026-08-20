@@ -577,6 +577,9 @@ class LocalBackend:
                 cwd=self._root,
                 capture_output=True,
                 text=True,
+                # Closed so Windows built-ins like `date`/`time` cannot block
+                # on an interactive prompt until the execute timeout.
+                stdin=subprocess.DEVNULL,
                 timeout=timeout if timeout is not None else DEFAULT_EXECUTE_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
@@ -603,6 +606,7 @@ class LocalBackend:
         try:
             process = await asyncio.create_subprocess_exec(
                 *shell_argv(command),
+                stdin=asyncio.subprocess.DEVNULL,  # same as execute(): no interactive prompts
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._root,

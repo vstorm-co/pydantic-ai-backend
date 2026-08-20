@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -330,6 +331,41 @@ class TestLocalBackendExecute:
         assert result.exit_code == 0
         assert str(tmp_path) in result.output
 
+    def test_execute_closes_stdin(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Foreground execution must not inherit stdin (Windows date/time hang)."""
+        recorded: dict[str, object] = {}
+
+        class Result:
+            stdout = "ok"
+            stderr = ""
+            returncode = 0
+
+        def run(*args: object, **kwargs: object) -> Result:
+            recorded.update(kwargs)
+            return Result()
+
+        monkeypatch.setattr("subprocess.run", run)
+        backend = LocalBackend(root_dir=tmp_path)
+
+        result = backend.execute("echo hello")
+
+        assert recorded["stdin"] is subprocess.DEVNULL
+        assert result.exit_code == 0
+        assert "ok" in result.output
+
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="cmd.exe date/time prompts are Windows-specific"
+    )
+    def test_execute_windows_date_and_time_do_not_block_on_stdin(self, tmp_path: Path):
+        """Bare `date`/`time` must return immediately instead of waiting for input."""
+        backend = LocalBackend(root_dir=tmp_path)
+
+        for command in ("date", "time"):
+            result = backend.execute(command, timeout=2)
+            assert result.exit_code != 124, command
+            assert "timed out" not in result.output.lower(), command
+            assert result.output.strip(), command
+
 
 class TestLocalBackendAsyncExecute:
     """Test LocalBackend async shell execution."""
@@ -369,6 +405,44 @@ class TestLocalBackendAsyncExecute:
         result = await backend.async_execute("sleep 10", timeout=1)
         assert result.exit_code == 124
         assert "timed out" in result.output
+
+    async def test_async_execute_closes_stdin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Async foreground execution must not inherit stdin either."""
+        recorded: dict[str, object] = {}
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return b"ok", b""
+
+        async def create(*args: object, **kwargs: object) -> FakeProc:
+            recorded.update(kwargs)
+            return FakeProc()
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", create)
+        backend = LocalBackend(root_dir=tmp_path)
+
+        result = await backend.async_execute("echo hello")
+
+        assert recorded["stdin"] is asyncio.subprocess.DEVNULL
+        assert result.exit_code == 0
+        assert "ok" in result.output
+
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="cmd.exe date/time prompts are Windows-specific"
+    )
+    async def test_async_execute_windows_date_and_time_do_not_block_on_stdin(self, tmp_path: Path):
+        """Bare `date`/`time` must return immediately on the async path too."""
+        backend = LocalBackend(root_dir=tmp_path)
+
+        for command in ("date", "time"):
+            result = await backend.async_execute(command, timeout=2)
+            assert result.exit_code != 124, command
+            assert "timed out" not in result.output.lower(), command
+            assert result.output.strip(), command
 
     async def test_async_execute_cancelled(self, tmp_path: Path):
         """Test that CancelledError propagates from async_execute."""
