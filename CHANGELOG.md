@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.29] - 2026-08-22
+
+### Fixed
+
+- **A tool's return description now reaches the model the way pydantic-ai sends
+  every other one.** `render` appended a prose `Returns: …` paragraph, where the
+  framework wraps a docstring's `Returns:` section in `<summary>` and `<returns>`
+  tags — so a host registering these beside tools of its own put two conventions
+  in one tool list, `create_chart` arriving as XML and `ls` as prose describing
+  the same kind of thing. `render` emits the framework's shape now, and
+  `tests/test_tool_text.py` pins it against a tool pydantic-ai renders itself, so
+  a change on that side fails here rather than leaving these tools speaking the
+  old dialect. The `*_DESCRIPTION` constants carry the new shape with them; a
+  catalogue wanting prose reads `ToolText.summary`, which is what it wanted.
+
 ## [0.2.28] - 2026-08-22
 
 ### Changed

@@ -8,6 +8,11 @@ is the half a tool description usually leaves out. The model then knows that
 `grep` answers three different shapes, that a listing may be a truncated slice,
 and that a failed `execute` still returns its output.
 
+What reaches the model is shaped the way pydantic-ai shapes a docstring with a
+`Returns:` section - `<summary>` around the prose, `<returns>` around the return
+description - so these tools read the same as every tool built from a docstring
+rather than introducing a second convention into one tool list.
+
 Two audiences read this text and they need different amounts of it. A coding
 agent wants the git and dependency guidance; an agent that keeps a scratch
 workspace for a report never sees a repository and pays for those sentences on
@@ -69,6 +74,16 @@ class ToolText:
     def render(self, profile: Profile = DEFAULT_PROFILE) -> str:
         """The description handed to the model.
 
+        Shaped the way pydantic-ai shapes a docstring that has a `Returns:`
+        section - the prose inside `<summary>`, the return description inside
+        `<returns>` - because that is what every tool built from a docstring
+        already sends, and a host registering these beside its own would
+        otherwise put two conventions in one tool list. A prose `Returns:`
+        paragraph was the first attempt and is what that inconsistency looked
+        like. `tests/test_tool_text.py` pins the shape against a tool the
+        framework renders itself, so a change there fails here rather than
+        drifting quietly.
+
         Args:
             profile: Which audience to write for.
         """
@@ -77,9 +92,13 @@ class ToolText:
             parts.append(self.usage)
         if self.coding and profile == "coding":
             parts.append(self.coding)
-        if self.returns:
-            parts.append(f"Returns: {self.returns}")
-        return "\n\n".join(parts)
+        body = "\n\n".join(parts)
+        if not self.returns:
+            return body
+        return (
+            f"<summary>{body}</summary>\n"
+            f"<returns>\n<description>{self.returns}</description>\n</returns>"
+        )
 
     def docstring(self) -> str:
         """A Google-style docstring carrying the argument text.

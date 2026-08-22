@@ -91,6 +91,24 @@ TOOL_TEXT["grep"].args  # keyed by parameter name
 TOOL_TEXT["grep"].render()  # the description the model is given
 ```
 
+`render` produces what pydantic-ai produces for a docstring with a `Returns:`
+section — the prose inside `<summary>`, the return description inside
+`<returns>`:
+
+```
+<summary>Search the contents of files for a regular expression.
+
+Use this rather than a shell `grep` …</summary>
+<returns>
+<description>`files_with_matches` lists paths, `content` lists `path:line: text` …</description>
+</returns>
+```
+
+That is deliberate rather than decorative: a host registers these beside tools of
+its own that were built from docstrings, and two conventions in one tool list is
+one more thing for the model to reconcile. `tests/test_tool_text.py` pins the
+shape against a tool the framework renders itself.
+
 ### Profiles
 
 Two kinds of agent read these tools and they need different amounts of text. A

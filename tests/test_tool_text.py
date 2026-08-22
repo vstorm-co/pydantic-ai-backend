@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from pydantic_ai.exceptions import UserError
+from pydantic_ai.toolsets import FunctionToolset
 
 from pydantic_ai_backends import create_console_toolset
 from pydantic_ai_backends.toolsets import descriptions as text_module
@@ -68,6 +69,53 @@ class TestEveryToolIsDescribed:
         assert (
             TOOL_TEXT["hashline_read_file"].render()
         ) == text_module.HASHLINE_READ_FILE_DESCRIPTION
+
+
+class TestTheShapeIsTheFrameworksOwn:
+    """One convention per tool list, and it is not ours to invent."""
+
+    def test_it_matches_a_tool_pydantic_ai_renders_itself(self) -> None:
+        """A tool built from a docstring is what a host registers these beside.
+
+        Pinned against the framework rather than against a string literal: if
+        pydantic-ai changes how it renders a `Returns:` section, this fails here
+        rather than leaving these tools quietly speaking the old dialect.
+        """
+        native: FunctionToolset[None] = FunctionToolset()
+
+        @native.tool_plain
+        def demo() -> str:
+            """Do a thing.
+
+            A second paragraph of usage.
+
+            Returns:
+                One line per entry.
+            """
+            return ""  # pragma: no cover - never called, only described
+
+        rendered = ToolText(
+            summary="Do a thing.",
+            usage="A second paragraph of usage.",
+            returns="One line per entry.",
+        ).render()
+
+        assert rendered == native.tools["demo"].tool_def.description
+
+    def test_a_tool_with_nothing_to_report_is_left_as_prose(self) -> None:
+        """No `Returns:` section, no tags - which is what the framework does."""
+        assert ToolText(summary="Do a thing.", usage="Carefully.").render() == (
+            "Do a thing.\n\nCarefully."
+        )
+
+    def test_the_registered_description_carries_the_return_shape(self) -> None:
+        toolset = create_console_toolset()
+
+        described = toolset.tools["grep"].tool_def.description
+
+        assert described is not None
+        assert described.startswith("<summary>")
+        assert "<description>`files_with_matches` lists paths" in described
 
 
 class TestProfiles:
