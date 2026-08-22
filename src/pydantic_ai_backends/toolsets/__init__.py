@@ -16,9 +16,11 @@ from pydantic_ai_backends.toolsets.console import (
     create_console_toolset,
     get_console_system_prompt,
 )
+from pydantic_ai_backends.toolsets.descriptions import TOOL_TEXT, Profile, ToolText
 
 __all__ = [
     "CONSOLE_SYSTEM_PROMPT",
+    "TOOL_TEXT",
     "EDIT_FILE_DESCRIPTION",
     "EXECUTE_DESCRIPTION",
     "GLOB_DESCRIPTION",
@@ -30,6 +32,8 @@ __all__ = [
     "WRITE_FILE_DESCRIPTION",
     "ConsoleDeps",
     "ConsoleToolset",
+    "Profile",
+    "ToolText",
     "create_console_toolset",
     "get_console_system_prompt",
 ]

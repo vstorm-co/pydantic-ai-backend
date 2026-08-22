@@ -338,13 +338,12 @@ toolset = create_console_toolset(
     require_execute_approval=True,
 )
 
-# With custom tool descriptions
-toolset = create_console_toolset(
-    descriptions={
-        "execute": "Run shell commands in the workspace",
-        "read_file": "Read file contents from the workspace",
-    }
-)
+# Leaner descriptions for an agent that is not working in a repository
+toolset = create_console_toolset(profile="agent")
+
+# With custom tool text — a string replaces the description, a ToolText
+# replaces the per-argument text with it
+toolset = create_console_toolset(descriptions={"execute": "Run shell commands in the workspace"})
 ```
 
 **Available tools:** `ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `execute`

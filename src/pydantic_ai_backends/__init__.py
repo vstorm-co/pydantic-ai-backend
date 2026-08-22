@@ -137,6 +137,7 @@ if TYPE_CHECKING:
         create_console_toolset,
         get_console_system_prompt,
     )
+    from pydantic_ai_backends.toolsets.descriptions import TOOL_TEXT, Profile, ToolText
 
 _LAZY_MODULES: dict[str, tuple[str, ...]] = {
     "pydantic_ai_backends.hashline": (
@@ -168,6 +169,7 @@ _LAZY_MODULES: dict[str, tuple[str, ...]] = {
         "create_console_toolset",
         "get_console_system_prompt",
     ),
+    "pydantic_ai_backends.toolsets.descriptions": ("TOOL_TEXT", "Profile", "ToolText"),
     "pydantic_ai_backends.capability": ("ConsoleCapability",),
     "pydantic_ai_backends.backends.base": ("AsyncBaseSandbox", "BaseSandbox"),
     "pydantic_ai_backends.backends.daytona": ("DaytonaSandbox",),
@@ -208,6 +210,7 @@ _LAZY_IMPORTS = {name: module for module, names in _LAZY_MODULES.items() for nam
 # Spelled out rather than derived from the two groups above: type checkers only
 # understand a literal `__all__`, and this is the library's public API reference.
 __all__ = [
+    "TOOL_TEXT",
     "AskCallback",
     "AskFallback",
     "AsyncBackendAdapter",
@@ -229,6 +232,8 @@ __all__ = [
     "ConsoleCapability",
     "ConsoleDeps",
     "ConsoleToolset",
+    "Profile",
+    "ToolText",
     "DEFAULT_MAX_DOCUMENT_BYTES",
     "DEFAULT_MAX_IMAGE_BYTES",
     "DEFAULT_RULESET",

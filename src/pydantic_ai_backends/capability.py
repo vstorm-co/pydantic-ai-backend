@@ -18,6 +18,7 @@ Example:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,6 +45,7 @@ from pydantic_ai_backends.toolsets.console import (
     create_console_toolset,
     get_console_system_prompt,
 )
+from pydantic_ai_backends.toolsets.descriptions import DEFAULT_PROFILE, Profile, ToolText
 
 TOOL_OPERATIONS: dict[str, PermissionOperation] = {
     "ls": "ls",
@@ -155,14 +157,27 @@ class ConsoleCapability(AbstractCapability[Any]):
     max_document_bytes: int = DEFAULT_MAX_DOCUMENT_BYTES
     """Largest document returned; bigger ones yield an error."""
 
-    descriptions: dict[str, str] | None = None
-    """Per-tool description overrides, keyed by tool name.
+    descriptions: Mapping[str, str | ToolText] | None = None
+    """Per-tool text overrides, keyed by tool name.
 
     A host that lists these tools in its own catalogue needs the text it shows
     and the text the model reads to be the same string. Without this the two are
     written in different repositories and drift, and the drift is invisible: the
     person choosing what to allow and the model choosing when to act are reading
     different descriptions of the same tool.
+
+    A string replaces the tool's description and leaves its argument text alone;
+    a `ToolText` replaces both. An unknown tool name raises rather than being
+    ignored.
+    """
+
+    profile: Profile = DEFAULT_PROFILE
+    """How much guidance the tool descriptions carry.
+
+    `"coding"` includes what an agent working in a repository needs — git,
+    dependencies, reading a failed command's output. `"agent"` leaves it out,
+    which is what an agent whose workspace is scratch space for one conversation
+    should be paying for.
     """
 
     permissions: PermissionRuleset | None = None
@@ -195,6 +210,7 @@ class ConsoleCapability(AbstractCapability[Any]):
             document_support=self.document_support,
             max_document_bytes=self.max_document_bytes,
             descriptions=self.descriptions,
+            profile=self.profile,
             # Passed through as well as being enforced in `prepare_tools`: the
             # toolset drops a denied operation's tools outright, so they are gone
             # rather than merely hidden from one request's tool definitions - and
