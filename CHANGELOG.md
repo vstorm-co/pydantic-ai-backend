@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.28] - 2026-08-22
+
+### Changed
+
+- **Every console tool now says what it returns, and its text is one object
+  rather than two.** A tool definition is a prompt, and these were written as
+  Claude Code's are: shouty (`NEVER`, `ALWAYS`, `MUST` and `IMPORTANT` between
+  them 16 times), thin on arguments, and silent on the one thing a model cannot
+  infer — the shape of the answer. Nothing said that `grep` replies in three
+  different shapes depending on `output_mode`, that `glob` lists 100 paths and
+  `grep` 50 before summarising the rest as `... and N more`, that `read_file`'s
+  `offset` counts from 0 while the line numbers it prints count from 1, that a
+  failed `execute` still returns its output under `Command failed (exit code N)`,
+  or that a timeout answers `Error: Command timed out` with code 124. All of it
+  is in the descriptions now, under a `Returns:` paragraph.
+
+  The mechanism behind that: each tool's text is a `ToolText` — `summary`,
+  `usage`, `coding`, `args`, `returns` — and the description handed to the model
+  is rendered from it, while `args` becomes the per-argument text in the JSON
+  schema. Previously the description was a constant and the argument text was a
+  docstring beside the function, so a host could override one and not the other,
+  and `docs/api/toolsets.md` held a third copy that had gone stale. The
+  `*_DESCRIPTION` constants are still exported and are rendered from the same
+  objects.
+
+  `tests/test_tool_text.py` holds the drift shut: every argument of every tool in
+  both edit formats carries a description, and `TOOL_TEXT` names exactly the
+  arguments the function takes — an argument the registry forgets reaches the
+  model undescribed, and one it names that no longer exists is stale text nobody
+  would notice.
+
+### Added
+
+- **A mistake the model can fix now raises `ModelRetry`, and a refusal still does
+  not.** Every failure used to be a returned string, including the ones the model
+  had plainly got wrong: an `old_string` matching three places, a file edited
+  between the read and the edit, a path that does not exist. The model was told in
+  a sentence indistinguishable from a real answer and left to notice. Those cases
+  — a missing file, an offset past the end, an absent or ambiguous `old_string`, a
+  stale read, a hashline hash that no longer matches — come back as a retry prompt
+  now.
+
+  What stays a returned string is as deliberate: a non-zero exit from `execute` is
+  a *result* to reason about rather than a malformed call, `grep` finding nothing
+  is an answer, a dropped connection is not something different arguments would
+  fix, and a **permission refusal must never be a retry**, because a retry prompt
+  invites the model to look for a way around the rule. `PERMISSION_DENIED_PREFIX`
+  is now one constant that `PermissionGuard` writes and `toolsets/_failures.py`
+  reads, with a test holding the two ends together.
+
+  `max_retries` becomes a floor as well as a ceiling: on a tool's last attempt the
+  message is returned rather than raised. `ModelRetry` past the budget ends the
+  whole run with `UnexpectedModelBehavior`, so without that floor a model that
+  mistyped an `old_string` twice would kill a run that used to carry on. The worst
+  case is now exactly the old behaviour, never a dead run — and `max_retries=0`
+  reproduces it entirely.
+
+- **`profile="agent"`, for a host whose agent is not working in a repository.**
+  `execute` carried 2501 characters of coding-agent guidance — git safety,
+  package managers, what to do after three failed attempts — on every request,
+  including for an agent whose workspace is scratch space for one conversation.
+  That guidance is now the `coding` half of the text, kept under the default
+  `profile="coding"` and dropped under `"agent"`: about 240 tokens a request
+  across the seven tools a typical host registers, and the return shapes are kept
+  either way.
+
+- **`descriptions` accepts a `ToolText`, and refuses an unknown key.** A string
+  still replaces the description alone; a `ToolText` replaces the argument text
+  with it, which was previously unreachable from outside the library. A key that
+  is not a tool name now raises `UserError` — it used to be ignored, so a
+  misspelled or renamed key meant an override that silently reached nothing,
+  including for a host whose own catalogue then showed one text while the model
+  read another.
+
 ## [0.2.27] - 2026-08-20
 
 ### Fixed

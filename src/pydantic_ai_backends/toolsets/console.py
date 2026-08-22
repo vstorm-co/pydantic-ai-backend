@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 from pydantic_ai import RunContext
@@ -21,7 +21,7 @@ from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai_backends.adapter import ensure_async
 from pydantic_ai_backends.backends import _guard
 from pydantic_ai_backends.protocol import AsyncBackendProtocol, BackendProtocol
-from pydantic_ai_backends.toolsets import _ruleset, _tracking
+from pydantic_ai_backends.toolsets import _failures, _ruleset, _tracking
 from pydantic_ai_backends.toolsets._content import (
     DEFAULT_MAX_DOCUMENT_BYTES as DEFAULT_MAX_DOCUMENT_BYTES,
 )
@@ -48,6 +48,13 @@ from pydantic_ai_backends.toolsets.descriptions import (
     CONSOLE_SYSTEM_PROMPT as CONSOLE_SYSTEM_PROMPT,
 )
 from pydantic_ai_backends.toolsets.descriptions import (
+    DEFAULT_PROFILE,
+    OVERRIDE_KEYS,
+    TOOL_TEXT,
+    Profile,
+    ToolText,
+)
+from pydantic_ai_backends.toolsets.descriptions import (
     EDIT_FILE_DESCRIPTION as EDIT_FILE_DESCRIPTION,
 )
 from pydantic_ai_backends.toolsets.descriptions import (
@@ -69,16 +76,22 @@ from pydantic_ai_backends.toolsets.descriptions import (
     HASHLINE_READ_FILE_DESCRIPTION as HASHLINE_READ_FILE_DESCRIPTION,
 )
 from pydantic_ai_backends.toolsets.descriptions import (
-    KILL_SHELL_DESCRIPTION,
-    LIST_SHELLS_DESCRIPTION,
-    READ_OUTPUT_DESCRIPTION,
-    RUN_IN_BACKGROUND_DESCRIPTION,
+    KILL_SHELL_DESCRIPTION as KILL_SHELL_DESCRIPTION,
+)
+from pydantic_ai_backends.toolsets.descriptions import (
+    LIST_SHELLS_DESCRIPTION as LIST_SHELLS_DESCRIPTION,
 )
 from pydantic_ai_backends.toolsets.descriptions import (
     LS_DESCRIPTION as LS_DESCRIPTION,
 )
 from pydantic_ai_backends.toolsets.descriptions import (
     READ_FILE_DESCRIPTION as READ_FILE_DESCRIPTION,
+)
+from pydantic_ai_backends.toolsets.descriptions import (
+    READ_OUTPUT_DESCRIPTION as READ_OUTPUT_DESCRIPTION,
+)
+from pydantic_ai_backends.toolsets.descriptions import (
+    RUN_IN_BACKGROUND_DESCRIPTION as RUN_IN_BACKGROUND_DESCRIPTION,
 )
 from pydantic_ai_backends.toolsets.descriptions import (
     WRITE_FILE_DESCRIPTION as WRITE_FILE_DESCRIPTION,
@@ -206,7 +219,8 @@ def create_console_toolset(  # noqa: C901
     document_support: bool = False,
     max_document_bytes: int = DEFAULT_MAX_DOCUMENT_BYTES,
     edit_format: EditFormat = "str_replace",
-    descriptions: dict[str, str] | None = None,
+    descriptions: Mapping[str, str | ToolText] | None = None,
+    profile: Profile = DEFAULT_PROFILE,
 ) -> FunctionToolset[ConsoleDeps]:
     """Create a console toolset for file operations and shell execution.
 
@@ -232,8 +246,12 @@ def create_console_toolset(  # noqa: C901
         permissions: Ruleset deciding which tools exist and which need approval:
             an operation defaulting to "deny" drops its tools entirely, one
             defaulting to "ask" marks them as requiring approval.
-        max_retries: Times a tool may retry within one run after invalid
-            arguments, with the validation error fed back to the model.
+        max_retries: Times a tool may retry within one run, with the message
+            fed back to the model — pydantic-ai's own argument validation, and
+            the mistakes `toolsets/_failures.py` steers on: a missing file, an
+            `old_string` that is absent or matches twice, a stale read. Past the
+            budget the message is returned rather than raised, so a run never
+            ends on one.
         image_support: Return recognized image files (`.png`, `.jpg`, `.jpeg`,
             `.gif`, `.webp`) as `BinaryContent` a multimodal model can see,
             instead of garbled text.
@@ -245,10 +263,18 @@ def create_console_toolset(  # noqa: C901
         edit_format: `"str_replace"` matches exact strings; `"hashline"` tags
             each line with a content hash so the model references lines by
             `number:hash` instead of reproducing text.
-        descriptions: Per-tool description overrides, keyed by tool name: `ls`,
+        descriptions: Per-tool text overrides, keyed by tool name: `ls`,
             `read_file`, `write_file`, `edit_file`, `hashline_edit`, `glob`,
             `grep`, `execute`, `run_in_background`, `read_output`, `kill_shell`,
-            `list_shells`.
+            `list_shells`. A string replaces the tool's description and leaves
+            its argument text alone; a :class:`ToolText` replaces both. An
+            unknown key raises `UserError` rather than being ignored, since a
+            silent override is one nobody discovers.
+        profile: How much guidance the descriptions carry. `"coding"` includes
+            the guidance written for an agent working in a repository — git,
+            dependencies, debugging a failed command — and `"agent"` leaves it
+            out, which is about 250 tokens a request an agent with a scratch
+            workspace was paying for advice it could not use.
 
     Example:
         ```python
@@ -269,7 +295,13 @@ def create_console_toolset(  # noqa: C901
         guarded = create_console_toolset(permissions=DEFAULT_RULESET)
         ```
     """
-    described = descriptions or {}
+    overrides: Mapping[str, str | ToolText] = descriptions or {}
+    unknown = sorted(set(overrides) - OVERRIDE_KEYS)
+    if unknown:
+        raise UserError(
+            f"Unknown tool name(s) in `descriptions`: {', '.join(unknown)}. "
+            f"Valid names: {', '.join(sorted(OVERRIDE_KEYS))}."
+        )
 
     # Wrapped once, here, because the closure backend never changes. `guarding`
     # answers with the backend untouched when there is no ruleset or when the
@@ -309,6 +341,42 @@ def create_console_toolset(  # noqa: C901
 
     toolset: FunctionToolset[ConsoleDeps] = FunctionToolset(id=id, max_retries=max_retries)
 
+    def described(
+        text_id: str,
+        tool_name: str | None = None,
+        *,
+        requires_approval: bool = False,
+    ) -> Callable[[_ToolFn], _ToolFn]:
+        """Register a tool with the text this configuration gives it.
+
+        One `ToolText` supplies both halves of what the model reads, but they
+        travel separately: the description is passed to the decorator, while the
+        per-argument text reaches the JSON schema through the function's
+        docstring and through nothing else — hence the assignment. It is also
+        why the tools below carry a one-line docstring rather than a second copy
+        of the argument text, which is a copy that drifts.
+
+        Args:
+            text_id: Key in `TOOL_TEXT`. Differs from the tool name only for
+                `read_file`, which has one text per edit format.
+            tool_name: Name a caller overrides this tool by, when it is not the
+                text id.
+            requires_approval: Whether the tool call is suspended for a human.
+        """
+        name = tool_name or text_id
+        override = overrides.get(name)
+        text = override if isinstance(override, ToolText) else TOOL_TEXT[text_id]
+        description = override if isinstance(override, str) else text.render(profile)
+
+        def register(fn: _ToolFn) -> _ToolFn:
+            cast("Any", fn).__doc__ = text.docstring()
+            registered = toolset.tool(description=description, requires_approval=requires_approval)(
+                fn
+            )
+            return cast("_ToolFn", registered)
+
+        return register
+
     async def binary_content(
         target: BackendProtocol | AsyncBackendProtocol, path: str
     ) -> Any | None:  # pragma: no cover - exercised through read_file
@@ -321,17 +389,13 @@ def create_console_toolset(  # noqa: C901
             return await document_content(target, path, max_document_bytes)
         return None
 
-    @toolset.tool(description=described.get("ls", LS_DESCRIPTION))
+    @described("ls")
     @_degrade_on_error
     async def ls(
         ctx: RunContext[ConsoleDeps],
         path: str = ".",
     ) -> str:
-        """List files and directories at the given path.
-
-        Args:
-            path: Directory path to list. Defaults to current directory.
-        """
+        """List files and directories at the given path."""
         entries = await ensure_async(backend_for(ctx)).ls_info(path)
         if not entries:
             return f"Directory '{path}' is empty or does not exist"
@@ -347,7 +411,7 @@ def create_console_toolset(  # noqa: C901
 
     if edit_format == "hashline":
 
-        @toolset.tool(description=described.get("read_file", HASHLINE_READ_FILE_DESCRIPTION))
+        @described("hashline_read_file", "read_file")
         @_degrade_on_error
         async def read_file(
             ctx: RunContext[ConsoleDeps],
@@ -355,13 +419,7 @@ def create_console_toolset(  # noqa: C901
             offset: int = 0,
             limit: int = 2000,
         ) -> Any:
-            """Read file content with hashline tags.
-
-            Args:
-                path: Absolute or relative path to the file to read.
-                offset: Line number to start reading from (0-indexed).
-                limit: Maximum number of lines to read.
-            """
+            """Read file content with hashline tags."""
             binary = await binary_content(backend_for(ctx), path)
             if binary is not None:
                 return binary
@@ -370,7 +428,11 @@ def create_console_toolset(  # noqa: C901
 
             backend = ensure_async(backend_for(ctx))
             if not await backend.exists(path):
-                return f"Error: File '{path}' not found"
+                return _failures.steer(
+                    ctx,
+                    f"Error: File '{path}' not found. Check the path with `ls` or "
+                    "`glob`, then read it again.",
+                )
 
             raw = await backend.read_bytes(path)
             _tracking.record_read(backend_for(ctx), path, raw)
@@ -378,7 +440,7 @@ def create_console_toolset(  # noqa: C901
 
     else:
 
-        @toolset.tool(description=described.get("read_file", READ_FILE_DESCRIPTION))
+        @described("read_file")
         @_degrade_on_error
         async def read_file(
             ctx: RunContext[ConsoleDeps],
@@ -386,42 +448,29 @@ def create_console_toolset(  # noqa: C901
             offset: int = 0,
             limit: int = 2000,
         ) -> Any:
-            """Read file content with line numbers.
-
-            Args:
-                path: Absolute or relative path to the file to read.
-                offset: Line number to start reading from (0-indexed).
-                limit: Maximum number of lines to read.
-            """
+            """Read file content with line numbers."""
             binary = await binary_content(backend_for(ctx), path)
             if binary is not None:
                 return binary
 
             backend = ensure_async(backend_for(ctx))
             result = await backend.read(path, offset, limit)
-            if not result.startswith("Error"):
-                await _tracking.record_path_read(backend, backend_for(ctx), path)
+            if result.startswith("Error"):
+                return _failures.steer(ctx, result)
+            await _tracking.record_path_read(backend, backend_for(ctx), path)
             return result
 
-    @toolset.tool(
-        description=described.get("write_file", WRITE_FILE_DESCRIPTION),
-        requires_approval=write_approval,
-    )
+    @described("write_file", requires_approval=write_approval)
     @_degrade_on_error
     async def write_file(
         ctx: RunContext[ConsoleDeps],
         path: str,
         content: str,
     ) -> str:
-        """Write content to a file.
-
-        Args:
-            path: Path to the file to write.
-            content: Complete content to write to the file.
-        """
+        """Write content to a file."""
         result = await ensure_async(backend_for(ctx)).write(path, content)
         if result.error:
-            return f"Error: {result.error}"
+            return _failures.steer(ctx, f"Error: {result.error}")
 
         # The agent knows this file's content now, so an immediate edit must not
         # be refused as stale.
@@ -430,10 +479,7 @@ def create_console_toolset(  # noqa: C901
 
     if edit_format == "hashline":
 
-        @toolset.tool(
-            description=described.get("hashline_edit", HASHLINE_EDIT_DESCRIPTION),
-            requires_approval=write_approval,
-        )
+        @described("hashline_edit", requires_approval=write_approval)
         @_degrade_on_error
         async def hashline_edit(
             ctx: RunContext[ConsoleDeps],
@@ -445,18 +491,7 @@ def create_console_toolset(  # noqa: C901
             end_hash: str | None = None,
             insert_after: bool = False,
         ) -> str:
-            """Edit a file by referencing lines with their content hashes.
-
-            Args:
-                path: Path to the file to edit.
-                start_line: 1-indexed line number to start the edit.
-                start_hash: 2-char content hash of the start line (from read_file).
-                new_content: Replacement text. Empty string deletes line(s).
-                end_line: 1-indexed end of range (inclusive). Omit for single-line edit.
-                end_hash: 2-char content hash of the end line. Optional validation.
-                insert_after: If True, insert new_content after start_line instead \
-of replacing it.
-            """
+            """Edit a file by referencing lines with their content hashes."""
             from pydantic_ai_backends.hashline import apply_hashline_edit_with_summary
 
             raw_backend = backend_for(ctx)
@@ -464,7 +499,7 @@ of replacing it.
 
             async with _tracking.edit_lock(raw_backend, path):
                 if not await backend.exists(path):
-                    return f"Error: File '{path}' not found"
+                    return _failures.steer(ctx, f"Error: File '{path}' not found")
 
                 current = (await backend.read_bytes(path)).decode("utf-8", errors="replace")
                 new_text, error, summary = apply_hashline_edit_with_summary(
@@ -477,19 +512,16 @@ of replacing it.
                     insert_after,
                 )
                 if error:
-                    return f"Error: {error}"
+                    return _failures.steer(ctx, f"Error: {error}")
 
                 written = await backend.write(path, new_text)
                 if written.error:
-                    return f"Error: {written.error}"
+                    return _failures.steer(ctx, f"Error: {written.error}")
                 return f"Edited {written.path}: {summary}"
 
     else:
 
-        @toolset.tool(
-            description=described.get("edit_file", EDIT_FILE_DESCRIPTION),
-            requires_approval=write_approval,
-        )
+        @described("edit_file", requires_approval=write_approval)
         @_degrade_on_error
         async def edit_file(
             ctx: RunContext[ConsoleDeps],
@@ -498,16 +530,7 @@ of replacing it.
             new_string: str,
             replace_all: bool = False,
         ) -> str:
-            """Edit a file by performing exact string replacement.
-
-            Args:
-                path: Path to the file to edit.
-                old_string: Exact string to find and replace. Must match file content exactly \
-including whitespace and indentation.
-                new_string: Replacement string. Must be different from old_string.
-                replace_all: If True, replace all occurrences. If False (default), \
-the old_string must appear exactly once in the file.
-            """
+            """Edit a file by performing exact string replacement."""
             raw_backend = backend_for(ctx)
             backend = ensure_async(raw_backend)
 
@@ -519,30 +542,25 @@ the old_string must appear exactly once in the file.
             async with _tracking.edit_lock(raw_backend, path):
                 stale = await _tracking.staleness_error(backend, raw_backend, path)
                 if stale is not None:
-                    return stale
+                    return _failures.steer(ctx, stale)
 
                 result = await backend.edit(path, old_string, new_string, replace_all)
                 if result.error:
-                    return f"Error: {result.error}"
+                    return _failures.steer(ctx, f"Error: {result.error}")
 
                 # The agent's view is the post-edit content now, so a follow-up
                 # edit must not be flagged as stale.
                 await _tracking.record_path_read(backend, raw_backend, path)
                 return f"Edited {result.path}: replaced {result.occurrences} occurrence(s)"
 
-    @toolset.tool(description=described.get("glob", GLOB_DESCRIPTION))
+    @described("glob")
     @_degrade_on_error
     async def glob(
         ctx: RunContext[ConsoleDeps],
         pattern: str,
         path: str = ".",
     ) -> str:
-        """Find files matching a glob pattern.
-
-        Args:
-            pattern: Glob pattern to match.
-            path: Base directory to search from. Defaults to current directory.
-        """
+        """Find files matching a glob pattern."""
         entries = await ensure_async(backend_for(ctx)).glob_info(pattern, path)
         if not entries:
             return f"No files matching '{pattern}' in {path}"
@@ -553,7 +571,7 @@ the old_string must appear exactly once in the file.
             lines.append(f"  ... and {len(entries) - GLOB_RESULT_LIMIT} more")
         return "\n".join(lines)
 
-    @toolset.tool(description=described.get("grep", GREP_DESCRIPTION))
+    @described("grep")
     @_degrade_on_error
     async def grep(
         ctx: RunContext[ConsoleDeps],
@@ -563,15 +581,7 @@ the old_string must appear exactly once in the file.
         output_mode: Literal["content", "files_with_matches", "count"] = "files_with_matches",
         ignore_hidden: bool = default_ignore_hidden,
     ) -> str:
-        """Search for a regex pattern across files.
-
-        Args:
-            pattern: Regex pattern to search for.
-            path: File or directory to search in. If None, searches current directory.
-            glob_pattern: Filter files by pattern (e.g., `"*.py"`, `"*.{js,ts}"`).
-            output_mode: Output format — `"content"`, `"files_with_matches"`, or `"count"`.
-            ignore_hidden: Whether to skip hidden files/directories.
-        """
+        """Search for a regex pattern across files."""
         result = await ensure_async(backend_for(ctx)).grep_raw(
             pattern, path, glob_pattern, ignore_hidden
         )
@@ -599,23 +609,14 @@ the old_string must appear exactly once in the file.
 
     if include_execute:
 
-        @toolset.tool(
-            description=described.get("execute", EXECUTE_DESCRIPTION),
-            requires_approval=execute_approval,
-        )
+        @described("execute", requires_approval=execute_approval)
         @_degrade_on_error
         async def execute(
             ctx: RunContext[ConsoleDeps],
             command: str,
             timeout: int | None = DEFAULT_EXECUTE_TIMEOUT,
         ) -> str:
-            """Execute a shell command in the working directory.
-
-            Args:
-                command: Shell command to execute.
-                timeout: Maximum execution time in seconds. Increase \
-for long-running builds or test suites.
-            """
+            """Execute a shell command in the working directory."""
             target = backend_for(ctx)
             async_backend = ensure_async(target)
 
@@ -643,20 +644,13 @@ for long-running builds or test suites.
             backend = ensure_async(backend_for(ctx))
             return backend if hasattr(backend, "execute_background") else None
 
-        @toolset.tool(
-            description=described.get("run_in_background", RUN_IN_BACKGROUND_DESCRIPTION),
-            requires_approval=execute_approval,
-        )
+        @described("run_in_background", requires_approval=execute_approval)
         @_degrade_on_error
         async def run_in_background(
             ctx: RunContext[ConsoleDeps],
             command: str,
         ) -> str:
-            """Start a long-lived command in the background.
-
-            Args:
-                command: Shell command to run detached (e.g. a dev server).
-            """
+            """Start a long-lived command in the background."""
             sandbox = background(ctx)
             if sandbox is None:
                 return _NO_BACKGROUND_SUPPORT
@@ -667,17 +661,13 @@ for long-running builds or test suites.
                 f"kill_shell('{handle.shell_id}') to stop it."
             )
 
-        @toolset.tool(description=described.get("read_output", READ_OUTPUT_DESCRIPTION))
+        @described("read_output")
         @_degrade_on_error
         async def read_output(
             ctx: RunContext[ConsoleDeps],
             shell_id: str,
         ) -> str:
-            """Read new output from a background shell.
-
-            Args:
-                shell_id: The id returned by run_in_background.
-            """
+            """Read new output from a background shell."""
             sandbox = background(ctx)
             if sandbox is None:
                 return _NO_BACKGROUND_SUPPORT
@@ -687,20 +677,13 @@ for long-running builds or test suites.
             body = (result.stdout + result.stderr).strip() or "(no new output)"
             return f"[{result.shell_id}] {status}\n{body}"
 
-        @toolset.tool(
-            description=described.get("kill_shell", KILL_SHELL_DESCRIPTION),
-            requires_approval=execute_approval,
-        )
+        @described("kill_shell", requires_approval=execute_approval)
         @_degrade_on_error
         async def kill_shell(
             ctx: RunContext[ConsoleDeps],
             shell_id: str,
         ) -> str:
-            """Stop a background shell.
-
-            Args:
-                shell_id: The id returned by run_in_background.
-            """
+            """Stop a background shell."""
             sandbox = background(ctx)
             if sandbox is None:
                 return _NO_BACKGROUND_SUPPORT
@@ -708,7 +691,7 @@ for long-running builds or test suites.
                 return f"Killed background shell {shell_id}."
             return f"Background shell {shell_id} was already finished or unknown."
 
-        @toolset.tool(description=described.get("list_shells", LIST_SHELLS_DESCRIPTION))
+        @described("list_shells")
         @_degrade_on_error
         async def list_shells(
             ctx: RunContext[ConsoleDeps],

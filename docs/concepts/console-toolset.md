@@ -74,20 +74,92 @@ The `edit_format` parameter selects how the model edits files. The default
 `"hashline"` swaps it for a `hashline_edit` tool — see [Hashline Edit
 Format](#hashline-edit-format) below.
 
-## Custom Tool Descriptions
+## What the Model Reads
 
-You can override the default description of any tool with the `descriptions` parameter. This is useful when you want to tailor tool descriptions to your specific use case for better LLM behavior:
+Each tool's text is one `ToolText` object: what the tool does, when to use it and
+when to reach for another one, what every argument means, and what comes back —
+including how a result is truncated and what a failure looks like. The
+description handed to the model is composed from it, and the per-argument text
+becomes the descriptions in the tool's JSON schema.
 
 ```python
+from pydantic_ai_backends import TOOL_TEXT
+
+TOOL_TEXT["grep"].summary  # one sentence — what a catalogue should show
+TOOL_TEXT["grep"].returns  # the three shapes `output_mode` can answer with
+TOOL_TEXT["grep"].args  # keyed by parameter name
+TOOL_TEXT["grep"].render()  # the description the model is given
+```
+
+### Profiles
+
+Two kinds of agent read these tools and they need different amounts of text. A
+coding agent wants the git, dependency and debugging guidance; an agent whose
+workspace is scratch space for one conversation never sees a repository and pays
+for those sentences on every request.
+
+```python
+coding = create_console_toolset()  # the default
+lean = create_console_toolset(profile="agent")  # ~240 tokens lighter
+```
+
+`"agent"` drops the repository guidance from `execute` and `write_file` and
+keeps everything true of any workspace, the return shapes included.
+
+### Custom Tool Descriptions
+
+Override any tool's text with the `descriptions` parameter — useful when a host
+lists these tools in its own catalogue and needs the text it shows and the text
+the model reads to be one string:
+
+```python
+from pydantic_ai_backends import ToolText
+
 toolset = create_console_toolset(
     descriptions={
-        "execute": "Run shell commands in the workspace",
-        "read_file": "Read file contents from the workspace",
+        # A string replaces the description; the argument text is kept.
+        "execute": "Run a shell command in the customer's workspace.",
+        # A ToolText replaces both halves.
+        "read_file": ToolText(
+            summary="Read a file from the shared drive.",
+            args={"path": "Path under /drive.", "offset": "...", "limit": "..."},
+            returns="The file's lines, numbered from 1.",
+        ),
     }
 )
 ```
 
-Only the tools you specify are overridden; all others keep their built-in descriptions. Valid keys are: `ls`, `read_file`, `write_file`, `edit_file`, `hashline_edit`, `glob`, `grep`, `execute`.
+Valid keys are the tool names: `ls`, `read_file`, `write_file`, `edit_file`,
+`hashline_edit`, `glob`, `grep`, `execute`, `run_in_background`, `read_output`,
+`kill_shell`, `list_shells`. An unknown key raises `UserError` rather than being
+ignored — a misspelled override that silently reaches nothing is one nobody
+discovers.
+
+## Failures
+
+A tool reports trouble in one of two shapes, and they say different things to the
+model.
+
+**A mistake it can fix raises `ModelRetry`** — the message goes back as a retry
+prompt and the model gets another attempt at the call:
+
+- a file that is not there, or an offset past its end
+- an `old_string` that matches nothing, or matches more than once
+- a file edited between the read and the edit, or a hashline hash that no longer
+  matches
+
+**Everything else is returned as text**, because it is the answer rather than a
+malformed call: a non-zero exit from `execute`, a `grep` that found nothing, a
+backend with no shell, a dropped connection — and a **permission refusal**, which
+is deliberate. A retry prompt on a refusal invites the model to look for a way
+around the rule.
+
+`max_retries` is the budget, and it is a floor as much as a ceiling: on a tool's
+final attempt the message is returned instead of raised. `ModelRetry` past the
+budget ends the whole run with `UnexpectedModelBehavior`, so a model that mistypes
+an `old_string` twice would kill a run that would otherwise have carried on. The
+worst case here is the behaviour this library had before — an error string the
+model reads and adapts to.
 
 ## Permission-based Configuration
 

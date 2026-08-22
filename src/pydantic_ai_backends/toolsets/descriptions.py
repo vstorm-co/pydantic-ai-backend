@@ -1,12 +1,103 @@
-"""Prompts and tool descriptions for the console toolset.
+"""What the model reads about each console tool.
 
-Each constant is the full description handed to `@toolset.tool(description=...)`.
-Usage guidance lives here, next to the tool it governs, rather than in the
-system prompt — a model reads a tool's description when it is choosing that
-tool, which is exactly when the guidance is needed.
+A tool definition is a prompt: the model chooses a tool, and fills in its
+arguments, from nothing but the text here. So each tool's text is one object
+rather than a loose string — :class:`ToolText` holds what the tool does, when to
+use it and when not, what every argument means, and **what comes back**, which
+is the half a tool description usually leaves out. The model then knows that
+`grep` answers three different shapes, that a listing may be a truncated slice,
+and that a failed `execute` still returns its output.
+
+Two audiences read this text and they need different amounts of it. A coding
+agent wants the git and dependency guidance; an agent that keeps a scratch
+workspace for a report never sees a repository and pays for those sentences on
+every request. `profile` decides: `"coding"` includes the extra block, `"agent"`
+leaves it out.
+
+The `*_DESCRIPTION` constants are still exported, rendered from the same objects,
+so a caller that imports one keeps working.
 """
 
 from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Literal
+
+Profile = Literal["agent", "coding"]
+"""How much guidance a tool's description carries.
+
+`"coding"` is everything, including the block written for an agent working in a
+repository. `"agent"` drops that block and keeps what is true of any workspace.
+"""
+
+DEFAULT_PROFILE: Profile = "coding"
+"""Profile used when a caller names none — what every existing caller had."""
+
+
+@dataclass(frozen=True)
+class ToolText:
+    """Everything the model reads about one tool.
+
+    Held as fields rather than one string because the parts have different
+    destinations: `summary`, `usage`, `coding` and `returns` are composed into
+    the tool's description, while `args` becomes the per-argument text in its
+    JSON schema. Splitting them is also what lets a host show `summary` in its
+    own catalogue and know it is the first sentence the model reads, rather than
+    a paraphrase written in another repository.
+    """
+
+    summary: str
+    """One sentence: what the tool does. Also what a catalogue should show."""
+
+    usage: str = ""
+    """When to use it, when to use another tool, and what it will not do."""
+
+    coding: str = ""
+    """Guidance only an agent working in a repository needs.
+
+    Rendered under the `"coding"` profile and omitted under `"agent"`. Anything
+    true of any workspace belongs in `usage` instead.
+    """
+
+    args: Mapping[str, str] = field(default_factory=dict)
+    """One entry per argument, keyed exactly as the parameter is named."""
+
+    returns: str = ""
+    """The shape of the result, including its failures and its truncation."""
+
+    def render(self, profile: Profile = DEFAULT_PROFILE) -> str:
+        """The description handed to the model.
+
+        Args:
+            profile: Which audience to write for.
+        """
+        parts = [self.summary]
+        if self.usage:
+            parts.append(self.usage)
+        if self.coding and profile == "coding":
+            parts.append(self.coding)
+        if self.returns:
+            parts.append(f"Returns: {self.returns}")
+        return "\n\n".join(parts)
+
+    def docstring(self) -> str:
+        """A Google-style docstring carrying the argument text.
+
+        Set on the tool function before it is registered, because per-argument
+        descriptions reach the JSON schema through the docstring and through
+        nothing else — which is why they cannot simply live in `render`. The
+        summary is repeated here for a reader of the generated docstring; the
+        model reads `render` instead, since an explicit description wins over
+        the docstring's own summary.
+        """
+        lines = [self.summary]
+        if self.args:
+            lines.append("")
+            lines.append("Args:")
+            lines.extend(f"    {name}: {text}" for name, text in self.args.items())
+        return "\n".join(lines)
+
 
 CONSOLE_SYSTEM_PROMPT = """\
 ## Console Tools
@@ -25,193 +116,324 @@ glob, grep) and shell execution (execute). File contents use **hashline format**
 detailed usage guidance.
 """
 
-LS_DESCRIPTION = """\
-List files and directories at the given path, showing names and sizes.
 
-Use `glob` instead when you need to find files by pattern (e.g., all *.py files).
-Use `ls` when you need to see the full contents of a specific directory."""
+LS_TEXT = ToolText(
+    summary="List the files and directories at a path, with their sizes.",
+    usage=(
+        "Use it to see what one directory holds. To find files by name or extension "
+        "anywhere below it, use `glob`: that searches recursively and this does not."
+    ),
+    args={"path": "Directory to list. Defaults to the working directory."},
+    returns=(
+        "One line per entry, directories marked with a trailing `/` and files with "
+        "their size in bytes. An empty directory and a missing one answer with the "
+        "same sentence, so an empty listing is not proof the directory exists."
+    ),
+)
 
-READ_FILE_DESCRIPTION = """\
-Read file content with line numbers. ALWAYS read a file before editing it.
+READ_FILE_TEXT = ToolText(
+    summary="Read a file's contents, with line numbers.",
+    usage=(
+        "Read a file before editing it: `edit_file` matches on exact text and refuses "
+        "an edit to a file that changed since your last read, so this is both how you "
+        "learn what to replace and how you clear that check.\n\n"
+        "`offset` counts from 0 while the line numbers shown count from 1, so "
+        "`offset=100` starts at the line labelled 101. For a long file, read a first "
+        "slice with `limit=100` to see its shape, then read the part you need. Call "
+        "this tool more than once in a response when you need several files.\n\n"
+        "An image or PDF may come back as content you can look at directly rather "
+        "than as text; work from what you see instead of parsing it."
+    ),
+    args={
+        "path": "File to read, absolute or relative to the working directory.",
+        "offset": "First line to return, counting from 0. Defaults to 0.",
+        "limit": "How many lines to return. Defaults to 2000.",
+    },
+    returns=(
+        "The requested lines, each prefixed with its 1-based line number and a tab, "
+        "with a `... (N more lines)` trailer when the slice stops short of the end. A "
+        "missing file, a binary one or an offset past the end come back as a line "
+        "starting `Error:` — the run continues, so correct it and call again."
+    ),
+)
 
-Results are returned with line numbers (like `cat -n`).
+HASHLINE_READ_FILE_TEXT = ToolText(
+    summary="Read a file's contents, each line tagged with a content hash.",
+    usage=(
+        "Read a file before editing it: `hashline_edit` addresses lines by the "
+        "`line:hash` pair this returns, and refuses an edit whose hash no longer "
+        "matches — which is how it notices the file changed under you.\n\n"
+        "`offset` counts from 0 while the tags count from 1. For a long file, read a "
+        "first slice with `limit=100`, then read the part you need."
+    ),
+    args={
+        "path": "File to read, absolute or relative to the working directory.",
+        "offset": "First line to return, counting from 0. Defaults to 0.",
+        "limit": "How many lines to return. Defaults to 2000.",
+    },
+    returns=(
+        "One line per line of the file, formatted `{line_number}:{hash}|{content}`, "
+        "the hash being two characters belonging to that line's exact content. A "
+        "slice that stops short of the end carries a `... (N more lines)` trailer, "
+        "and a missing file or an out-of-range offset a line starting `Error:`."
+    ),
+)
 
-Usage:
-- For large files (>200 lines), use pagination: first scan with `limit=100` \
-to understand structure, then read targeted sections with `offset` and `limit`.
-- For small files, read the whole file by not providing offset/limit.
-- You can read multiple files in parallel — call read_file multiple times \
-in a single response for maximum efficiency.
-- If a file doesn't exist, an error is returned.
-- Read existing files before modifying them — understand the codebase first.
-- Mimic existing code style, naming conventions, and patterns."""
+WRITE_FILE_TEXT = ToolText(
+    summary="Write a file, creating it or replacing everything in it.",
+    usage=(
+        "For a file that already exists, prefer `edit_file`: it changes the part you "
+        "name, where this replaces the whole file and loses anything you left out. "
+        "Use `write_file` to create a file, or when a full rewrite is what you mean. "
+        "Missing parent directories are created for you.\n\n"
+        "Keep credentials out of it — a workspace is not a secret store, and its "
+        "files are readable by anyone who can see this conversation."
+    ),
+    coding=(
+        "Create a new file only when the work needs one; extending a file that exists "
+        "is usually the smaller change. Leave README, documentation and summary files "
+        "alone unless they were asked for."
+    ),
+    args={
+        "path": "File to write, absolute or relative to the working directory.",
+        "content": "The file's complete new content.",
+    },
+    returns=(
+        "`Wrote N lines to {path}`, or a line starting `Error:`. A successful write "
+        "counts as a read, so the file can be edited straight afterwards."
+    ),
+)
 
-HASHLINE_READ_FILE_DESCRIPTION = """\
-Read file content with hashline tags. ALWAYS read a file before editing it.
+EDIT_FILE_TEXT = ToolText(
+    summary="Replace an exact string in a file.",
+    usage=(
+        "`old_string` has to match the file character for character, indentation "
+        "included, which is why you read the file first. It also has to identify one "
+        "place: if it appears more than once the edit is refused, so include the "
+        "surrounding lines until it is unique — or pass `replace_all=True` when every "
+        "occurrence is what you mean, as in a rename.\n\n"
+        "Change only the tokens you meant to change, leaving the wording and "
+        "formatting around them alone. A formatter or a commit hook can rewrite the "
+        "file after an edit, so read it again before the next edit to it."
+    ),
+    args={
+        "path": "File to edit, absolute or relative to the working directory.",
+        "old_string": "Text to replace, matched exactly, whitespace included.",
+        "new_string": "Text to put in its place. Must differ from `old_string`.",
+        "replace_all": (
+            "Replace every occurrence. Defaults to false, which requires "
+            "`old_string` to appear exactly once."
+        ),
+    },
+    returns=(
+        "`Edited {path}: replaced N occurrence(s)`, or a line starting `Error:` "
+        "saying the string was not found, was found N times, or that the file changed "
+        "since your last read. All three are recoverable: read the file again and "
+        "send an `old_string` that matches one place."
+    ),
+)
 
-Each line is tagged with a content hash: `{line_number}:{hash}|{content}`.
-Use the `line:hash` pair when calling `hashline_edit`.
+HASHLINE_EDIT_TEXT = ToolText(
+    summary="Replace, insert or delete lines addressed by their content hashes.",
+    usage=(
+        "Every edit anchors on a `line:hash` pair from `read_file`. Replace one line "
+        "with `start_line`, `start_hash` and `new_content`; replace a range by adding "
+        "`end_line` and `end_hash`; insert with `insert_after=True`; delete by sending "
+        "an empty `new_content`.\n\n"
+        "A hash that no longer matches means the file changed since you read it — "
+        "read it again rather than guessing at the new numbering. Making several "
+        "edits to one file, work from the bottom up so the lines above stay valid."
+    ),
+    args={
+        "path": "File to edit, absolute or relative to the working directory.",
+        "start_line": "1-based line the edit starts at, as shown in its tag.",
+        "start_hash": "The two-character hash shown for that line.",
+        "new_content": "Replacement text. An empty string deletes the line or range.",
+        "end_line": "1-based last line of an inclusive range. Omit for a single line.",
+        "end_hash": "The two-character hash shown for `end_line`.",
+        "insert_after": (
+            "Insert `new_content` after `start_line` instead of replacing it. Defaults to false."
+        ),
+    },
+    returns=(
+        "`Edited {path}:` and what changed — lines replaced, inserted or deleted, and "
+        "where — or a line starting `Error:`. A hash mismatch is recoverable by "
+        "reading the file again."
+    ),
+)
 
-Usage:
-- For large files (>200 lines), use pagination: first scan with \
-`limit=100` to understand structure, then read targeted sections.
-- For small files, read the whole file by not providing offset/limit.
-- You can read multiple files in parallel for maximum efficiency.
-- Read existing files before modifying them — understand the codebase first."""
+GLOB_TEXT = ToolText(
+    summary="Find files whose path matches a glob pattern.",
+    usage=(
+        "This is how you discover files before reading or editing them. `*` matches "
+        "within one path segment and `**` across directories, so `*.py` finds Python "
+        "files beside you and `**/*.py` finds them at any depth; `**/*.{js,ts}` "
+        "matches either extension. To search what is inside files, use `grep`."
+    ),
+    args={
+        "pattern": 'Glob pattern, e.g. `"*.py"`, `"**/*.ts"`, `"**/test_*.py"`.',
+        "path": "Directory to search from. Defaults to the working directory.",
+    },
+    returns=(
+        "A count, then up to 100 matching paths; the rest are summarised as `... and "
+        "N more`, which means you are seeing a slice — narrow the pattern when the "
+        "whole set matters. No match answers `No files matching ...`."
+    ),
+)
 
-WRITE_FILE_DESCRIPTION = """\
-Write content to a file. Creates the file if it doesn't exist, \
-or completely overwrites it if it does. Parent directories are created as needed.
+GREP_TEXT = ToolText(
+    summary="Search the contents of files for a regular expression.",
+    usage=(
+        "Use this rather than a shell `grep` or `rg` through `execute`: it works on "
+        "every backend, including those with no shell. Full regex syntax is "
+        'supported, e.g. `"log.*Error"`. Narrow the search with `path` for a subtree '
+        "and `glob_pattern` for a file type, and choose how much comes back with "
+        "`output_mode`."
+    ),
+    args={
+        "pattern": "Regular expression to search for.",
+        "path": "File or directory to search. Defaults to the working directory.",
+        "glob_pattern": 'Only search files matching this, e.g. `"*.py"`, `"*.{js,ts}"`.',
+        "output_mode": (
+            '`"files_with_matches"` for paths (the default), `"content"` for the '
+            'matching lines, `"count"` for how many there are.'
+        ),
+        "ignore_hidden": "Skip hidden files and directories.",
+    },
+    returns=(
+        "`files_with_matches` lists paths, `content` lists `path:line: text` with each "
+        "line cut to 100 characters, `count` returns a number. The two lists stop at "
+        "50 entries and say `... and N more`, so read a full list as a slice. No match "
+        "answers `No matches for ...`."
+    ),
+)
 
-IMPORTANT:
-- ALWAYS prefer `edit_file` over `write_file` for existing files — \
-`edit_file` makes targeted changes while `write_file` replaces the entire file.
-- Only use `write_file` for: (1) creating new files, or (2) complete rewrites.
-- NEVER create new files unless explicitly required — prefer editing existing ones.
-- Do NOT create README, documentation, or summary files unless asked.
-- Never write secrets (.env, credentials.json, API keys) to files."""
+EXECUTE_TEXT = ToolText(
+    summary="Run a shell command in the working directory.",
+    usage=(
+        "Use it for work that needs a shell — running a program, a build, a test "
+        "suite, a package manager. For anything the other tools already do, use them: "
+        "`read_file` rather than `cat`, `write_file` rather than a redirect, "
+        "`edit_file` rather than `sed`, `glob` rather than `find`, `grep` rather than "
+        "shell `grep`. They work on every backend and report what happened in a form "
+        "you can act on.\n\n"
+        "Quote paths containing spaces. Chain steps that depend on each other into "
+        "one command with `&&`, and run independent ones as separate calls in the "
+        "same response. Raise `timeout` for a command that will take longer than two "
+        "minutes; a command that never exits on its own, such as a server, blocks "
+        "until that timeout and is then killed. When output is long, redirect it to a "
+        "file and read that."
+    ),
+    coding=(
+        "When a command fails, read the whole output before changing anything — the "
+        "cause is usually above the last line. Reproduce a failure before fixing it, "
+        "change one thing at a time, and after three failed attempts at one approach "
+        "try a different one. If something is missing, check what is installed "
+        "(`which <tool>`, `pip list`) and install it with the package manager the "
+        "project implies.\n\n"
+        "With git: make new commits rather than amending, stage the paths you changed "
+        "rather than `git add -A`, which is how a `.env` gets committed, and commit "
+        "only when asked. `push --force`, `reset --hard`, `clean -f`, `branch -D` and "
+        "`--no-verify` discard someone's work or their checks, so run them only when "
+        "the request names them, and check what a destructive command points at first."
+    ),
+    args={
+        "command": "Shell command to run.",
+        "timeout": "Seconds to allow before the command is killed. Defaults to 120.",
+    },
+    returns=(
+        "The command's stdout and stderr together. A non-zero exit arrives as "
+        "`Command failed (exit code N):` and that output, a timeout as `Error: "
+        "Command timed out` with code 124, and long output is cut with a `... (output "
+        "truncated)` trailer. A failed command is a result, not the end of the run."
+    ),
+)
 
-EDIT_FILE_DESCRIPTION = """\
-Edit a file by performing exact string replacement. This is the preferred \
-way to modify existing files.
+RUN_IN_BACKGROUND_TEXT = ToolText(
+    summary="Start a long-running command and return immediately.",
+    usage=(
+        "For a process that does not exit on its own — a dev server, a watcher, a log "
+        "tail. `execute` blocks until its command finishes and kills it at the "
+        "timeout, so a server started that way is reaped before it is useful. Follow "
+        "this one with `read_output`, probe it from a separate `execute` call, and "
+        "stop it with `kill_shell` when you are done."
+    ),
+    args={"command": "Shell command to start detached, e.g. a dev server."},
+    returns="The shell's id and process id, and the calls that follow it.",
+)
 
-IMPORTANT:
-- You MUST `read_file` first before editing — you need to see the exact content \
-to construct a correct `old_string`.
-- Preserve exact indentation (tabs vs spaces) as it appears in the file.
-- The edit will FAIL if `old_string` is not found, or if it appears more \
-than once (unless `replace_all=True`). If it fails, provide more surrounding \
-context to make `old_string` unique.
-- After editing a file, re-read it before making subsequent edits to the same \
-file — auto-formatters or pre-commit hooks may have changed content on disk.
-- When making substitutions or replacements, change ONLY the exact tokens \
-specified. Do NOT adjust surrounding text (articles, grammar, punctuation).
-- Use `replace_all=True` when renaming a variable, function, or string \
-across the entire file."""
+READ_OUTPUT_TEXT = ToolText(
+    summary="Read what a background shell has printed since your last read.",
+    usage=("Call it again to follow a slow startup: each call returns only what is new."),
+    args={"shell_id": "The id `run_in_background` returned."},
+    returns=(
+        "The shell id, whether it is still running or the code it exited with, and "
+        "its new stdout and stderr — `(no new output)` when there was none."
+    ),
+)
 
-HASHLINE_EDIT_DESCRIPTION = """\
-Edit a file by referencing lines with their content hashes. \
-This is the preferred way to modify existing files.
+KILL_SHELL_TEXT = ToolText(
+    summary="Stop a background shell.",
+    usage=(
+        "Stop one as soon as you no longer need it: a shell left running holds its "
+        "port and its process for whatever comes next here."
+    ),
+    args={"shell_id": "The id `run_in_background` returned."},
+    returns="Confirmation, or a note that the shell had already finished.",
+)
 
-You MUST `read_file` first to see the `line:hash` tags.
+LIST_SHELLS_TEXT = ToolText(
+    summary="List the background shells started in this session.",
+    usage="Use it to find a shell whose id you no longer have.",
+    returns=(
+        "One line per shell: its id, whether it is running or the code it exited "
+        "with, and the command it was started from."
+    ),
+)
 
-Operations:
-- **Replace single line**: set `start_line` + `start_hash` + `new_content`
-- **Replace range**: also set `end_line` + `end_hash`
-- **Insert after**: set `insert_after=True` to add lines after the anchor
-- **Delete**: set `new_content=""`
 
-If the hash doesn't match, the file changed since your last read — \
-re-read it first. When making multiple edits, work **bottom-to-top** so \
-line numbers don't shift.
+TOOL_TEXT: Mapping[str, ToolText] = {
+    "ls": LS_TEXT,
+    "read_file": READ_FILE_TEXT,
+    "hashline_read_file": HASHLINE_READ_FILE_TEXT,
+    "write_file": WRITE_FILE_TEXT,
+    "edit_file": EDIT_FILE_TEXT,
+    "hashline_edit": HASHLINE_EDIT_TEXT,
+    "glob": GLOB_TEXT,
+    "grep": GREP_TEXT,
+    "execute": EXECUTE_TEXT,
+    "run_in_background": RUN_IN_BACKGROUND_TEXT,
+    "read_output": READ_OUTPUT_TEXT,
+    "kill_shell": KILL_SHELL_TEXT,
+    "list_shells": LIST_SHELLS_TEXT,
+}
+"""Every text the console toolset can register, keyed by its id.
 
-After editing, re-read before making subsequent edits to the same file — \
-auto-formatters or pre-commit hooks may have changed content on disk.
-When making substitutions, change ONLY the exact tokens specified. \
-Do NOT adjust surrounding text (articles, grammar, punctuation)."""
+The ids are tool names except `hashline_read_file`, which is `read_file` under
+the hashline edit format — one tool with two texts, so the registry needs two
+keys where a caller overriding it still names the tool, `read_file`.
+"""
 
-GLOB_DESCRIPTION = """\
-Find files matching a glob pattern. Use this to discover files in the \
-codebase before reading or editing them.
+OVERRIDE_KEYS: frozenset[str] = frozenset(key for key in TOOL_TEXT if key != "hashline_read_file")
+"""Tool names a caller may override, which is `TOOL_TEXT` keyed by tool.
 
-Common patterns:
-- `"*.py"` — Python files in current directory only
-- `"**/*.py"` — Python files recursively in all subdirectories
-- `"src/**/*.ts"` — TypeScript files under src/
-- `"**/test_*.py"` — All test files recursively
-- `"**/*.{js,ts,tsx}"` — Multiple extensions
+Kept as its own set so an unknown key can be refused rather than ignored: a
+misspelled or renamed key used to mean the override silently did nothing, and
+nothing said so — including to a host whose catalogue then showed one text while
+the model read another.
+"""
 
-You can call glob multiple times in a single response to search for \
-different patterns in parallel."""
 
-GREP_DESCRIPTION = """\
-Search for a regex pattern across files. ALWAYS use this instead of \
-shell `grep` or `rg` commands.
-
-Supports full regex syntax (e.g., `"log.*Error"`, `"function\\s+\\w+"`).
-
-Output modes:
-- `"files_with_matches"` (default) — returns only file paths that match
-- `"content"` — returns matching lines with file path and line numbers
-- `"count"` — returns the number of matches"""
-
-EXECUTE_DESCRIPTION = """\
-Execute a shell command in the working directory.
-
-IMPORTANT: This tool is for operations that REQUIRE a real shell — \
-running tests, builds, git commands, package installs, running scripts.
-
-## You MUST use specialized tools instead of shell equivalents:
-- `read_file` instead of `cat`, `head`, `tail`
-- `edit_file`/`hashline_edit` instead of `sed`, `awk`
-- `write_file` instead of `echo >` or `cat <<EOF`
-- `glob` instead of `find` or `ls`
-- `grep` instead of shell `grep` or `rg`
-
-## Usage
-- Always quote file paths containing spaces with double quotes.
-- Prefer absolute paths over relative paths.
-- When running multiple independent commands, make separate `execute` calls \
-in a single response (parallel execution).
-- When commands depend on each other, chain with `&&` in a single call \
-(e.g., `cd /project && make test`).
-- For long-running commands (builds, large test suites), increase the timeout.
-- For verbose output, redirect to a temp file and inspect with `read_file`.
-
-## Debugging
-- Read the FULL error output when a command fails — the root cause is often \
-in the middle of a traceback, not the last line.
-- Reproduce the error before attempting a fix.
-- Change one thing at a time — don't make multiple speculative fixes.
-- If something fails 3 times with the same approach, STOP and try a \
-completely different strategy.
-
-## Dependencies
-- If a command fails because a package or tool is missing, install it \
-immediately (`pip install X`, `npm install X`) and retry.
-- Check what's already installed before installing new packages \
-(`which <tool>`, `pip list`).
-- Use the project's package manager (check for pyproject.toml, package.json, \
-Cargo.toml).
-
-## Git Safety
-- NEVER run destructive git commands unless explicitly asked: \
-`push --force`, `reset --hard`, `clean -f`, `branch -D`, `checkout .`
-- NEVER skip hooks (`--no-verify`) unless explicitly asked.
-- NEVER force push to main/master — warn the user first.
-- ALWAYS create NEW commits rather than amending existing ones \
-(unless the user explicitly asks for amend).
-- When staging files, prefer `git add <specific files>` over `git add -A` \
-or `git add .` to avoid accidentally including .env, credentials, or binaries.
-- NEVER commit changes unless the user explicitly asks.
-
-## Safety
-- Be careful not to introduce command injection vulnerabilities.
-- Never commit secrets (.env, credentials.json, API keys).
-- Be careful with destructive commands (`rm -rf`, `drop table`, etc.) — \
-verify the target path/object before executing."""
-
-RUN_IN_BACKGROUND_DESCRIPTION = """\
-Start a long-lived command in the background and return immediately with a \
-`shell_id`. Use this for processes that don't exit on their own — dev servers, \
-watchers, `uvicorn`/`npm run dev`, tailing logs.
-
-Do NOT use plain `execute` for servers: it blocks until the command finishes \
-and kills the process tree on timeout, so a server gets reaped.
-
-After starting: poll its output with `read_output(shell_id)`, probe it from a \
-separate `execute` call (e.g. `curl`), and stop it with `kill_shell(shell_id)` \
-when done. Don't write your own launcher scripts — use this tool."""
-
-READ_OUTPUT_DESCRIPTION = """\
-Read output produced by a background shell since your last read (stdout+stderr), \
-along with whether it's still running and its exit code if finished. Call \
-repeatedly to follow a server's startup logs."""
-
-KILL_SHELL_DESCRIPTION = """\
-Stop a background shell started with `run_in_background`. Always kill background \
-shells you no longer need (e.g. a dev server after you've verified it)."""
-
-LIST_SHELLS_DESCRIPTION = """\
-List the background shells started this session with their status \
-(running / exited) and command."""
+LS_DESCRIPTION = LS_TEXT.render()
+READ_FILE_DESCRIPTION = READ_FILE_TEXT.render()
+HASHLINE_READ_FILE_DESCRIPTION = HASHLINE_READ_FILE_TEXT.render()
+WRITE_FILE_DESCRIPTION = WRITE_FILE_TEXT.render()
+EDIT_FILE_DESCRIPTION = EDIT_FILE_TEXT.render()
+HASHLINE_EDIT_DESCRIPTION = HASHLINE_EDIT_TEXT.render()
+GLOB_DESCRIPTION = GLOB_TEXT.render()
+GREP_DESCRIPTION = GREP_TEXT.render()
+EXECUTE_DESCRIPTION = EXECUTE_TEXT.render()
+RUN_IN_BACKGROUND_DESCRIPTION = RUN_IN_BACKGROUND_TEXT.render()
+READ_OUTPUT_DESCRIPTION = READ_OUTPUT_TEXT.render()
+KILL_SHELL_DESCRIPTION = KILL_SHELL_TEXT.render()
+LIST_SHELLS_DESCRIPTION = LIST_SHELLS_TEXT.render()
