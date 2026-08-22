@@ -40,6 +40,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A mistake the model can fix now raises `ModelRetry`, and a refusal still does
+  not.** Every failure used to be a returned string, including the ones the model
+  had plainly got wrong: an `old_string` matching three places, a file edited
+  between the read and the edit, a path that does not exist. The model was told in
+  a sentence indistinguishable from a real answer and left to notice. Those cases
+  — a missing file, an offset past the end, an absent or ambiguous `old_string`, a
+  stale read, a hashline hash that no longer matches — come back as a retry prompt
+  now.
+
+  What stays a returned string is as deliberate: a non-zero exit from `execute` is
+  a *result* to reason about rather than a malformed call, `grep` finding nothing
+  is an answer, a dropped connection is not something different arguments would
+  fix, and a **permission refusal must never be a retry**, because a retry prompt
+  invites the model to look for a way around the rule. `PERMISSION_DENIED_PREFIX`
+  is now one constant that `PermissionGuard` writes and `toolsets/_failures.py`
+  reads, with a test holding the two ends together.
+
+  `max_retries` becomes a floor as well as a ceiling: on a tool's last attempt the
+  message is returned rather than raised. `ModelRetry` past the budget ends the
+  whole run with `UnexpectedModelBehavior`, so without that floor a model that
+  mistyped an `old_string` twice would kill a run that used to carry on. The worst
+  case is now exactly the old behaviour, never a dead run — and `max_retries=0`
+  reproduces it entirely.
+
 - **`profile="agent"`, for a host whose agent is not working in a repository.**
   `execute` carried 2501 characters of coding-agent guidance — git safety,
   package managers, what to do after three failed attempts — on every request,

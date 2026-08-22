@@ -27,6 +27,15 @@ if TYPE_CHECKING:
 GUARDED_COMMAND_OPERATIONS: tuple[PermissionOperation, ...] = ("read", "write")
 """Operations whose deny rules also block a command that names such a path."""
 
+PERMISSION_DENIED_PREFIX = "Permission denied"
+"""How every refusal this module returns rather than raises begins.
+
+A constant because the console toolset has to tell a refusal from a mistake: a
+mistake is handed back as `ModelRetry` so the model tries again, and a refusal
+must not be, since a retry prompt invites it to look for a way around the rule.
+`toolsets/_failures.py` is the reader.
+"""
+
 
 class PermissionGuard:
     """Decides synchronously whether one operation may proceed.
@@ -73,11 +82,11 @@ class PermissionGuard:
         if action == "deny":
             rule = self._checker.find_matching_rule(operation, target)
             if rule and rule.description:
-                return f"Permission denied: {rule.description}"
-            return f"Permission denied for {operation} on '{target}'"
+                return f"{PERMISSION_DENIED_PREFIX}: {rule.description}"
+            return f"{PERMISSION_DENIED_PREFIX} for {operation} on '{target}'"
 
         if self._ask_fallback == "deny":
-            return f"Permission denied for {operation} on '{target}' (approval required)"
+            return f"{PERMISSION_DENIED_PREFIX} for {operation} on '{target}' (approval required)"
         raise PermissionAskError(operation, target, "Approval required but no callback")
 
     def is_denied(self, operation: PermissionOperation, target: str) -> bool:
@@ -116,7 +125,7 @@ class PermissionGuard:
             for operation in GUARDED_COMMAND_OPERATIONS:
                 if self.is_denied(operation, target):
                     return (
-                        f"Permission denied: command references '{target}', "
+                        f"{PERMISSION_DENIED_PREFIX}: command references '{target}', "
                         f"which is denied for {operation}"
                     )
         return None

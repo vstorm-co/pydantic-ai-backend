@@ -135,6 +135,32 @@ Valid keys are the tool names: `ls`, `read_file`, `write_file`, `edit_file`,
 ignored — a misspelled override that silently reaches nothing is one nobody
 discovers.
 
+## Failures
+
+A tool reports trouble in one of two shapes, and they say different things to the
+model.
+
+**A mistake it can fix raises `ModelRetry`** — the message goes back as a retry
+prompt and the model gets another attempt at the call:
+
+- a file that is not there, or an offset past its end
+- an `old_string` that matches nothing, or matches more than once
+- a file edited between the read and the edit, or a hashline hash that no longer
+  matches
+
+**Everything else is returned as text**, because it is the answer rather than a
+malformed call: a non-zero exit from `execute`, a `grep` that found nothing, a
+backend with no shell, a dropped connection — and a **permission refusal**, which
+is deliberate. A retry prompt on a refusal invites the model to look for a way
+around the rule.
+
+`max_retries` is the budget, and it is a floor as much as a ceiling: on a tool's
+final attempt the message is returned instead of raised. `ModelRetry` past the
+budget ends the whole run with `UnexpectedModelBehavior`, so a model that mistypes
+an `old_string` twice would kill a run that would otherwise have carried on. The
+worst case here is the behaviour this library had before — an error string the
+model reads and adapts to.
+
 ## Permission-based Configuration
 
 For fine-grained control, use the permission system:

@@ -21,7 +21,7 @@ from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai_backends.adapter import ensure_async
 from pydantic_ai_backends.backends import _guard
 from pydantic_ai_backends.protocol import AsyncBackendProtocol, BackendProtocol
-from pydantic_ai_backends.toolsets import _ruleset, _tracking
+from pydantic_ai_backends.toolsets import _failures, _ruleset, _tracking
 from pydantic_ai_backends.toolsets._content import (
     DEFAULT_MAX_DOCUMENT_BYTES as DEFAULT_MAX_DOCUMENT_BYTES,
 )
@@ -246,8 +246,12 @@ def create_console_toolset(  # noqa: C901
         permissions: Ruleset deciding which tools exist and which need approval:
             an operation defaulting to "deny" drops its tools entirely, one
             defaulting to "ask" marks them as requiring approval.
-        max_retries: Times a tool may retry within one run after invalid
-            arguments, with the validation error fed back to the model.
+        max_retries: Times a tool may retry within one run, with the message
+            fed back to the model — pydantic-ai's own argument validation, and
+            the mistakes `toolsets/_failures.py` steers on: a missing file, an
+            `old_string` that is absent or matches twice, a stale read. Past the
+            budget the message is returned rather than raised, so a run never
+            ends on one.
         image_support: Return recognized image files (`.png`, `.jpg`, `.jpeg`,
             `.gif`, `.webp`) as `BinaryContent` a multimodal model can see,
             instead of garbled text.
@@ -424,7 +428,11 @@ def create_console_toolset(  # noqa: C901
 
             backend = ensure_async(backend_for(ctx))
             if not await backend.exists(path):
-                return f"Error: File '{path}' not found"
+                return _failures.steer(
+                    ctx,
+                    f"Error: File '{path}' not found. Check the path with `ls` or "
+                    "`glob`, then read it again.",
+                )
 
             raw = await backend.read_bytes(path)
             _tracking.record_read(backend_for(ctx), path, raw)
@@ -447,8 +455,9 @@ def create_console_toolset(  # noqa: C901
 
             backend = ensure_async(backend_for(ctx))
             result = await backend.read(path, offset, limit)
-            if not result.startswith("Error"):
-                await _tracking.record_path_read(backend, backend_for(ctx), path)
+            if result.startswith("Error"):
+                return _failures.steer(ctx, result)
+            await _tracking.record_path_read(backend, backend_for(ctx), path)
             return result
 
     @described("write_file", requires_approval=write_approval)
@@ -461,7 +470,7 @@ def create_console_toolset(  # noqa: C901
         """Write content to a file."""
         result = await ensure_async(backend_for(ctx)).write(path, content)
         if result.error:
-            return f"Error: {result.error}"
+            return _failures.steer(ctx, f"Error: {result.error}")
 
         # The agent knows this file's content now, so an immediate edit must not
         # be refused as stale.
@@ -490,7 +499,7 @@ def create_console_toolset(  # noqa: C901
 
             async with _tracking.edit_lock(raw_backend, path):
                 if not await backend.exists(path):
-                    return f"Error: File '{path}' not found"
+                    return _failures.steer(ctx, f"Error: File '{path}' not found")
 
                 current = (await backend.read_bytes(path)).decode("utf-8", errors="replace")
                 new_text, error, summary = apply_hashline_edit_with_summary(
@@ -503,11 +512,11 @@ def create_console_toolset(  # noqa: C901
                     insert_after,
                 )
                 if error:
-                    return f"Error: {error}"
+                    return _failures.steer(ctx, f"Error: {error}")
 
                 written = await backend.write(path, new_text)
                 if written.error:
-                    return f"Error: {written.error}"
+                    return _failures.steer(ctx, f"Error: {written.error}")
                 return f"Edited {written.path}: {summary}"
 
     else:
@@ -533,11 +542,11 @@ def create_console_toolset(  # noqa: C901
             async with _tracking.edit_lock(raw_backend, path):
                 stale = await _tracking.staleness_error(backend, raw_backend, path)
                 if stale is not None:
-                    return stale
+                    return _failures.steer(ctx, stale)
 
                 result = await backend.edit(path, old_string, new_string, replace_all)
                 if result.error:
-                    return f"Error: {result.error}"
+                    return _failures.steer(ctx, f"Error: {result.error}")
 
                 # The agent's view is the post-edit content now, so a follow-up
                 # edit must not be flagged as stale.
