@@ -1,0 +1,167 @@
+/* ============================================
+   pydantic-ai-backend Documentation Styles
+   Clean, minimal - inspired by pydantic-deep
+   ============================================ */
+
+/* --------------------------------------------
+   Theme Colors
+   -------------------------------------------- */
+:root {
+  --md-primary-fg-color: #e91e63;
+  --md-primary-fg-color--light: #f48fb1;
+  --md-primary-fg-color--dark: #c2185b;
+  --md-accent-fg-color: #ff4081;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #e91e63;
+  --md-primary-fg-color--light: #f48fb1;
+  --md-primary-fg-color--dark: #c2185b;
+  --md-accent-fg-color: #ff4081;
+}
+
+/* --------------------------------------------
+   Announcement Bar
+   -------------------------------------------- */
+.md-banner {
+  background: #1e1e2e;
+}
+
+.md-banner a {
+  color: #f8f8f2 !important;
+}
+
+.md-banner a:hover {
+  color: var(--md-primary-fg-color) !important;
+}
+
+/* --------------------------------------------
+   Typography
+   -------------------------------------------- */
+.md-typeset h1 {
+  font-weight: 700;
+  color: var(--md-primary-fg-color);
+}
+
+/* Center the main title on index page */
+.md-content h1[id="file-storage-sandbox-backends-for-pydantic-ai"] {
+  text-align: center;
+  font-size: 2.5rem;
+  margin-top: 0;
+}
+
+/* --------------------------------------------
+   Code Blocks
+   -------------------------------------------- */
+.md-typeset pre {
+  border-radius: 6px;
+}
+
+.md-typeset code {
+  border-radius: 4px;
+}
+
+/* --------------------------------------------
+   Tables
+   -------------------------------------------- */
+.md-typeset table:not([class]) th {
+  background: var(--md-primary-fg-color);
+  color: white;
+  font-weight: 600;
+}
+
+.md-typeset table:not([class]) {
+  font-size: 0.85rem;
+}
+
+/* --------------------------------------------
+   Admonitions
+   -------------------------------------------- */
+.md-typeset .admonition.tip,
+.md-typeset details.tip {
+  border-color: var(--md-primary-fg-color);
+}
+
+.md-typeset .tip > .admonition-title,
+.md-typeset .tip > summary {
+  background-color: rgba(233, 30, 99, 0.1);
+}
+
+/* --------------------------------------------
+   Navigation
+   -------------------------------------------- */
+.md-nav__link--active {
+  font-weight: 600;
+  color: var(--md-primary-fg-color) !important;
+}
+
+/* --------------------------------------------
+   Buttons
+   -------------------------------------------- */
+.md-button--primary {
+  background-color: var(--md-primary-fg-color);
+  border-color: var(--md-primary-fg-color);
+}
+
+.md-button--primary:hover {
+  background-color: var(--md-primary-fg-color--dark);
+  border-color: var(--md-primary-fg-color--dark);
+}
+
+/* --------------------------------------------
+   Feature Grid
+   -------------------------------------------- */
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.feature-card {
+  background: var(--md-code-bg-color);
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-left: 3px solid var(--md-primary-fg-color);
+  border-radius: 8px;
+  padding: 1.25rem;
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.feature-card:hover {
+  border-color: var(--md-accent-fg-color);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.feature-card h3 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+  font-size: 1.1rem;
+}
+
+.feature-card p {
+  margin-bottom: 0.5rem;
+  color: var(--md-default-fg-color--light);
+  font-size: 0.9rem;
+}
+
+.feature-card a {
+  display: inline-block;
+  margin-top: 0.5rem;
+  font-weight: 500;
+  color: var(--md-accent-fg-color);
+}
+
+.feature-card a:hover {
+  text-decoration: underline;
+}
+
+/* --------------------------------------------
+   Grid Cards
+   -------------------------------------------- */
+.grid.cards {
+  margin-top: 1rem;
+}
+
+.grid.cards > ul > li {
+  border-left: 3px solid var(--md-primary-fg-color);
+}
