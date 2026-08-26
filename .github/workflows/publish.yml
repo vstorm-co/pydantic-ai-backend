@@ -13,7 +13,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
       - run: uv sync --all-extras
       - run: uv run python -m build
       - uses: pypa/gh-action-pypi-publish@release/v1
