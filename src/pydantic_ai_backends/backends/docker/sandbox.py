@@ -15,6 +15,7 @@ from pydantic_ai_backends._editing import Replacement, replace_in_content
 from pydantic_ai_backends._limits import (
     DEFAULT_MAX_READ_BYTES,
     MAX_EXECUTE_OUTPUT_BYTES,
+    MAX_RUN_OUTPUT_BYTES,
     READ_LIMIT_HINT,
 )
 from pydantic_ai_backends._text import bytes_to_text
@@ -31,10 +32,12 @@ from pydantic_ai_backends.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Mapping, Sequence
 
     from docker import DockerClient
     from docker.models.containers import Container
+
+    from pydantic_ai_backends.types import CommandOutcome
 
 ALIVE_CACHE_SECONDS = 5.0
 """How long a liveness answer is trusted before the daemon is asked again.
@@ -281,6 +284,11 @@ class DockerSandbox(BaseSandbox):
         """Idle seconds after which `SessionManager` may reap this sandbox."""
         return self._idle_timeout
 
+    @property
+    def work_dir(self) -> str:
+        """Directory commands start in and relative paths resolve against."""
+        return self._work_dir
+
     def _resolve_path(self, path: str) -> str:
         """Resolve a relative path against the container's working directory."""
         if not PurePosixPath(path).is_absolute():
@@ -525,6 +533,63 @@ class DockerSandbox(BaseSandbox):
             exit_code=exit_code,
             truncated=len(output) > MAX_EXECUTE_OUTPUT_BYTES,
         )
+
+    async def run_command(
+        self,
+        argv: Sequence[str],
+        *,
+        run_id: str,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        output_limit: int | None = None,
+    ) -> CommandOutcome:
+        """Run `argv` under the workspace failure contract rather than this protocol's.
+
+        Unlike :meth:`execute` this raises when the container is unreachable,
+        keeps stdout and stderr apart, and stops the command's process group when
+        the caller times out or is cancelled. It is what a Pydantic AI workspace
+        and `sandboxd`'s `/run` are built on; an agent's tool path keeps using
+        :meth:`execute`.
+
+        Args:
+            argv: The program and its arguments, passed through literally.
+            run_id: Names the run so :meth:`stop_command` can stop it.
+            env: Variables layered over the container's environment.
+            timeout: Seconds before the command is stopped; none when `None`.
+            output_limit: Combined output bytes before the command is stopped;
+                the module default when `None`.
+
+        Raises:
+            SandboxUnavailableError: The container is gone or not running.
+        """
+        # Imported here: `anyio` arrives with the `workspaces` and `server` extras,
+        # the two callers of this method, and not with `docker`.
+        import anyio.to_thread
+
+        from pydantic_ai_backends.backends.docker import _exec
+
+        await anyio.to_thread.run_sync(self._ensure_container)
+        self._last_activity = time.time()
+        assert self._container is not None
+        return await _exec.run_in_container(
+            self._container,
+            argv,
+            run_id=run_id,
+            env=env,
+            workdir=self._work_dir,
+            timeout=timeout,
+            output_limit=output_limit if output_limit is not None else MAX_RUN_OUTPUT_BYTES,
+        )
+
+    async def stop_command(self, run_id: str) -> None:
+        """Stop a command :meth:`run_command` started, and everything it started.
+
+        Does nothing when the run has already finished or never started here.
+        """
+        from pydantic_ai_backends.backends.docker import _exec
+
+        if self._container is not None:
+            await _exec.stop_in_container(self._container, run_id)
 
     # ── Files ──────────────────────────────────────────────────────────
 

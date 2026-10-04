@@ -195,6 +195,15 @@ class ConsoleCapability(AbstractCapability[Any]):
     ask_fallback: AskFallback = "error"
     """What an unanswerable "ask" does — `"deny"` refuses it, `"error"` raises."""
 
+    use_workspace: bool = False
+    """Operate on the run's Pydantic AI workspace instead of a backend.
+
+    The tools then reach `ctx.workspace`, supplied by a workspace capability on
+    the same agent — `DockerWorkspace` or `SandboxdWorkspace` from
+    `pydantic_ai_backends.workspaces`, or one from the Pydantic AI harness such
+    as `E2BSandbox`. Excludes `backend`. Needs the `workspaces` extra.
+    """
+
     _toolset: AbstractToolset[Any] | None = field(default=None, init=False, repr=False)
     _checker: PermissionChecker | None = field(default=None, init=False, repr=False)
 
@@ -202,6 +211,7 @@ class ConsoleCapability(AbstractCapability[Any]):
         """Create the underlying console toolset and permission checker."""
         self._toolset = create_console_toolset(
             backend=self.backend,
+            use_workspace=self.use_workspace,
             include_execute=self.include_execute,
             include_background=self.include_background,
             edit_format=self.edit_format,

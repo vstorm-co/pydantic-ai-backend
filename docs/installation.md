@@ -60,6 +60,20 @@ uv add pydantic-ai-backend[remote]
 pip install pydantic-ai-backend[remote]
 ```
 
+### Pydantic AI Workspaces
+
+To supply a [Pydantic AI workspace](concepts/workspaces.md) from a Docker
+container or a `sandboxd` session, or to run the console tools in whatever
+workspace a run has (needs Pydantic AI 2.52 or newer):
+
+```bash
+uv add "pydantic-ai-backend[workspaces]"
+# or
+pip install "pydantic-ai-backend[workspaces]"
+```
+
+Add `docker` as well for `DockerWorkspace`.
+
 ### sandboxd (service)
 
 For the service that owns Docker and rents out sandboxes over HTTP. Install this

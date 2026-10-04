@@ -77,6 +77,9 @@ pip install pydantic-ai-backend[remote]
 # The sandbox service itself (install in the service image, not your app)
 pip install pydantic-ai-backend[server]
 
+# Pydantic AI workspaces from a container or a sandboxd session (Pydantic AI 2.52+)
+pip install pydantic-ai-backend[workspaces]
+
 # Everything
 pip install pydantic-ai-backend[console,docker,remote]
 ```

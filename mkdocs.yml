@@ -157,6 +157,7 @@ nav:
     - Daytona Sandbox: concepts/daytona.md
     - Kubernetes Sandbox: concepts/kubernetes.md
     - Remote Sandboxes: concepts/remote.md
+    - Pydantic AI Workspaces: concepts/workspaces.md
     - Console Toolset: concepts/console-toolset.md
   - Examples:
     - examples/index.md
@@ -175,6 +176,7 @@ nav:
     - Daytona: api/daytona.md
     - Kubernetes: api/kubernetes.md
     - Remote: api/remote.md
+    - Workspaces: api/workspaces.md
     - Toolsets: api/toolsets.md
     - Types: api/types.md
   - Changelog: changelog.md

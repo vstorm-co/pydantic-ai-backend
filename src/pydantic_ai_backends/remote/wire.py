@@ -23,6 +23,9 @@ SESSION_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 """Session ids appear in URLs and in on-disk workspace paths, so they are
 restricted to characters that cannot traverse a directory or confuse a path."""
 
+RUN_ID_PATTERN = r"^[0-9a-f]{32}$"
+"""A `/run` id: a uuid4 hex, which is also what keeps it safe in a file name."""
+
 TENANT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 """Tenant labels are reported back in listings, so they carry the same
 restriction as session ids rather than being free text."""
@@ -41,6 +44,48 @@ class ExecResponse(BaseModel):
     output: str
     exit_code: int | None = None
     truncated: bool = False
+
+
+class RunRequest(BaseModel):
+    """Run one program, under the contract a Pydantic AI workspace needs.
+
+    Beside `/exec` rather than replacing it: `/exec` serves an agent's tool path,
+    which must never fail and so folds a refused command into its output, while a
+    workspace needs the streams apart, a dead sandbox reported as one, and a way
+    to stop a command whose caller gave up.
+    """
+
+    argv: list[str] = Field(min_length=1)
+    """The program and its arguments, passed through literally. A shell command
+    is `["/bin/sh", "-c", "..."]`, spelled out by the client."""
+
+    env: dict[str, str] = Field(default_factory=dict)
+    """Variables layered over the sandbox's own environment."""
+
+    timeout_seconds: float | None = Field(default=None, gt=0)
+    """Deadline for the command. Clamped to the service's `execute_timeout`, and
+    that ceiling applies when this is `None`."""
+
+    run_id: str = Field(pattern=RUN_ID_PATTERN)
+    """Chosen by the client, so it can stop the run from another request when it
+    stops waiting for this one."""
+
+
+class RunResponse(BaseModel):
+    """How a `/run` command ended: finished, timed out, or over its output limit.
+
+    A non-zero `exit_code` is a result. `timed_out` and `output_limited` carry no
+    exit code and only the beginning of each stream, because the command was
+    stopped rather than allowed to finish.
+    """
+
+    stdout: str
+    stderr: str
+    exit_code: int | None = None
+    timed_out: bool = False
+    output_limited: bool = False
+    output_limit: int | None = None
+    """The ceiling an `output_limited` command crossed, in bytes."""
 
 
 class ReadRequest(BaseModel):
@@ -201,6 +246,15 @@ class CreateSessionRequest(BaseModel):
     opened with; a `runtime` that disagrees is rejected rather than ignored.
     """
 
+    attach: bool = False
+    """Only attach, never create: refuse with 404 when `session_id` names neither
+    an open session nor a workspace this service still holds.
+
+    What a client continuing earlier work needs. `reuse` alone opens a fresh,
+    empty session when the old one is gone, so the caller would carry on in an
+    empty directory believing its files were there. Implies `reuse`.
+    """
+
 
 class SessionEvent(BaseModel):
     """One operation performed against a session.
@@ -214,7 +268,7 @@ class SessionEvent(BaseModel):
     """Monotonic per-session sequence number, for incremental polling."""
     at: float
     op: str
-    """Operation name: `exec`, `read`, `write`, `edit`, `ls`, `glob`, `grep`, `exists`."""
+    """Operation name: `exec`, `run`, `read`, `write`, `edit`, `ls`, `glob`, `grep`, `exists`."""
     target: str
     """Command or path the operation addressed, truncated."""
     ok: bool

@@ -312,6 +312,12 @@ A `runtime` that disagrees with the open session is **refused**, not honoured.
 Honouring it would mean replacing a live sandbox and discarding the files the
 caller came back for.
 
+`reuse` opens a fresh, empty session when the one named is gone. A client that
+must not carry on in an empty directory sends `attach` instead, which never
+creates: it attaches to an open session or to a workspace the service still
+holds, and answers `404` otherwise. [`SandboxdWorkspace`](workspaces.md) opens
+every ref this way.
+
 ### Choosing what the session id keys on
 
 The session id is the only thing you choose, so it is what decides who shares
@@ -670,13 +676,23 @@ conversation, and forwards only listing and reading.
 
 ## Failure behaviour
 
-File and command operations **degrade rather than raise**: a transport failure
+`RemoteSandbox`'s file and command operations **degrade rather than raise**: a transport failure
 surfaces the same way a missing file does — `b""`, `[]`, or an `Error: ...`
 string — matching `LocalBackend` and `DockerSandbox`. A tool call must not take
 down an agent run because a socket blipped.
 
 `start()` is the exception and does raise: a caller who cannot get a sandbox at
 all needs to know why.
+
+`POST /sessions/{id}/run` is the service's other way to run a command, for a
+caller that must not degrade: a [Pydantic AI workspace](workspaces.md). It takes
+an argv, an `env` and a client-chosen `run_id`, keeps stdout and stderr apart,
+answers `410` when the sandbox has gone, and reports a command stopped at its
+deadline or over its output limit as `timed_out` or `output_limited` instead of
+an exit code. `POST /sessions/{id}/runs/{run_id}/stop` stops such a command and
+every process it started, for a client that gave up waiting. A sandbox from a
+custom `sandbox_builder` needs `run_command` and `stop_command`
+(`CommandRunner`) for these; without them `/run` answers `501`.
 
 ## Capacity and reaping
 

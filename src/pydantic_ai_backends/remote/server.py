@@ -47,6 +47,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import time
@@ -64,6 +65,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.responses import HTMLResponse
 
+from pydantic_ai_backends._limits import MAX_RUN_OUTPUT_BYTES
 from pydantic_ai_backends.adapter import ensure_async
 from pydantic_ai_backends.backends.docker._image import buildkit_available
 from pydantic_ai_backends.backends.docker.runtimes import get_runtime
@@ -73,6 +75,7 @@ from pydantic_ai_backends.backends.docker.session import (
     alive_of,
     last_activity_of,
 )
+from pydantic_ai_backends.protocol import CommandRunner, SandboxUnavailableError
 from pydantic_ai_backends.remote import wire
 from pydantic_ai_backends.remote._workspace import (
     WorkspacePathError,
@@ -1662,14 +1665,18 @@ class _Service:
                 ),
             ) from exc
 
+        if body.attach and body.session_id is None:
+            raise HTTPException(status_code=400, detail="attach needs the session_id to attach to")
         session_id = body.session_id or f"s-{uuid.uuid4().hex[:16]}"
         open_already = self._sessions.get(session_id)
         if open_already is not None:
-            if not body.reuse:
+            if not (body.reuse or body.attach):
                 raise HTTPException(status_code=409, detail=f"Session exists: {session_id}")
             return await self._attach(session_id, open_already, body.runtime)
         if session_id in self._pending:
             raise HTTPException(status_code=409, detail=f"Session is opening: {session_id}")
+        if body.attach and not self._holds_workspace(session_id):
+            raise HTTPException(status_code=404, detail=f"Nothing to attach to: {session_id}")
 
         # Claimed before the first await. Starting a sandbox suspends, so without
         # this two requests naming one id both get past the check above, both are
@@ -1701,6 +1708,17 @@ class _Service:
             session=self.describe(session_id, sandbox, alive=await alive_of(sandbox)),
             token=self._sessions[session_id].token,
         )
+
+    def _holds_workspace(self, session_id: str) -> bool:
+        """Whether files from a closed session `session_id` are still on disk.
+
+        Only a configured `workspace_root` outlives a session. Without one a
+        closed session left nothing a later attach could find, so there is
+        nothing to attach to.
+        """
+        if self.config.workspace_root is None:
+            return False
+        return workspace_root_for(Path(self.config.workspace_root), session_id).is_dir()
 
     async def make_room(self) -> str | None:
         """Close the least recently used idle session when the pool is full.
@@ -2021,6 +2039,26 @@ class _Service:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    def run_timeout(self, requested: float | None) -> float:
+        """Deadline for a `/run` command: the request's, within the service ceiling."""
+        ceiling = float(self.config.execute_timeout)
+        return ceiling if requested is None else min(requested, ceiling)
+
+    def runner(self, sandbox: Any) -> CommandRunner:
+        """The sandbox's workspace-contract command runner.
+
+        Raises:
+            HTTPException: 501 for a sandbox from a custom factory that has only
+                the tool-path `execute`, whose failures cannot be told apart from
+                a command's own output.
+        """
+        if not isinstance(sandbox, CommandRunner):
+            raise HTTPException(
+                status_code=501,
+                detail=f"{type(sandbox).__name__} cannot run commands for a workspace",
+            )
+        return sandbox
+
     def command_timeout(self, requested: int | None) -> int:
         """Clamp a requested command timeout to the service ceiling."""
         if requested is None:
@@ -2245,6 +2283,64 @@ def _register_workspace_routes(app: FastAPI, service: _Service) -> None:
         return await service.archive_read_bytes(session_id, body)
 
 
+def _register_run_routes(app: FastAPI, service: _Service) -> None:
+    """Commands for a Pydantic AI workspace, under its failure contract."""
+
+    @app.post("/sessions/{session_id}/run", response_model=wire.RunResponse)
+    async def run_command(session_id: AuthorizedSession, body: wire.RunRequest) -> wire.RunResponse:
+        """Run one program for a Pydantic AI workspace.
+
+        Unlike `/exec`, a sandbox that has disappeared is a 410 rather than a
+        command that failed, and the streams come back apart. The command is
+        stopped at its deadline here, and `/runs/{run_id}/stop` stops it sooner
+        for a client that gave up waiting.
+        """
+        runner = service.runner(await service.sandbox(session_id))
+        with service.observe(session_id, "run", shlex.join(body.argv)) as outcome:
+            try:
+                result = await runner.run_command(
+                    body.argv,
+                    run_id=body.run_id,
+                    env=body.env or None,
+                    timeout=service.run_timeout(body.timeout_seconds),
+                    output_limit=MAX_RUN_OUTPUT_BYTES,
+                )
+            except SandboxUnavailableError as exc:
+                outcome.detail = "sandbox gone"
+                raise HTTPException(status_code=410, detail=str(exc)) from exc
+            outcome.ok = result.exit_code == 0
+            outcome.detail = (
+                "timed out"
+                if result.timed_out
+                else "output limit"
+                if result.output_limited
+                else f"exit {result.exit_code}"
+            )
+        return wire.RunResponse(
+            stdout=result.stdout,
+            stderr=result.stderr,
+            exit_code=result.exit_code,
+            timed_out=result.timed_out,
+            output_limited=result.output_limited,
+            output_limit=MAX_RUN_OUTPUT_BYTES if result.output_limited else None,
+        )
+
+    @app.post("/sessions/{session_id}/runs/{run_id}/stop", status_code=204)
+    async def stop_run(
+        session_id: AuthorizedSession,
+        run_id: Annotated[str, PathParam(pattern=wire.RUN_ID_PATTERN)],
+    ) -> None:
+        """Stop a `/run` command and everything it started.
+
+        A run that already finished, or a session with no sandbox right now, has
+        nothing to stop; that is a success rather than an error, since a client
+        stops a run exactly when it no longer knows how far it got.
+        """
+        sandbox = service.peek(session_id)
+        if isinstance(sandbox, CommandRunner):
+            await sandbox.stop_command(run_id)
+
+
 def _register_operation_routes(app: FastAPI, service: _Service) -> None:
     """The file and command operations, all scoped to one session."""
 
@@ -2427,6 +2523,7 @@ def create_app(
     _register_session_routes(app, service)
     _register_workspace_routes(app, service)
     _register_operation_routes(app, service)
+    _register_run_routes(app, service)
     return app
 
 

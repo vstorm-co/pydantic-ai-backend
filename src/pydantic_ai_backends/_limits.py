@@ -5,6 +5,15 @@ from __future__ import annotations
 MAX_EXECUTE_OUTPUT_BYTES = 100_000
 """Output retained from a single `execute()` call; the rest is discarded."""
 
+MAX_RUN_OUTPUT_BYTES = 10 * 1024 * 1024
+"""Combined stdout and stderr a `run_command` may produce before it is stopped.
+
+Larger than `MAX_EXECUTE_OUTPUT_BYTES` because the reader is code, not a model,
+and a command that outgrows it fails rather than being cut short silently. The
+same ceiling as Pydantic AI's local workspace, so a command fails the same way
+wherever it runs.
+"""
+
 DEFAULT_MAX_READ_BYTES = 8 * 1024 * 1024
 """Ceiling for a whole-file read.
 

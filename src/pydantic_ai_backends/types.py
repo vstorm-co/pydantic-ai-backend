@@ -98,6 +98,23 @@ class ExecuteResponse:
     truncated: bool = False
 
 
+@dataclass(frozen=True)
+class CommandOutcome:
+    """How one `CommandRunner.run_command` call ended.
+
+    Exactly one of three shapes: finished (`exit_code` set, non-zero included),
+    `timed_out`, or `output_limited`. The last two carry only the beginning of
+    each stream and no exit code, because the command was stopped rather than
+    allowed to finish. Undecodable bytes are replaced, never dropped.
+    """
+
+    stdout: str
+    stderr: str
+    exit_code: int | None = None
+    timed_out: bool = False
+    output_limited: bool = False
+
+
 @dataclass
 class BackgroundHandle:
     """Handle to a started background (long-lived) process."""

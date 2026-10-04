@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Pydantic AI workspaces from this library's sandboxes.** Pydantic AI 2.52
+  gave every tool one environment to work in, `ctx.workspace`, and the harness's
+  `Coder`, `Shell` and `FileSystem` run in whichever one an agent is given — but
+  the only self-hosted container it offered was a directory on the host.
+  `pydantic_ai_backends.workspaces` adds two: `DockerWorkspace`, a container on
+  this host, and `SandboxdWorkspace`, a `sandboxd` session, so the agent's
+  process holds no Docker socket. Both pass Pydantic AI's own
+  `WorkspaceBackendSuite` against a real daemon. A ref attaches to the same
+  container or session on a later run, and one whose environment is gone fails
+  with `WorkspaceUnavailableError` rather than continuing in an empty one. New
+  `workspaces` extra; see the "Pydantic AI Workspaces" page.
+- **`ConsoleCapability(use_workspace=True)`** runs the console tools in the
+  run's workspace instead of a backend of their own — one of the above, or the
+  harness's E2B, Modal or Sprites. `WorkspaceSandbox` is the adapter underneath.
+- **`sandboxd` runs commands for a workspace: `POST /sessions/{id}/run`** takes
+  an argv, `env` and a `run_id`, keeps stdout and stderr apart, answers `410`
+  for a vanished sandbox, and `POST /sessions/{id}/runs/{run_id}/stop` stops a
+  command and its process group. `/exec` is unchanged. A session open request
+  with `attach` attaches without ever creating, answering `404` when there is
+  nothing left to attach to.
+- **`DockerSandbox.run_command` / `stop_command`**, the `CommandRunner`
+  protocol and `SandboxUnavailableError`: commands under a workspace's failure
+  contract, which raises for an unreachable container instead of folding it into
+  the output. The tool path keeps using `execute`.
+
 ## [0.2.29] - 2026-08-22
 
 ### Fixed
@@ -503,7 +530,7 @@ before upgrading is deferred.
 
   The guard deliberately lets pydantic-ai's control-flow exceptions past — `ModelRetry`, `ApprovalRequired`, `CallDeferred` and the `Skip*` family. Those are not failures, they steer the run, and catching `ModelRetry` in particular would turn a retry into a dead end the model cannot recover from. `UserError` passes through too, because reporting a misuse of the library to the model as a failed file operation hides the bug; it subclasses `RuntimeError`, so the narrower handler this replaced was already swallowing it.
 - **The shell derivation every sandbox depends on is measured.** `BaseSandbox` carried a blanket `# pragma: no cover`, so the command construction and output parsing behind Docker, Daytona, Kubernetes and any third-party sandbox contributed nothing to the 100% gate. Moving it into one module made it directly testable, and it is now covered — including the quoting of a hostile path, `ls` rows with spaces in the name, a `grep` line containing colons, and the failure branch of every operation.
-- **The failure contract is written down.** What a backend must return when an operation fails was real, load-bearing and documented nowhere, so implementors were deducing it from our source. `protocol.py` now states it per method, including the asymmetry that matters most: `read` may return an `Error: ` string but `read_bytes` must return `b""`, because its caller cannot tell an error message from real file content — a probe staging a screenshot would treat `b"Error: not found"` as the image.
+- **The failure contract is written down.** What a backend must return when an operation fails was real, load-bearing and documented nowhere, so implementers were deducing it from our source. `protocol.py` now states it per method, including the asymmetry that matters most: `read` may return an `Error: ` string but `read_bytes` must return `b""`, because its caller cannot tell an error message from real file content — a probe staging a screenshot would treat `b"Error: not found"` as the image.
 
 - **`SandboxdConfig(container_ttl=...)`** removes a persisted sandbox container that has been stopped for that long, leaving its workspace untouched. It separates the two things a session accumulates: what it *installed* is rebuildable, what it *wrote* is not — so a deployment can reclaim the first on a schedule while keeping an agent's files for ever, which is what its user expects. `workspace_ttl` remains the opposite knob and stays `None` by default. The sweep finds containers by their name prefix rather than from a record of its own, because after a restart Docker is the only source of what is still lying around.
 - **`SandboxdConfig(evict_idle_after=...)`** turns the session ceiling from a hard cap on how many sessions may exist into a working-set size. At the ceiling the least recently used session idle for at least that long is closed to make room, instead of the incoming request being refused — which was the wrong answer when the pool was full of sandboxes nobody was using. With `workspace_root` set the evicted session loses nothing but its container: its next request re-attaches and finds its files, for the price of a container start. A session idle for less than the threshold is never a candidate, because killing an agent's work to serve somebody else's first request is worse than making them wait, and a pool of genuinely busy sessions still answers `429`. Requires `workspace_root`, and the config refuses without it rather than silently discarding an evicted session's files.

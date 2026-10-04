@@ -99,6 +99,8 @@ from pydantic_ai_backends.toolsets.descriptions import (
 from pydantic_ai_backends.types import GrepMatch
 
 if TYPE_CHECKING:
+    from pydantic_ai.workspaces import Workspace
+
     from pydantic_ai_backends.permissions.checker import AskCallback, AskFallback
     from pydantic_ai_backends.permissions.types import PermissionRuleset
 
@@ -202,6 +204,18 @@ def _degrade_on_error(fn: _ToolFn) -> _ToolFn:
     return cast("_ToolFn", guarded)
 
 
+def _workspace_sandbox_factory() -> Callable[[Workspace], AsyncBackendProtocol]:
+    """`WorkspaceSandbox`, or the install hint when Pydantic AI predates workspaces."""
+    try:
+        from pydantic_ai_backends.workspaces._console import WorkspaceSandbox
+    except ImportError as error:
+        raise UserError(
+            "`use_workspace=True` needs Pydantic AI workspaces (2.52 or newer). "
+            'Install with: pip install "pydantic-ai-backend[workspaces]"'
+        ) from error
+    return WorkspaceSandbox
+
+
 def create_console_toolset(  # noqa: C901
     id: str | None = None,
     backend: BackendProtocol | AsyncBackendProtocol | None = None,
@@ -221,6 +235,7 @@ def create_console_toolset(  # noqa: C901
     edit_format: EditFormat = "str_replace",
     descriptions: Mapping[str, str | ToolText] | None = None,
     profile: Profile = DEFAULT_PROFILE,
+    use_workspace: bool = False,
 ) -> FunctionToolset[ConsoleDeps]:
     """Create a console toolset for file operations and shell execution.
 
@@ -275,6 +290,11 @@ def create_console_toolset(  # noqa: C901
             dependencies, debugging a failed command — and `"agent"` leaves it
             out, which is about 250 tokens a request an agent with a scratch
             workspace was paying for advice it could not use.
+        use_workspace: Operate on the run's Pydantic AI workspace,
+            `ctx.workspace`, instead of a backend: the one a workspace capability
+            such as `DockerWorkspace`, `SandboxdWorkspace` or the harness's
+            `E2BSandbox` supplied. Excludes `backend`. Needs the `workspaces`
+            extra.
 
     Example:
         ```python
@@ -295,6 +315,9 @@ def create_console_toolset(  # noqa: C901
         guarded = create_console_toolset(permissions=DEFAULT_RULESET)
         ```
     """
+    if use_workspace and backend is not None:
+        raise UserError("Pass `backend` or `use_workspace=True`, not both.")
+    workspace_sandbox = _workspace_sandbox_factory() if use_workspace else None
     overrides: Mapping[str, str | ToolText] = descriptions or {}
     unknown = sorted(set(overrides) - OVERRIDE_KEYS)
     if unknown:
@@ -330,7 +353,7 @@ def create_console_toolset(  # noqa: C901
         if backend is not None:
             return guarded_backend if guarded_backend is not None else backend
         return _guard.guarding(
-            ctx.deps.backend,
+            ctx.deps.backend if workspace_sandbox is None else workspace_sandbox(ctx.workspace),
             permissions,
             ask_callback=ask_callback,
             ask_fallback=ask_fallback,

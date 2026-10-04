@@ -111,11 +111,15 @@ class TestOperatorGuidance:
             "runtime",
             "tenant",
             "reuse",
+            "attach",
         }
         assert "{ runtime: el.newRuntime.value }" in PAGE
         assert "body.session_id = id" in PAGE
         assert "body.tenant = tenant" in PAGE
         assert "body.reuse = true" in PAGE
+        # Deliberately not offered: `attach` is for a client continuing its own
+        # earlier work, and someone opening a session by hand wants one either way.
+        assert "body.attach" not in PAGE
 
     def test_no_ceiling_is_offered_as_a_request_field(self):
         """A client naming its own memory would be a host takeover by another route."""

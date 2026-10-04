@@ -23,6 +23,11 @@ file content — a probe that staged a screenshot would happily treat
 `b"Error: not found"` as the image. `read` can afford a message because its
 result is text destined for a model either way.
 
+:class:`CommandRunner` is the one exception, and deliberately so: it serves a
+Pydantic AI workspace and `sandboxd`'s `/run`, whose callers are code that has to
+tell a dead sandbox from a command that failed, so it raises
+:class:`SandboxUnavailableError` instead of folding the outage into the output.
+
 Implementations are not expected to be defensive by hand at every call site: both
 :class:`~pydantic_ai_backends.BaseSandbox` and
 :class:`~pydantic_ai_backends.AsyncBaseSandbox` already honour this for every
@@ -35,10 +40,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
     from pydantic_ai_backends.types import (
         BackgroundHandle,
         BackgroundOutput,
         BackgroundProcessInfo,
+        CommandOutcome,
         EditResult,
         ExecuteResponse,
         FileInfo,
@@ -297,3 +305,50 @@ class AsyncBackgroundSandboxProtocol(AsyncSandboxProtocol, Protocol):
     async def kill_background(self, shell_id: str) -> bool: ...
     async def list_background(self) -> list[BackgroundProcessInfo]: ...
     async def kill_all_background(self) -> None: ...
+
+
+class SandboxUnavailableError(RuntimeError):
+    """The sandbox is gone or no longer running, so no command can reach it."""
+
+
+@runtime_checkable
+class CommandRunner(Protocol):
+    """Optional sandbox extension: commands under a workspace's failure contract.
+
+    `execute` folds every failure into its output so an agent's run survives it;
+    this raises instead, keeps stdout and stderr apart, and can be stopped from
+    elsewhere by the `run_id` its caller chose. Implemented by `DockerSandbox`,
+    and what both `sandboxd`'s `/run` and the Pydantic AI workspaces in
+    :mod:`pydantic_ai_backends.workspaces` are built on.
+    """
+
+    async def run_command(
+        self,
+        argv: Sequence[str],
+        *,
+        run_id: str,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        output_limit: int | None = None,
+    ) -> CommandOutcome:
+        """Run `argv` with stdin at EOF and wait for it.
+
+        Args:
+            argv: The program and its arguments, passed through literally.
+            run_id: Names the run, so :meth:`stop_command` can stop it.
+            env: Variables layered over the sandbox's environment.
+            timeout: Seconds before the command is stopped; none when `None`.
+            output_limit: Combined output bytes before it is stopped; the
+                implementation's default when `None`.
+
+        Raises:
+            SandboxUnavailableError: The sandbox is gone or not running.
+        """
+        ...
+
+    async def stop_command(self, run_id: str) -> None:
+        """Stop the command started under `run_id` and everything it started.
+
+        A run that already finished, or never started, has nothing to stop.
+        """
+        ...
