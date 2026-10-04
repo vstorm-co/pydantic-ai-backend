@@ -1,91 +1,42 @@
-"""File storage and sandbox backends for AI agents.
+"""Pydantic AI workspaces from self-hosted sandboxes, and tools that work in them.
 
-A unified interface for file storage and command execution across in-memory,
-local and containerised backends.
+A workspace is the environment an agent run works in, which every tool reaches
+through `ctx.workspace`. This library supplies workspaces Pydantic AI does not
+ship — a Docker container, a `sandboxd` session, a Kubernetes pod, a Daytona
+sandbox, a JSON document — and `ConsoleCapability`, file and shell tools that run
+in whichever workspace the run has.
 
-Basic usage:
-    ```python
-    from pydantic_ai_backends import LocalBackend, StateBackend
+Requires `pip install "pydantic-ai-backend[console]"`; each workspace names its
+own extra.
 
-    backend = StateBackend()
-    backend.write("/app.py", "print('hello')")
-    content = backend.read("/app.py")
+```python
+from pydantic_ai import Agent
 
-    backend = LocalBackend("/workspace")
-    result = backend.execute("python app.py")
-    ```
+from pydantic_ai_backends import ConsoleCapability, DockerWorkspace
 
-Console toolset for AI agents:
-    ```python
-    from dataclasses import dataclass
-
-    from pydantic_ai_backends import LocalBackend, create_console_toolset
-
-    @dataclass
-    class MyDeps:
-        backend: LocalBackend
-
-    # Provides: ls, read_file, write_file, edit_file, glob, grep, execute
-    toolset = create_console_toolset()
-    ```
-
-Docker sandbox (needs `pip install pydantic-ai-backend[docker]`):
-    ```python
-    from pydantic_ai_backends import DockerSandbox
-
-    sandbox = DockerSandbox(image="python:3.12-slim")
-    print(sandbox.execute("python -c 'print(1+1)'").output)  # "2"
-    ```
+agent = Agent(
+    "anthropic:claude-opus-5-5",
+    capabilities=[DockerWorkspace(image="python:3.12-slim"), ConsoleCapability()],
+)
+```
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pydantic_ai_backends.adapter import (
-    AsyncBackendAdapter,
-    AsyncBackgroundSandboxAdapter,
-    AsyncSandboxAdapter,
-    ensure_async,
-    is_async_backend,
-)
-from pydantic_ai_backends.backends.composite import AsyncCompositeBackend, CompositeBackend
-from pydantic_ai_backends.backends.local import LocalBackend
 from pydantic_ai_backends.backends.state import StateBackend
-from pydantic_ai_backends.protocol import (
-    AsyncBackendProtocol,
-    AsyncBackgroundSandboxProtocol,
-    AsyncSandboxProtocol,
-    BackendProtocol,
-    BackgroundSandboxProtocol,
-    CommandRunner,
-    SandboxProtocol,
-    SandboxUnavailableError,
-)
+from pydantic_ai_backends.protocol import CommandRunner, SandboxUnavailableError
 from pydantic_ai_backends.types import (
-    BackgroundHandle,
-    BackgroundOutput,
-    BackgroundProcessInfo,
     CommandOutcome,
-    EditResult,
-    ExecuteResponse,
     FileData,
     FileInfo,
-    GrepMatch,
     RuntimeConfig,
     SandboxUsage,
-    WriteResult,
 )
 
 if TYPE_CHECKING:
-    from pydantic_ai_backends.backends.base import AsyncBaseSandbox
-    from pydantic_ai_backends.backends.daytona import DaytonaSandbox
-    from pydantic_ai_backends.backends.docker import (
-        BUILTIN_RUNTIMES,
-        BaseSandbox,
-        DockerSandbox,
-        SessionManager,
-    )
+    from pydantic_ai_backends.backends.docker import BUILTIN_RUNTIMES, DockerSandbox, SessionManager
     from pydantic_ai_backends.backends.docker.runtimes import get_runtime
     from pydantic_ai_backends.backends.docker.session import SandboxFactory
     from pydantic_ai_backends.backends.kubernetes import KubernetesPodSandbox
@@ -116,7 +67,7 @@ if TYPE_CHECKING:
         PermissionRuleset,
         create_ruleset,
     )
-    from pydantic_ai_backends.remote import RemoteSandbox
+    from pydantic_ai_backends.remote import WorkspaceArchive, WorkspaceArchiveError
     from pydantic_ai_backends.toolsets.console import (
         DEFAULT_MAX_DOCUMENT_BYTES,
         DEFAULT_MAX_IMAGE_BYTES,
@@ -134,15 +85,38 @@ if TYPE_CHECKING:
         LS_DESCRIPTION,
         READ_FILE_DESCRIPTION,
         WRITE_FILE_DESCRIPTION,
-        ConsoleDeps,
         ConsoleToolset,
         EditFormat,
         create_console_toolset,
         get_console_system_prompt,
     )
     from pydantic_ai_backends.toolsets.descriptions import TOOL_TEXT, Profile, ToolText
+    from pydantic_ai_backends.workspaces import (
+        DaytonaWorkspace,
+        DaytonaWorkspaceBackend,
+        DockerWorkspace,
+        DockerWorkspaceBackend,
+        KubernetesWorkspace,
+        KubernetesWorkspaceBackend,
+        SandboxdWorkspace,
+        SandboxdWorkspaceBackend,
+        StateWorkspace,
+        StateWorkspaceBackend,
+    )
 
 _LAZY_MODULES: dict[str, tuple[str, ...]] = {
+    "pydantic_ai_backends.workspaces": (
+        "DaytonaWorkspace",
+        "DaytonaWorkspaceBackend",
+        "DockerWorkspace",
+        "DockerWorkspaceBackend",
+        "KubernetesWorkspace",
+        "KubernetesWorkspaceBackend",
+        "SandboxdWorkspace",
+        "SandboxdWorkspaceBackend",
+        "StateWorkspace",
+        "StateWorkspaceBackend",
+    ),
     "pydantic_ai_backends.hashline": (
         "apply_hashline_edit",
         "apply_hashline_edit_with_summary",
@@ -150,7 +124,6 @@ _LAZY_MODULES: dict[str, tuple[str, ...]] = {
         "line_hash",
     ),
     "pydantic_ai_backends.toolsets.console": (
-        "ConsoleDeps",
         "ConsoleToolset",
         "DEFAULT_MAX_DOCUMENT_BYTES",
         "DEFAULT_MAX_IMAGE_BYTES",
@@ -174,13 +147,11 @@ _LAZY_MODULES: dict[str, tuple[str, ...]] = {
     ),
     "pydantic_ai_backends.toolsets.descriptions": ("TOOL_TEXT", "Profile", "ToolText"),
     "pydantic_ai_backends.capability": ("ConsoleCapability",),
-    "pydantic_ai_backends.backends.base": ("AsyncBaseSandbox", "BaseSandbox"),
-    "pydantic_ai_backends.backends.daytona": ("DaytonaSandbox",),
     "pydantic_ai_backends.backends.docker.sandbox": ("DockerSandbox",),
     "pydantic_ai_backends.backends.docker.session": ("SandboxFactory", "SessionManager"),
     "pydantic_ai_backends.backends.docker.runtimes": ("BUILTIN_RUNTIMES", "get_runtime"),
     "pydantic_ai_backends.backends.kubernetes": ("KubernetesPodSandbox",),
-    "pydantic_ai_backends.remote.client": ("RemoteSandbox",),
+    "pydantic_ai_backends.remote.archive": ("WorkspaceArchive", "WorkspaceArchiveError"),
     "pydantic_ai_backends.permissions": (
         "AskCallback",
         "AskFallback",
@@ -204,68 +175,57 @@ _LAZY_MODULES: dict[str, tuple[str, ...]] = {
 }
 """Exports loaded on first use, grouped by the module that defines them.
 
-Importing these eagerly would pull in optional dependencies — docker, pypdf,
-httpx, pydantic-ai — that most callers do not have installed.
+Importing these eagerly would pull in optional dependencies — docker, kubernetes,
+daytona, httpx, pydantic-ai — that most callers do not have installed.
 """
 
 _LAZY_IMPORTS = {name: module for module, names in _LAZY_MODULES.items() for name in names}
 
-# Spelled out rather than derived from the two groups above: type checkers only
+# Spelled out rather than derived from the groups above: type checkers only
 # understand a literal `__all__`, and this is the library's public API reference.
 __all__ = [
-    "TOOL_TEXT",
-    "AskCallback",
-    "AskFallback",
-    "AsyncBackendAdapter",
-    "AsyncBackendProtocol",
-    "AsyncBackgroundSandboxAdapter",
-    "AsyncBackgroundSandboxProtocol",
-    "AsyncCompositeBackend",
-    "AsyncSandboxAdapter",
-    "AsyncSandboxProtocol",
     "BUILTIN_RUNTIMES",
-    "BackendProtocol",
-    "BackgroundHandle",
-    "BackgroundOutput",
-    "BackgroundProcessInfo",
-    "BackgroundSandboxProtocol",
-    "AsyncBaseSandbox",
-    "BaseSandbox",
-    "CommandOutcome",
-    "CommandRunner",
-    "CompositeBackend",
-    "ConsoleCapability",
-    "ConsoleDeps",
-    "ConsoleToolset",
-    "Profile",
-    "ToolText",
     "DEFAULT_MAX_DOCUMENT_BYTES",
     "DEFAULT_MAX_IMAGE_BYTES",
     "DEFAULT_RULESET",
     "DOCUMENT_EXTENSIONS",
     "DOCUMENT_MEDIA_TYPES",
-    "DaytonaSandbox",
-    "DockerSandbox",
     "EDIT_FILE_DESCRIPTION",
     "EXECUTE_DESCRIPTION",
-    "EditFormat",
-    "EditResult",
-    "ExecuteResponse",
-    "FileData",
-    "FileInfo",
     "GLOB_DESCRIPTION",
     "GREP_DESCRIPTION",
-    "GrepMatch",
     "HASHLINE_CONSOLE_PROMPT",
     "HASHLINE_EDIT_DESCRIPTION",
     "HASHLINE_READ_FILE_DESCRIPTION",
     "IMAGE_EXTENSIONS",
     "IMAGE_MEDIA_TYPES",
-    "KubernetesPodSandbox",
     "LS_DESCRIPTION",
-    "LocalBackend",
-    "OperationPermissions",
     "PERMISSIVE_RULESET",
+    "READONLY_RULESET",
+    "READ_FILE_DESCRIPTION",
+    "SECRETS_PATTERNS",
+    "STRICT_RULESET",
+    "SYSTEM_PATTERNS",
+    "TOOL_TEXT",
+    "WRITE_FILE_DESCRIPTION",
+    "AskCallback",
+    "AskFallback",
+    "CommandOutcome",
+    "CommandRunner",
+    "ConsoleCapability",
+    "ConsoleToolset",
+    "DaytonaWorkspace",
+    "DaytonaWorkspaceBackend",
+    "DockerSandbox",
+    "DockerWorkspace",
+    "DockerWorkspaceBackend",
+    "EditFormat",
+    "FileData",
+    "FileInfo",
+    "KubernetesPodSandbox",
+    "KubernetesWorkspace",
+    "KubernetesWorkspaceBackend",
+    "OperationPermissions",
     "PermissionAction",
     "PermissionAskError",
     "PermissionChecker",
@@ -274,27 +234,24 @@ __all__ = [
     "PermissionOperation",
     "PermissionRule",
     "PermissionRuleset",
-    "READONLY_RULESET",
-    "READ_FILE_DESCRIPTION",
-    "RemoteSandbox",
+    "Profile",
     "RuntimeConfig",
-    "SECRETS_PATTERNS",
-    "STRICT_RULESET",
-    "SYSTEM_PATTERNS",
     "SandboxFactory",
-    "SandboxProtocol",
     "SandboxUnavailableError",
     "SandboxUsage",
+    "SandboxdWorkspace",
+    "SandboxdWorkspaceBackend",
     "SessionManager",
     "StateBackend",
-    "WRITE_FILE_DESCRIPTION",
-    "WriteResult",
+    "StateWorkspace",
+    "StateWorkspaceBackend",
+    "ToolText",
+    "WorkspaceArchive",
+    "WorkspaceArchiveError",
     "apply_hashline_edit",
     "apply_hashline_edit_with_summary",
     "create_console_toolset",
     "create_ruleset",
-    "ensure_async",
-    "is_async_backend",
     "format_hashline_output",
     "get_console_system_prompt",
     "get_runtime",

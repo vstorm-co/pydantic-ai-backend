@@ -1,21 +1,21 @@
-"""Tests for the remote sandbox protocol, client and sandboxd service.
+"""Tests for the sandboxd service: sessions, `/run`, policy, the archive, the sweeps.
 
 The service is driven in-process through Starlette's `TestClient`, with a fake
-sandbox builder injected, so nothing here needs a Docker daemon. The same
-`TestClient` is handed to `RemoteSandbox` as its HTTP client, which makes the
-client/server pair genuinely end-to-end rather than mocked against each other.
+sandbox builder injected, so nothing here needs a Docker daemon. The workspace
+client is tested end to end against a running service in
+`tests/test_workspace_sandboxd.py`.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
+import shlex
 import sys
 import threading
 import time
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,41 +24,25 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from pydantic_ai_backends import StateBackend
-from pydantic_ai_backends.remote import RemoteSandbox, wire
-from pydantic_ai_backends.remote.client import TRANSPORT_SLACK_SECONDS
+from pydantic_ai_backends.remote import wire
 from pydantic_ai_backends.remote.server import (
     SandboxdConfig,
     SandboxRuntime,
     _session_volumes,
     create_app,
 )
-from pydantic_ai_backends.types import (
-    EditResult,
-    ExecuteResponse,
-    SandboxUsage,
-    WriteResult,
-)
+from pydantic_ai_backends.types import CommandOutcome, SandboxUsage
 
 SERVICE_TOKEN = "service-secret"
 
 
 class FakeSandbox:
-    """In-memory stand-in for a Docker sandbox.
-
-    Backed by `StateBackend` for the file operations so the tests exercise real
-    read/write/edit/glob/grep behaviour rather than canned responses. Raw bytes
-    are additionally kept verbatim in `_blobs`, because `StateBackend` stores
-    text lines and is not byte-exact — without that, a binary round trip would
-    fail on the fake rather than on the protocol under test.
-    """
+    """Stand-in for a Docker sandbox: its lifecycle, and commands it only records."""
 
     def __init__(self, session_id: str, runtime: Any) -> None:
         self._id = session_id
         self.runtime_entry = runtime
         self.image = runtime.image_label()
-        self._store = StateBackend()
-        self._blobs: dict[str, bytes] = {}
         self._last_activity = 1_000.0
         self._idle_timeout = 60
         self.alive = False
@@ -68,7 +52,10 @@ class FakeSandbox:
         # False models the base sandbox surface, whose `stop()` takes no
         # arguments — `_remove_sandbox` has to fall back for those.
         self.accepts_remove = True
-        self.commands: list[tuple[str, int | None]] = []
+        self.commands: list[tuple[str, float | None]] = []
+        self.stopped_runs: list[str] = []
+        self.exit_code = 0
+        self.run_error: Exception | None = None
         self.usage: SandboxUsage | None = None
         self.usage_calls = 0
         self.sample_delay = 0.0
@@ -117,55 +104,25 @@ class FakeSandbox:
             time.sleep(self.sample_delay)
         return self.usage
 
-    # operations ----------------------------------------------------------
-    def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
-        self._work()
-        self.commands.append((command, timeout))
-        return ExecuteResponse(output=f"ran {command}", exit_code=0, truncated=False)
-
-    def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
-        self._work()
-        return self._store.read(path, offset, limit)
-
-    def read_bytes(self, path: str) -> bytes:
-        self._work()
-        if path in self._blobs:
-            return self._blobs[path]
-        return self._store.read_bytes(path)
-
-    def write(self, path: str, content: str | bytes) -> WriteResult:
-        self._work()
-        raw = content if isinstance(content, bytes) else content.encode("utf-8")
-        self._blobs[path] = raw
-        return self._store.write(path, content)
-
-    def edit(
-        self, path: str, old_string: str, new_string: str, replace_all: bool = False
-    ) -> EditResult:
-        self._work()
-        return self._store.edit(path, old_string, new_string, replace_all)
-
-    def exists(self, path: str) -> bool:
-        self._work()
-        return self._store.exists(path)
-
-    def ls_info(self, path: str) -> list[Any]:
-        self._work()
-        return self._store.ls_info(path)
-
-    def glob_info(self, pattern: str, path: str = "/") -> list[Any]:
-        self._work()
-        return self._store.glob_info(pattern, path)
-
-    def grep_raw(
+    # commands ------------------------------------------------------------
+    async def run_command(
         self,
-        pattern: str,
-        path: str | None = None,
-        glob: str | None = None,
-        ignore_hidden: bool = True,
-    ) -> Any:
+        argv: Sequence[str],
+        *,
+        run_id: str,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        output_limit: int | None = None,
+    ) -> CommandOutcome:
         self._work()
-        return self._store.grep_raw(pattern, path, glob, ignore_hidden)
+        if self.run_error is not None:
+            raise self.run_error
+        command = shlex.join(argv)
+        self.commands.append((command, timeout))
+        return CommandOutcome(stdout=f"ran {command}", stderr="", exit_code=self.exit_code)
+
+    async def stop_command(self, run_id: str) -> None:
+        self.stopped_runs.append(run_id)
 
 
 class Harness:
@@ -228,6 +185,11 @@ async def _wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bo
     return predicate()
 
 
+def _run(command: str) -> dict[str, Any]:
+    """A `/run` body for a shell command, under a fixed run id."""
+    return {"argv": ["sh", "-c", command], "run_id": "0" * 32}
+
+
 def _open_session(client: TestClient, **body: Any) -> tuple[str, str]:
     """Open a session, returning `(session_id, session_token)`."""
     response = client.post("/sessions", json=body, headers=_service_headers())
@@ -283,7 +245,7 @@ class TestIndex:
 
         assert "/healthz" in body.endpoints
         assert "/sessions" in body.endpoints
-        assert "/sessions/{session_id}/exec" in body.endpoints
+        assert "/sessions/{session_id}/run" in body.endpoints
         assert "/" not in body.endpoints
 
     def test_root_needs_no_token(self, client: TestClient):
@@ -357,7 +319,7 @@ class TestAuthentication:
     def test_operations_require_a_token(self, client: TestClient):
         session_id, _ = _open_session(client)
 
-        response = client.post(f"/sessions/{session_id}/exec", json={"command": "echo hi"})
+        response = client.post(f"/sessions/{session_id}/run", json=_run("echo hi"))
 
         assert response.status_code == 401
 
@@ -366,8 +328,8 @@ class TestAuthentication:
         second, _ = _open_session(client, session_id="tenant-b")
 
         response = client.post(
-            f"/sessions/{second}/exec",
-            json={"command": "cat /etc/shadow"},
+            f"/sessions/{second}/run",
+            json=_run("cat /etc/shadow"),
             headers={wire.TOKEN_HEADER: first_token},
         )
 
@@ -378,8 +340,8 @@ class TestAuthentication:
         session_id, _ = _open_session(client, session_id="tenant-a")
 
         response = client.post(
-            f"/sessions/{session_id}/exec",
-            json={"command": "echo hi"},
+            f"/sessions/{session_id}/run",
+            json=_run("echo hi"),
             headers=_service_headers(),
         )
 
@@ -533,313 +495,6 @@ class TestSessionLifecycle:
         assert harness.built[second].stopped == 1
 
 
-class TestOperationsOverHttp:
-    """The file and command endpoints, driven directly."""
-
-    def test_exec_is_capped_by_the_service_timeout(self, harness: Harness):
-        harness = Harness(execute_timeout=30)
-        with harness.client() as client:
-            session_id, _ = _open_session(client)
-
-            client.post(
-                f"/sessions/{session_id}/exec",
-                json={"command": "sleep 600", "timeout_seconds": 9999},
-                headers=_service_headers(),
-            )
-
-            assert harness.built[session_id].commands == [("sleep 600", 30)]
-
-    def test_exec_without_a_timeout_uses_the_service_ceiling(self, harness: Harness):
-        harness = Harness(execute_timeout=45)
-        with harness.client() as client:
-            session_id, _ = _open_session(client)
-
-            client.post(
-                f"/sessions/{session_id}/exec",
-                json={"command": "echo hi"},
-                headers=_service_headers(),
-            )
-
-            assert harness.built[session_id].commands == [("echo hi", 45)]
-
-    def test_exec_keeps_a_shorter_client_timeout(self, harness: Harness):
-        harness = Harness(execute_timeout=300)
-        with harness.client() as client:
-            session_id, _ = _open_session(client)
-
-            client.post(
-                f"/sessions/{session_id}/exec",
-                json={"command": "echo hi", "timeout_seconds": 5},
-                headers=_service_headers(),
-            )
-
-            assert harness.built[session_id].commands == [("echo hi", 5)]
-
-    def test_write_rejects_content_that_is_not_base64(self, client: TestClient):
-        session_id, _ = _open_session(client)
-
-        response = client.post(
-            f"/sessions/{session_id}/write",
-            json={"path": "/f.txt", "content_b64": "not base64!!"},
-            headers=_service_headers(),
-        )
-
-        assert response.status_code == 400
-        assert "base64" in response.json()["detail"]
-
-    def test_grep_reports_a_search_error(self, client: TestClient, harness: Harness):
-        session_id, _ = _open_session(client)
-        harness.built[session_id].grep_raw = lambda *a, **k: "Error: bad pattern"  # type: ignore[method-assign]
-
-        response = client.post(
-            f"/sessions/{session_id}/grep",
-            json={"pattern": "["},
-            headers=_service_headers(),
-        )
-
-        body = wire.GrepResponse.model_validate(response.json())
-        assert body.error == "Error: bad pattern"
-        assert body.matches == []
-
-    def test_usage_is_absent_for_a_sandbox_that_cannot_report_it(self):
-        """A backend with no `resource_usage` simply reports nothing."""
-        from pydantic_ai_backends.remote.server import _usage_of
-
-        class Bare:
-            pass
-
-        assert _usage_of(Bare()) is None
-
-    def test_usage_is_absent_when_the_sampler_returns_junk(
-        self, client: TestClient, harness: Harness
-    ):
-        session_id, _ = _open_session(client)
-        harness.built[session_id].resource_usage = lambda: "not usage"  # type: ignore[method-assign]
-
-        response = client.get(
-            f"/sessions/{session_id}", params={"usage": "true"}, headers=_service_headers()
-        )
-
-        assert wire.SessionInfo.model_validate(response.json()).usage is None
-
-
-class TestRemoteSandboxAgainstService:
-    """End-to-end: the real client driving the real service."""
-
-    @pytest.fixture
-    def sandbox(self, client: TestClient):
-        remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="e2e", client=client)
-        remote.start()
-        yield remote
-        remote.stop()
-
-    def test_start_is_idempotent(self, sandbox: RemoteSandbox, harness: Harness):
-        sandbox.start()
-
-        assert harness.built["e2e"].started == 1
-
-    def test_execute_round_trip(self, sandbox: RemoteSandbox):
-        result = sandbox.execute("echo hi", timeout=5)
-
-        assert result.output == "ran echo hi"
-        assert result.exit_code == 0
-        assert result.truncated is False
-
-    def test_write_read_and_edit(self, sandbox: RemoteSandbox):
-        assert sandbox.write("/app.py", "value = 'old'\n").error is None
-        assert "value = 'old'" in sandbox.read("/app.py")
-
-        edited = sandbox.edit("/app.py", "old", "new")
-        assert edited.error is None
-        assert edited.occurrences == 1
-        assert "value = 'new'" in sandbox.read("/app.py")
-
-    def test_write_and_read_bytes_survives_non_utf8(self, sandbox: RemoteSandbox):
-        payload = bytes(range(256))
-
-        assert sandbox.write("/blob.bin", payload).error is None
-        assert sandbox.read_bytes("/blob.bin") == payload
-
-    def test_exists(self, sandbox: RemoteSandbox):
-        sandbox.write("/there.txt", "x")
-
-        assert sandbox.exists("/there.txt") is True
-        assert sandbox.exists("/missing.txt") is False
-
-    def test_ls_and_glob(self, sandbox: RemoteSandbox):
-        sandbox.write("/pkg/a.py", "a")
-        sandbox.write("/pkg/b.txt", "b")
-
-        names = {entry["name"] for entry in sandbox.ls_info("/pkg")}
-        assert names == {"a.py", "b.txt"}
-
-        matched = sandbox.glob_info("**/*.py", "/")
-        assert [entry["path"] for entry in matched] == ["/pkg/a.py"]
-
-    def test_grep_returns_matches(self, sandbox: RemoteSandbox):
-        sandbox.write("/notes.txt", "alpha\nbeta\n")
-
-        found = sandbox.grep_raw("beta")
-
-        assert isinstance(found, list)
-        assert found[0]["line_number"] == 2
-        assert found[0]["line"] == "beta"
-
-    def test_is_alive_tracks_the_remote_session(self, sandbox: RemoteSandbox, harness: Harness):
-        assert sandbox.is_alive() is True
-
-        harness.built["e2e"].alive = False
-        assert sandbox.is_alive() is False
-
-    def test_resource_usage_round_trip(self, sandbox: RemoteSandbox, harness: Harness):
-        harness.built["e2e"].usage = SandboxUsage(memory_bytes=2048, cpu_percent=3.5)
-
-        usage = sandbox.resource_usage()
-
-        assert usage is not None
-        assert usage.memory_bytes == 2048
-        assert usage.cpu_percent == 3.5
-
-    def test_resource_usage_is_none_when_unavailable(
-        self, sandbox: RemoteSandbox, harness: Harness
-    ):
-        harness.built["e2e"].usage = None
-
-        assert sandbox.resource_usage() is None
-
-    def test_stop_deletes_the_remote_session(self, client: TestClient, harness: Harness):
-        remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="tostop", client=client)
-        remote.start()
-        remote.stop()
-
-        assert harness.built["tostop"].stopped == 1
-        assert client.get("/sessions/tostop", headers=_service_headers()).status_code == 404
-
-    def test_stop_before_start_is_a_no_op(self, client: TestClient):
-        RemoteSandbox(token=SERVICE_TOKEN, client=client).stop()
-
-    def test_session_manager_can_drive_remote_sandboxes(self, client: TestClient, harness: Harness):
-        """RemoteSandbox is a drop-in for SessionManager's factory contract."""
-        from pydantic_ai_backends import SessionManager
-
-        manager = SessionManager(
-            sandbox_factory=lambda sid: RemoteSandbox(
-                token=SERVICE_TOKEN, session_id=sid, client=client
-            )
-        )
-
-        async def scenario() -> str:
-            sandbox = await manager.get_or_create("via-manager")
-            output = sandbox.execute("echo managed").output
-            await manager.shutdown()
-            return str(output)
-
-        import asyncio
-
-        assert asyncio.run(scenario()) == "ran echo managed"
-        assert harness.built["via-manager"].stopped == 1
-
-
-class TestRemoteSandboxFailureHandling:
-    """A broken service must degrade, not raise, on operations."""
-
-    @pytest.fixture
-    def offline(self, client: TestClient):
-        """A started sandbox whose session the service has since forgotten."""
-        remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="gone", client=client)
-        remote.start()
-        client.delete("/sessions/gone", headers=_service_headers())
-        return remote
-
-    def test_operations_degrade_on_a_missing_session(self, offline: RemoteSandbox):
-        assert offline.read("/f.txt").startswith("Error:")
-        assert offline.read_bytes("/f.txt") == b""
-        assert offline.write("/f.txt", "x").error is not None
-        assert offline.edit("/f.txt", "a", "b").error is not None
-        assert offline.exists("/f.txt") is False
-        assert offline.ls_info("/") == []
-        assert offline.glob_info("*.py") == []
-        assert offline.grep_raw("x") == "Error: could not search for 'x'"
-        assert offline.execute("echo hi").exit_code == 1
-        assert offline.is_alive() is False
-        assert offline.resource_usage() is None
-
-    def test_start_raises_when_the_service_refuses(self, client: TestClient):
-        remote = RemoteSandbox(token="wrong-token", client=client)
-
-        with pytest.raises(RuntimeError, match="refused to open a session"):
-            remote.start()
-
-    def test_start_raises_when_the_service_is_unreachable(self):
-        class Dead:
-            def post(self, *args: Any, **kwargs: Any) -> Any:
-                raise OSError("connection refused")
-
-        remote = RemoteSandbox(client=Dead())  # type: ignore[arg-type]
-
-        with pytest.raises(RuntimeError, match="Could not reach the sandbox service"):
-            remote.start()
-
-    def test_transport_failures_are_swallowed_by_operations(self):
-        class Dead:
-            def post(self, *args: Any, **kwargs: Any) -> Any:
-                raise OSError("connection refused")
-
-            def get(self, *args: Any, **kwargs: Any) -> Any:
-                raise OSError("connection refused")
-
-            def delete(self, *args: Any, **kwargs: Any) -> Any:
-                raise OSError("connection refused")
-
-        remote = RemoteSandbox(client=Dead())  # type: ignore[arg-type]
-
-        assert remote.execute("echo hi").exit_code == 1
-        assert remote.read("/f.txt").startswith("Error:")
-        assert remote.is_alive() is False
-        assert remote.resource_usage() is None
-        remote.stop()
-
-    def test_undecodable_read_bytes_payload_yields_empty(self, client: TestClient):
-        remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="bad64", client=client)
-        remote.start()
-
-        class Corrupt:
-            status_code = 200
-
-            @staticmethod
-            def json() -> dict[str, str]:
-                return {"content_b64": "!!!not base64!!!"}
-
-        remote._post = lambda *a, **k: Corrupt()  # type: ignore[method-assign]
-
-        assert remote.read_bytes("/f.txt") == b""
-
-    def test_owned_client_is_built_and_closed(self):
-        """Without an injected client, RemoteSandbox owns an httpx client."""
-        remote = RemoteSandbox("http://localhost:9/", token="t")
-
-        assert remote._owns_client is True
-        remote.stop()
-        assert remote._http.is_closed
-
-
-class TestRemoteSandboxConstruction:
-    """Client construction details that do not need a service."""
-
-    def test_generated_session_id_is_used(self):
-        remote = RemoteSandbox(client=object())  # type: ignore[arg-type]
-
-        assert remote.session_id.startswith("remote-")
-        assert remote.session_id == remote.id
-
-    def test_base_url_trailing_slash_is_trimmed(self):
-        remote = RemoteSandbox("http://example.test:8080/", token="t")
-        try:
-            assert str(remote._http.base_url) == "http://example.test:8080"
-        finally:
-            remote.stop()
-
-
 class TestWireModels:
     """Protocol-level details worth pinning."""
 
@@ -857,10 +512,13 @@ class TestWireModels:
         with pytest.raises(ValidationError):
             wire.CreateSessionRequest(session_id="../escape")
 
-    def test_write_request_carries_base64(self):
-        body = wire.WriteRequest(path="/f", content_b64=base64.b64encode(b"\x00\xff").decode())
-
-        assert base64.b64decode(body.content_b64) == b"\x00\xff"
+    def test_a_run_request_needs_a_program_and_a_hex_run_id(self):
+        with pytest.raises(ValueError):
+            wire.RunRequest(argv=[], run_id="0" * 32)
+        with pytest.raises(ValueError):
+            wire.RunRequest(argv=["true"], run_id="../../etc")
+        with pytest.raises(ValueError):
+            wire.RunRequest(argv=["true"], run_id="0" * 32, timeout_seconds=0)
 
 
 class TestServiceInternals:
@@ -894,7 +552,6 @@ class TestServiceInternals:
         assert sandbox._cpus == 0.5
         assert sandbox._pids_limit == 64
         assert sandbox._idle_timeout == 120
-        assert sandbox._max_read_bytes == 4096
 
     async def test_shutdown_without_startup_is_safe(self):
         """`shutdown` runs even if the lifespan never created a pool."""
@@ -939,8 +596,8 @@ class TestServiceInternals:
         harness.built[session_id].alive = False
 
         response = client.post(
-            f"/sessions/{session_id}/exec",
-            json={"command": "echo hi"},
+            f"/sessions/{session_id}/run",
+            json=_run("echo hi"),
             headers=_service_headers(),
         )
 
@@ -968,36 +625,6 @@ class TestServiceInternals:
         import asyncio
 
         assert asyncio.run(scenario()) == 404
-
-
-class TestClientGrepParsing:
-    """The grep response has two shapes; both are exercised end to end."""
-
-    def test_matches_are_mapped_to_grep_match_rows(self, client: TestClient):
-        remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="grepper", client=client)
-        remote.start()
-        try:
-            remote.write("/a.txt", "one\ntwo\nthree\n")
-            found = remote.grep_raw("t")
-
-            assert isinstance(found, list)
-            assert [row["line"] for row in found] == ["two", "three"]
-            assert all(row["path"] == "/a.txt" for row in found)
-        finally:
-            remote.stop()
-
-    def test_client_surfaces_a_server_side_grep_error(self, client: TestClient, harness: Harness):
-        """`grep_raw`'s string branch has to survive the round trip."""
-        remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="greperr", client=client)
-        remote.start()
-        try:
-            harness.built["greperr"].grep_raw = (  # type: ignore[method-assign]
-                lambda *a, **k: "Error: unterminated character class"
-            )
-
-            assert remote.grep_raw("[") == "Error: unterminated character class"
-        finally:
-            remote.stop()
 
 
 class TestServicePolicy:
@@ -1074,45 +701,40 @@ class TestSessionActivity:
         headers = _service_headers()
         base = f"/sessions/{session_id}"
 
-        client.post(
-            f"{base}/write", json={"path": "/a.txt", "content_b64": "aGk="}, headers=headers
-        )
-        client.post(f"{base}/exec", json={"command": "echo hi"}, headers=headers)
-        client.post(f"{base}/ls", json={"path": "/"}, headers=headers)
+        for command in ("printf a", "echo hi", "ls /"):
+            client.post(f"{base}/run", json=_run(command), headers=headers)
 
         log = self._events(client, session_id)
 
-        assert [event.op for event in log.events] == ["write", "exec", "ls"]
+        assert [event.op for event in log.events] == ["run", "run", "run"]
+        assert [event.target for event in log.events] == [
+            "sh -c 'printf a'",
+            "sh -c 'echo hi'",
+            "sh -c 'ls /'",
+        ]
         assert [event.seq for event in log.events] == [1, 2, 3]
         assert log.latest_seq == 3
         assert all(event.ok for event in log.events)
         assert all(event.duration_ms >= 0 for event in log.events)
 
-    def test_the_log_records_targets_and_outcomes_not_payloads(self, client: TestClient):
-        """An audit trail that stored contents would be a data leak."""
+    def test_the_log_records_the_command_and_its_outcome_not_its_output(self, client: TestClient):
+        """An audit trail that stored output would be a data leak."""
         session_id, _ = _open_session(client)
-        secret = base64.b64encode(b"super-secret-content").decode()
-        client.post(
-            f"/sessions/{session_id}/write",
-            json={"path": "/secrets.txt", "content_b64": secret},
-            headers=_service_headers(),
-        )
+        client.post(f"/sessions/{session_id}/run", json=_run("cat key"), headers=_service_headers())
 
         event = self._events(client, session_id).events[0]
 
-        assert event.target == "/secrets.txt"
-        assert event.detail == "20 bytes"
-        assert "super-secret" not in event.model_dump_json()
+        assert event.target == "sh -c 'cat key'"
+        assert event.detail == "exit 0"
+        assert "ran" not in event.model_dump_json()
 
     def test_a_failing_operation_is_recorded_as_not_ok(self, client: TestClient, harness: Harness):
         session_id, _ = _open_session(client)
-        harness.built[session_id].execute = lambda command, timeout=None: ExecuteResponse(
-            output="boom", exit_code=1
-        )
+        harness.built[session_id].exit_code = 1
 
         client.post(
-            f"/sessions/{session_id}/exec",
-            json={"command": "false"},
+            f"/sessions/{session_id}/run",
+            json=_run("false"),
             headers=_service_headers(),
         )
 
@@ -1124,31 +746,28 @@ class TestSessionActivity:
         """The case an operator most wants to see must not be the one that is lost."""
         session_id, _ = _open_session(client)
 
-        def explode(command, timeout=None):
-            raise RuntimeError("daemon vanished")
-
-        harness.built[session_id].execute = explode
+        harness.built[session_id].run_error = RuntimeError("daemon vanished")
 
         # TestClient re-raises server exceptions rather than surfacing the 500,
         # so the point here is that the entry survives the failure either way.
         with pytest.raises(RuntimeError, match="daemon vanished"):
             client.post(
-                f"/sessions/{session_id}/exec",
-                json={"command": "boom"},
+                f"/sessions/{session_id}/run",
+                json=_run("boom"),
                 headers=_service_headers(),
             )
 
         event = self._events(client, session_id).events[0]
-        assert event.op == "exec"
-        assert event.target == "boom"
+        assert event.op == "run"
+        assert event.target == "sh -c boom"
         assert event.ok is False
 
     def test_after_returns_only_newer_entries(self, client: TestClient):
         session_id, _ = _open_session(client)
         for index in range(3):
             client.post(
-                f"/sessions/{session_id}/exists",
-                json={"path": f"/f{index}"},
+                f"/sessions/{session_id}/run",
+                json=_run(f"test -f f{index}"),
                 headers=_service_headers(),
             )
 
@@ -1160,8 +779,8 @@ class TestSessionActivity:
     def test_long_targets_are_truncated(self, client: TestClient):
         session_id, _ = _open_session(client)
         client.post(
-            f"/sessions/{session_id}/exec",
-            json={"command": "echo " + "x" * 500},
+            f"/sessions/{session_id}/run",
+            json=_run("echo " + "x" * 500),
             headers=_service_headers(),
         )
 
@@ -1176,7 +795,7 @@ class TestSessionActivity:
         session_id, _ = _open_session(client)
         service = harness.app.state.service
         for _ in range(_EVENT_HISTORY + 25):
-            with service.observe(session_id, "exec", "noop") as outcome:
+            with service.observe(session_id, "run", "noop") as outcome:
                 outcome.ok = True
 
         log = self._events(client, session_id)
@@ -1205,7 +824,7 @@ class TestSessionActivity:
             service = harness.app.state.service
             client.delete("/sessions/doomed", headers=_service_headers())
 
-            with service.observe("doomed", "exec", "after the fact") as outcome:
+            with service.observe("doomed", "run", "after the fact") as outcome:
                 outcome.ok = True
 
             assert (
@@ -1244,22 +863,21 @@ class TestSessionReuse:
             assert attached.token == token
             assert harness.built[session_id].started == 1
 
-    def test_reuse_sees_the_files_the_first_run_wrote(self, client: TestClient):
-        first = RemoteSandbox(token=SERVICE_TOKEN, session_id="conv-2", client=client)
-        first.start()
-        first.write("/notes.txt", "from the first run")
+    def test_reuse_reaches_the_sandbox_the_first_run_used(
+        self, client: TestClient, harness: Harness
+    ):
+        _open_session(client, session_id="conv-2", reuse=True)
+        first = harness.built["conv-2"]
 
-        second = RemoteSandbox(token=SERVICE_TOKEN, session_id="conv-2", reuse=True, client=client)
-        second.start()
+        _open_session(client, session_id="conv-2", reuse=True)
 
-        assert second.read_bytes("/notes.txt") == b"from the first run"
+        assert harness.built["conv-2"] is first
+        assert first.started == 1
 
-    def test_reuse_without_an_open_session_creates_one(self, client: TestClient):
-        sandbox = RemoteSandbox(token=SERVICE_TOKEN, session_id="conv-3", reuse=True, client=client)
+    def test_reuse_without_an_open_session_creates_one(self, client: TestClient, harness: Harness):
+        _open_session(client, session_id="conv-3", reuse=True)
 
-        sandbox.start()
-
-        assert sandbox.is_alive() is True
+        assert harness.built["conv-3"].alive is True
 
     def test_attaching_with_a_different_runtime_is_refused(self, client: TestClient):
         """Honouring it would replace a live sandbox and drop its files."""
@@ -1652,59 +1270,6 @@ class TestSweepLoop:
         assert "Sweep failed" in caplog.text
 
 
-class TestLazySessions:
-    """A sandbox nobody uses must not cost a container."""
-
-    def test_constructing_one_opens_nothing(self, harness: Harness):
-        with harness.client() as client:
-            RemoteSandbox(token=SERVICE_TOKEN, session_id="unused", client=client)
-
-            assert harness.built == {}
-
-    def test_the_first_operation_opens_the_session(self, harness: Harness):
-        with harness.client() as client:
-            sandbox = RemoteSandbox(token=SERVICE_TOKEN, session_id="lazy", client=client)
-
-            sandbox.write("/notes.txt", "hello")
-
-            assert harness.built["lazy"].started == 1
-
-    def test_the_session_is_opened_once(self, harness: Harness):
-        with harness.client() as client:
-            sandbox = RemoteSandbox(token=SERVICE_TOKEN, session_id="lazy", client=client)
-
-            sandbox.write("/a.txt", "1")
-            sandbox.write("/b.txt", "2")
-            sandbox.read("/a.txt")
-
-            assert harness.built["lazy"].started == 1
-
-    def test_an_explicit_start_still_pre_warms(self, harness: Harness):
-        with harness.client() as client:
-            sandbox = RemoteSandbox(token=SERVICE_TOKEN, session_id="warm", client=client)
-
-            sandbox.start()
-
-            assert harness.built["warm"].started == 1
-
-    def test_a_probe_does_not_open_a_session(self, harness: Harness):
-        """`is_alive` asks about a session; it must not create one."""
-        with harness.client() as client:
-            sandbox = RemoteSandbox(token=SERVICE_TOKEN, session_id="probed", client=client)
-
-            assert sandbox.is_alive() is False
-            assert harness.built == {}
-
-    def test_operations_degrade_when_the_session_cannot_be_opened(self, harness: Harness):
-        harness.next_start_error = RuntimeError("no daemon")
-        with harness.client() as client:
-            sandbox = RemoteSandbox(token=SERVICE_TOKEN, session_id="doomed", client=client)
-
-            assert sandbox.read_bytes("/x") == b""
-            assert sandbox.ls_info("/") == []
-            assert sandbox.execute("echo hi").exit_code == 1
-
-
 class TestWorkspaceArchiveRoutes:
     """Listing and reading a session's files with no sandbox running."""
 
@@ -2026,54 +1591,6 @@ class TestWorkspaceArchiveClient:
             assert archive._owns_client is True
         finally:
             archive.close()
-
-
-class _RaisingHttp:
-    """An HTTP client whose every request fails at the transport."""
-
-    def post(self, *args: Any, **kwargs: Any) -> Any:
-        raise OSError("connection reset")
-
-
-class TestLazySessionInternals:
-    """The guard that keeps two threads from opening one session twice."""
-
-    def test_only_one_thread_opens_the_session(self):
-        import threading
-
-        sandbox = RemoteSandbox(token="t", client=_RaisingHttp())
-        entered = threading.Event()
-        proceed = threading.Event()
-        opens: list[int] = []
-
-        def slow_open() -> None:
-            opens.append(1)
-            entered.set()
-            proceed.wait(2)
-            sandbox._started = True
-
-        sandbox.start = slow_open  # type: ignore[method-assign]
-
-        first = threading.Thread(target=sandbox._ensure_session)
-        first.start()
-        assert entered.wait(2)
-
-        # The first thread holds the lock inside start(); this one must wait and
-        # then find the session already open rather than opening a second.
-        second = threading.Thread(target=sandbox._ensure_session)
-        second.start()
-        proceed.set()
-        first.join(2)
-        second.join(2)
-
-        assert opens == [1]
-
-    def test_a_transport_failure_mid_operation_degrades(self):
-        sandbox = RemoteSandbox(token="t", client=_RaisingHttp())
-        sandbox._started = True
-
-        assert sandbox.read_bytes("/x") == b""
-        assert sandbox.ls_info("/") == []
 
 
 class TestSandboxRuntimeEntries:
@@ -2784,8 +2301,8 @@ class TestHibernation:
             await service.hibernate("asleep")
 
             response = client.post(
-                "/sessions/asleep/exec",
-                json={"command": "echo hi"},
+                "/sessions/asleep/run",
+                json=_run("echo hi"),
                 headers={wire.TOKEN_HEADER: token},
             )
 
@@ -2822,8 +2339,8 @@ class TestHibernation:
             harness.built["busy"]._last_activity = time.time()
 
             response = client.post(
-                "/sessions/asleep/exec",
-                json={"command": "echo hi"},
+                "/sessions/asleep/run",
+                json=_run("echo hi"),
                 headers={wire.TOKEN_HEADER: token},
             )
 
@@ -3238,75 +2755,6 @@ class TestContainerSweep:
             assert harness.app.state.service._sweep_task is not None
 
 
-class _Proxy:
-    """A gateway in front of the service that answers 200 with the wrong body.
-
-    Models the realistic misconfiguration: an auth proxy or captive portal
-    intercepting the request and returning its own HTML page with a success
-    status. `json()` raising is what httpx does with such a body.
-    """
-
-    def __init__(self, payload: Any = None) -> None:
-        self._payload = payload
-
-    def _answer(self) -> Any:
-        payload = self._payload
-
-        class Response:
-            status_code = 200
-
-            @staticmethod
-            def json() -> Any:
-                if payload is None:
-                    raise ValueError("Expecting value: line 1 column 1 (char 0)")
-                return payload
-
-        return Response()
-
-    def post(self, *args: Any, **kwargs: Any) -> Any:
-        return self._answer()
-
-    def get(self, *args: Any, **kwargs: Any) -> Any:
-        return self._answer()
-
-    def delete(self, *args: Any, **kwargs: Any) -> Any:
-        return self._answer()
-
-
-class TestMalformedSuccessResponses:
-    """A 200 carrying something else is a failed operation, not an exception."""
-
-    def test_start_explains_a_body_that_is_not_a_session(self):
-        remote = RemoteSandbox(client=_Proxy())  # type: ignore[arg-type]
-
-        with pytest.raises(RuntimeError, match="not a\n?\\s*session"):
-            remote.start()
-
-    def test_operations_degrade_rather_than_raise(self, client: TestClient):
-        """Raising here would end the agent run that made the tool call."""
-        remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="proxied", client=client)
-        remote.start()
-        remote._http = _Proxy()  # type: ignore[assignment]
-
-        assert remote.execute("echo hi").exit_code == 1
-        assert remote.read("/f.txt").startswith("Error:")
-        assert remote.read_bytes("/f.txt") == b""
-        assert remote.write("/f.txt", "x").error is not None
-        assert remote.edit("/f.txt", "a", "b").error is not None
-        assert remote.exists("/f.txt") is False
-        assert remote.grep_raw("x").startswith("Error:")
-        assert remote.is_alive() is False
-        assert remote.resource_usage() is None
-
-    def test_a_listing_body_that_is_not_entries_yields_no_rows(self, client: TestClient):
-        remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="badrows", client=client)
-        remote.start()
-        remote._http = _Proxy(payload={"detail": "not a listing"})  # type: ignore[assignment]
-
-        assert remote.ls_info("/") == []
-        assert remote.glob_info("*.py") == []
-
-
 class TestMalformedTokens:
     """A token the comparison cannot even look at must be a 401, not a 500."""
 
@@ -3320,8 +2768,8 @@ class TestMalformedTokens:
         _open_session(client, session_id="guarded")
 
         response = client.post(
-            "/sessions/guarded/exists",
-            json={"path": "/f.txt"},
+            "/sessions/guarded/run",
+            json=_run("true"),
             headers={b"x-sandbox-token": b"\xe9"},
         )
 
@@ -3496,11 +2944,9 @@ class TestReadRequestBounds:
         with pytest.raises(ValueError):
             wire.ReadRequest(path="/f.txt", **{field: value})
 
-    def test_a_negative_offset_is_refused_by_the_route(self, client: TestClient):
-        _open_session(client, session_id="slicing")
-
+    def test_a_negative_offset_is_refused_by_the_route(self, client: TestClient, tmp_path):
         response = client.post(
-            "/sessions/slicing/read",
+            "/workspaces/slicing/read",
             json={"path": "/f.txt", "offset": -1},
             headers=_service_headers(),
         )
@@ -3548,58 +2994,6 @@ class TestDanglingSymlinks:
             assert response.status_code == 200, response.text
             rows = [wire.FileEntry.model_validate(row) for row in response.json()]
             assert [row.name for row in rows] == ["app.py"]
-
-
-class TestReuseAfterStop:
-    """A stopped sandbox behaves like `DockerSandbox`: usable again."""
-
-    def test_an_owned_client_is_rebuilt_on_the_next_start(self):
-        """Otherwise stop() poisoned the object and every later call lied."""
-        remote = RemoteSandbox("http://localhost:9/", token="t")
-        first = remote._http
-
-        remote.stop()
-        assert first.is_closed
-
-        # Port 9 refuses, so reaching the transport at all is the evidence. Left
-        # unrebuilt, httpx raises "Cannot send a request, as the client has been
-        # closed" instead — the silent lie this fixes.
-        with pytest.raises(RuntimeError) as caught:
-            remote.start()
-
-        assert "Could not reach" in str(caught.value)
-        assert "has been closed" not in str(caught.value)
-        assert remote._http is not first
-        assert remote._http.is_closed is False
-        remote.stop()
-
-    def test_a_supplied_client_is_left_alone(self, client: TestClient):
-        """The caller owns it, so stop() must not close it — nor reopen a session."""
-        remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="borrowed", client=client)
-        remote.start()
-
-        remote.stop()
-
-        assert remote._owns_client is False
-        # Still usable, because the client was never closed.
-        remote.start()
-        assert remote.exists("/nope.txt") is False
-        remote.stop()
-
-    def test_a_second_session_can_be_opened_after_stopping(self, harness: Harness):
-        with harness.client() as running:
-            remote = RemoteSandbox(token=SERVICE_TOKEN, session_id="cycled", client=running)
-            remote.start()
-            remote.write("first.txt", "one")
-            first_sandbox = harness.built["cycled"]
-            remote.stop()
-
-            remote.start()
-            # A genuinely new sandbox, and none of the first one's files.
-            assert harness.built["cycled"] is not first_sandbox
-            assert remote.exists("/workspace/first.txt") is False
-
-        assert first_sandbox.stopped == 1
 
 
 class TestDashboardIsReadOnce:
@@ -3671,166 +3065,6 @@ class TestOciRuntimeSelection:
     def test_it_defaults_to_the_daemon_choice(self):
         """Naming a runtime the host has not registered turns sessions into 502s."""
         assert SandboxdConfig(token=SERVICE_TOKEN).oci_runtime is None
-
-
-class AsyncFakeSandbox:
-    """A natively async sandbox handed to the service as its builder."""
-
-    def __init__(self, session_id: str, runtime: Any) -> None:
-        self._id = session_id
-        self.runtime_entry = runtime
-        self.last_activity = 1_000.0
-        self.idle_timeout = 60
-        self.dead = False
-        self.stops = 0
-        self.removed = False
-        self.commands: list[str] = []
-        self.usage: SandboxUsage | None = None
-
-    async def start(self) -> None:
-        pass
-
-    async def stop(self, remove: bool = False) -> None:
-        self.stops += 1
-        self.removed = self.removed or remove
-
-    async def is_alive(self) -> bool:
-        return not self.dead
-
-    async def resource_usage(self) -> SandboxUsage | None:
-        return self.usage
-
-    async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
-        self.commands.append(command)
-        return ExecuteResponse(output="ok", exit_code=0)
-
-    async def read_bytes(self, path: str) -> bytes:
-        return b""
-
-    async def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
-        return "content"
-
-    async def write(self, path: str, content: str | bytes) -> WriteResult:
-        return WriteResult(path=path)
-
-    async def edit(self, path, old_string, new_string, replace_all=False) -> EditResult:
-        return EditResult(path=path, occurrences=1)
-
-    async def exists(self, path: str) -> bool:
-        return True
-
-    async def ls_info(self, path: str):
-        return []
-
-    async def glob_info(self, pattern: str, path: str = "/"):
-        return []
-
-    async def grep_raw(self, pattern, path=None, glob=None, ignore_hidden=True):
-        return []
-
-    def touch(self) -> None:
-        self.last_activity = 1_000.0
-
-
-class TestAsyncSandboxThroughTheService:
-    """An `AsyncBaseSandbox` must reach sandboxd, not just the toolset."""
-
-    @pytest.fixture
-    def async_harness(self):
-        built: dict[str, AsyncFakeSandbox] = {}
-
-        def build(session_id: str, runtime: Any) -> AsyncFakeSandbox:
-            built[session_id] = AsyncFakeSandbox(session_id, runtime)
-            return built[session_id]
-
-        config = SandboxdConfig(
-            token=SERVICE_TOKEN,
-            runtimes={"python": "python:3.12-slim"},
-            prewarm=False,
-        )
-        app = create_app(config, sandbox_builder=build)
-        return app, built
-
-    def test_liveness_is_resolved_not_reported_as_a_truthy_coroutine(self, async_harness):
-        app, built = async_harness
-        with TestClient(app) as client:
-            created = client.post(
-                "/sessions", json={"session_id": "a1"}, headers=_service_headers()
-            )
-            assert created.status_code == 200, created.text
-            assert created.json()["session"]["alive"] is True
-
-            built["a1"].dead = True
-            seen = client.get("/sessions/a1", headers=_service_headers())
-
-        assert seen.json()["alive"] is False
-
-    def test_operations_run_against_it(self, async_harness):
-        app, built = async_harness
-        with TestClient(app) as client:
-            _open_session(client, session_id="a2")
-
-            answer = client.post(
-                "/sessions/a2/exec",
-                json={"command": "echo hi"},
-                headers=_service_headers(),
-            )
-
-        assert answer.json()["output"] == "ok"
-        assert built["a2"].commands == ["echo hi"]
-
-    def test_usage_is_awaited_rather_than_thread_wrapped(self, async_harness):
-        """In a thread its coroutine never runs, so usage read as unavailable."""
-        app, built = async_harness
-        with TestClient(app) as client:
-            _open_session(client, session_id="a3")
-            built["a3"].usage = SandboxUsage(memory_bytes=4096)
-
-            seen = client.get("/sessions/a3?usage=true", headers=_service_headers())
-
-        assert seen.json()["usage"]["memory_bytes"] == 4096
-
-    def test_a_purge_actually_discards_the_container(self, async_harness):
-        app, built = async_harness
-        with TestClient(app) as client:
-            _open_session(client, session_id="a4")
-
-            closed = client.delete("/sessions/a4?purge=true", headers=_service_headers())
-
-        assert closed.status_code == 204
-        assert built["a4"].removed is True
-
-    def test_a_purge_falls_back_when_stop_takes_no_remove(self, async_harness):
-        """The base sandbox surface has nothing to discard beyond stopping."""
-        app, built = async_harness
-
-        class NoRemove(AsyncFakeSandbox):
-            async def stop(self) -> None:  # type: ignore[override]
-                self.stops += 1
-
-        with TestClient(app) as client:
-            _open_session(client, session_id="a5")
-            plain = NoRemove("a5", built["a5"].runtime_entry)
-            app.state.service.manager._sessions["a5"] = plain
-
-            closed = client.delete("/sessions/a5?purge=true", headers=_service_headers())
-
-        assert closed.status_code == 204
-        assert plain.stops >= 1
-
-    def test_reattaching_reports_liveness_too(self, async_harness):
-        app, _ = async_harness
-        with TestClient(app) as client:
-            _open_session(client, session_id="a6")
-
-            again = client.post(
-                "/sessions",
-                json={"session_id": "a6", "reuse": True},
-                headers=_service_headers(),
-            )
-
-        assert again.status_code == 200, again.text
-        assert again.json()["session"]["alive"] is True
 
 
 class TestUnprivilegedSandboxes:
@@ -3917,193 +3151,6 @@ class TestUnprivilegedSandboxes:
         assert policy.sandbox_uid == os.getuid()
 
 
-class TestOperationsAreBoundedByTheServiceCeiling:
-    """`execute_timeout` is documented as applying to *every* command.
-
-    It was applied on `/exec` and nowhere else. `ls`, `glob`, `grep`, `read` and
-    `write` all reach the sandbox's shell too, so one slow search occupied a
-    worker of the `max_workers` pool with nothing able to reclaim it — and
-    `max_workers` of them wedged the service for every session.
-    """
-
-    @pytest.fixture
-    def slow(self):
-        harness = Harness(execute_timeout=1)
-        with harness.client() as running:
-            yield harness, running
-
-    @staticmethod
-    def _open(client: TestClient) -> tuple[str, dict[str, str]]:
-        created = client.post(
-            "/sessions", json={"session_id": "slow"}, headers=_service_headers()
-        ).json()
-        return created["session"]["session_id"], {wire.TOKEN_HEADER: created["token"]}
-
-    @pytest.mark.parametrize(
-        ("route", "body"),
-        [
-            ("exec", {"command": "sleep 60"}),
-            ("ls", {"path": "/"}),
-            ("read", {"path": "/f"}),
-            ("read_bytes", {"path": "/f"}),
-            ("write", {"path": "/f", "content_b64": "eA=="}),
-            ("edit", {"path": "/f", "old_string": "a", "new_string": "b"}),
-            ("exists", {"path": "/f"}),
-            ("glob", {"pattern": "*.py", "path": "/"}),
-            ("grep", {"pattern": "x"}),
-        ],
-    )
-    def test_an_operation_past_the_ceiling_is_a_504(self, slow, route: str, body: dict[str, Any]):
-        harness, client = slow
-        session_id, headers = self._open(client)
-        # Just past the ceiling: the worker thread cannot be interrupted, so a
-        # longer stall only makes the service's shutdown wait for it.
-        harness.built[session_id].stall = 1.2
-
-        response = client.post(f"/sessions/{session_id}/{route}", json=body, headers=headers)
-
-        assert response.status_code == 504
-        assert "service ceiling" in response.json()["detail"]
-
-    def test_an_operation_inside_the_ceiling_still_answers(self, slow):
-        harness, client = slow
-        session_id, headers = self._open(client)
-
-        response = client.post(f"/sessions/{session_id}/ls", json={"path": "/"}, headers=headers)
-
-        assert response.status_code == 200
-
-
-class TestClientWaitsOutTheServiceCeiling:
-    """The client's transport timeout and the service's ceiling are one contract.
-
-    `TRANSPORT_SLACK_SECONDS` exists so "the transport never gives up before the
-    command it is waiting for", but the two defaults were set independently — 60s
-    against 300s. Anything in between was reported to the agent as an unavailable
-    service while the command was in fact still running, and typically retried.
-    """
-
-    def test_the_ceiling_is_read_from_the_service(self, client: TestClient):
-        sandbox = RemoteSandbox(token=SERVICE_TOKEN, session_id="paired", client=client)
-
-        sandbox.start()
-
-        assert sandbox.server_timeout == float(SandboxdConfig(token="x").execute_timeout)
-
-    def test_a_command_with_no_timeout_waits_that_long_plus_slack(self, client: TestClient):
-        sandbox = RemoteSandbox(token=SERVICE_TOKEN, session_id="paired", client=client)
-        sandbox.start()
-        seen: list[float | None] = []
-        original = client.post
-
-        def record(url: str, **kwargs: Any):
-            seen.append(kwargs.get("timeout"))
-            return original(url, **kwargs)
-
-        sandbox._http.post = record  # type: ignore[method-assign]
-        sandbox.execute("sleep 120")
-
-        assert seen == [sandbox.server_timeout + TRANSPORT_SLACK_SECONDS]
-
-    def test_an_explicit_timeout_still_wins(self, client: TestClient):
-        sandbox = RemoteSandbox(token=SERVICE_TOKEN, session_id="paired", client=client)
-        sandbox.start()
-        seen: list[float | None] = []
-        original = client.post
-
-        def record(url: str, **kwargs: Any):
-            seen.append(kwargs.get("timeout"))
-            return original(url, **kwargs)
-
-        sandbox._http.post = record  # type: ignore[method-assign]
-        sandbox.execute("echo hi", timeout=5)
-
-        assert seen == [5 + TRANSPORT_SLACK_SECONDS]
-
-    def test_a_service_that_will_not_say_falls_back_to_the_local_default(self):
-        """No `/policy`, no pairing — the local timeout is the only answer left."""
-        harness = Harness()
-        with harness.client() as running:
-            sandbox = RemoteSandbox(
-                token=SERVICE_TOKEN, session_id="unpaired", timeout=12.0, client=running
-            )
-            sandbox._http = _NoPolicy(running)
-
-            sandbox.start()
-
-            assert sandbox.server_timeout == 12.0
-
-    def test_a_policy_that_is_not_one_falls_back_too(self):
-        """A proxy in front of the service answers 200 with an HTML page."""
-        harness = Harness()
-        with harness.client() as running:
-            sandbox = RemoteSandbox(
-                token=SERVICE_TOKEN, session_id="proxied", timeout=9.0, client=running
-            )
-            sandbox._http = _NonsensePolicy(running)
-
-            sandbox.start()
-
-            assert sandbox.server_timeout == 9.0
-
-    def test_a_forbidden_policy_falls_back_too(self):
-        """The session token cannot read `/policy`; only the service token can."""
-        harness = Harness()
-        with harness.client() as running:
-            sandbox = RemoteSandbox(
-                token="wrong-token", session_id="denied", timeout=7.0, client=running
-            )
-            sandbox._service_token = SERVICE_TOKEN
-            sandbox._http = _ForbiddenPolicy(running)
-
-            sandbox.start()
-
-            assert sandbox.server_timeout == 7.0
-
-
-class _PolicyProxy:
-    """Passes everything to the real client except `/policy`."""
-
-    def __init__(self, inner: TestClient) -> None:
-        self._inner = inner
-
-    def get(self, url: str, **kwargs: Any):
-        raise NotImplementedError
-
-    def post(self, url: str, **kwargs: Any):
-        return self._inner.post(url, **kwargs)
-
-    def delete(self, url: str, **kwargs: Any):
-        return self._inner.delete(url, **kwargs)
-
-    @property
-    def is_closed(self) -> bool:
-        return False
-
-    def close(self) -> None: ...
-
-
-class _NoPolicy(_PolicyProxy):
-    """A client whose `/policy` is unreachable, as one behind a proxy may be."""
-
-    def get(self, url: str, **kwargs: Any):
-        raise RuntimeError("no route to /policy")
-
-
-class _NonsensePolicy(_PolicyProxy):
-    """A 200 carrying something that is not a policy."""
-
-    def get(self, url: str, **kwargs: Any):
-        return self._inner.get("/healthz")
-
-
-class _ForbiddenPolicy(_PolicyProxy):
-    """A 403, which `_parse` is handed as no answer at all."""
-
-    def get(self, url: str, **kwargs: Any):
-        return self._inner.get("/policy", headers={wire.TOKEN_HEADER: "nope"})
-
-
 class TestEventsRaceWithTheReaper:
     """`describe` re-looks-up and 404s; `events`, its sibling, subscripted."""
 
@@ -4119,3 +3166,167 @@ class TestEventsRaceWithTheReaper:
 
         assert raised.value.status_code == 404
         assert created["token"]
+
+
+class AsyncFakeSandbox:
+    """A natively async sandbox handed to the service as its builder."""
+
+    def __init__(self, session_id: str, runtime: Any) -> None:
+        self._id = session_id
+        self.runtime_entry = runtime
+        self.last_activity = 1_000.0
+        self.idle_timeout = 60
+        self.dead = False
+        self.stops = 0
+        self.removed = False
+        self.commands: list[str] = []
+        self.usage: SandboxUsage | None = None
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self, remove: bool = False) -> None:
+        self.stops += 1
+        self.removed = self.removed or remove
+
+    async def is_alive(self) -> bool:
+        return not self.dead
+
+    async def resource_usage(self) -> SandboxUsage | None:
+        return self.usage
+
+    async def run_command(
+        self,
+        argv: Sequence[str],
+        *,
+        run_id: str,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        output_limit: int | None = None,
+    ) -> CommandOutcome:
+        self.commands.append(shlex.join(argv))
+        return CommandOutcome(stdout="ok", stderr="", exit_code=0)
+
+    async def stop_command(self, run_id: str) -> None: ...
+
+    def touch(self) -> None:
+        self.last_activity = 1_000.0
+
+
+class TestAsyncSandboxThroughTheService:
+    """A natively async sandbox from a custom builder must work through sandboxd."""
+
+    @pytest.fixture
+    def async_harness(self):
+        built: dict[str, AsyncFakeSandbox] = {}
+
+        def build(session_id: str, runtime: Any) -> AsyncFakeSandbox:
+            built[session_id] = AsyncFakeSandbox(session_id, runtime)
+            return built[session_id]
+
+        config = SandboxdConfig(
+            token=SERVICE_TOKEN,
+            runtimes={"python": "python:3.12-slim"},
+            prewarm=False,
+        )
+        app = create_app(config, sandbox_builder=build)
+        return app, built
+
+    def test_liveness_is_resolved_not_reported_as_a_truthy_coroutine(self, async_harness):
+        app, built = async_harness
+        with TestClient(app) as client:
+            created = client.post(
+                "/sessions", json={"session_id": "a1"}, headers=_service_headers()
+            )
+            assert created.status_code == 200, created.text
+            assert created.json()["session"]["alive"] is True
+
+            built["a1"].dead = True
+            seen = client.get("/sessions/a1", headers=_service_headers())
+
+        assert seen.json()["alive"] is False
+
+    def test_commands_run_against_it(self, async_harness):
+        app, built = async_harness
+        with TestClient(app) as client:
+            _open_session(client, session_id="a2")
+
+            answer = client.post(
+                "/sessions/a2/run", json=_run("echo hi"), headers=_service_headers()
+            )
+
+        assert answer.json()["stdout"] == "ok"
+        assert built["a2"].commands == ["sh -c 'echo hi'"]
+
+    def test_usage_is_awaited_rather_than_thread_wrapped(self, async_harness):
+        """In a thread its coroutine never runs, so usage read as unavailable."""
+        app, built = async_harness
+        with TestClient(app) as client:
+            _open_session(client, session_id="a3")
+            built["a3"].usage = SandboxUsage(memory_bytes=4096)
+
+            seen = client.get("/sessions/a3?usage=true", headers=_service_headers())
+
+        assert seen.json()["usage"]["memory_bytes"] == 4096
+
+    def test_a_purge_actually_discards_the_container(self, async_harness):
+        app, built = async_harness
+        with TestClient(app) as client:
+            _open_session(client, session_id="a4")
+
+            closed = client.delete("/sessions/a4?purge=true", headers=_service_headers())
+
+        assert closed.status_code == 204
+        assert built["a4"].removed is True
+
+    def test_a_purge_falls_back_when_stop_takes_no_remove(self, async_harness):
+        """The base sandbox surface has nothing to discard beyond stopping."""
+        app, built = async_harness
+
+        class NoRemove(AsyncFakeSandbox):
+            async def stop(self) -> None:  # type: ignore[override]
+                self.stops += 1
+
+        with TestClient(app) as client:
+            _open_session(client, session_id="a5")
+            plain = NoRemove("a5", built["a5"].runtime_entry)
+            app.state.service.manager._sessions["a5"] = plain
+
+            closed = client.delete("/sessions/a5?purge=true", headers=_service_headers())
+
+        assert closed.status_code == 204
+        assert plain.stops >= 1
+
+    def test_reattaching_reports_liveness_too(self, async_harness):
+        app, _ = async_harness
+        with TestClient(app) as client:
+            _open_session(client, session_id="a6")
+
+            again = client.post(
+                "/sessions",
+                json={"session_id": "a6", "reuse": True},
+                headers=_service_headers(),
+            )
+
+        assert again.status_code == 200, again.text
+        assert again.json()["session"]["alive"] is True
+
+    def test_a_sandbox_reporting_nothing_has_no_usage(self, async_harness):
+        app, _ = async_harness
+        with TestClient(app) as client:
+            _open_session(client, session_id="a7")
+
+            seen = client.get("/sessions/a7?usage=true", headers=_service_headers())
+
+        assert seen.json()["usage"] is None
+
+    def test_a_sandbox_without_usage_reports_none(self, async_harness):
+        app, _ = async_harness
+
+        class NoUsage:
+            pass
+
+        from pydantic_ai_backends.remote.server import _usage_of
+
+        assert _usage_of(NoUsage()) is None
+        del app

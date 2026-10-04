@@ -372,8 +372,12 @@ class TestRunRoutesOnTheService:
     """What `/run`, `/runs/{id}/stop` and `attach` answer, in-process."""
 
     @pytest.fixture
-    def client(self) -> Iterator[TestClient]:
-        with Harness().client() as client:
+    def harness(self) -> Harness:
+        return Harness()
+
+    @pytest.fixture
+    def client(self, harness: Harness) -> Iterator[TestClient]:
+        with harness.client() as client:
             yield client
 
     def test_attach_needs_a_session_id(self, client: TestClient) -> None:
@@ -386,22 +390,47 @@ class TestRunRoutesOnTheService:
         )
         assert response.status_code == 404
 
-    def test_a_sandbox_without_a_runner_cannot_run(self, client: TestClient) -> None:
-        session_id, token = _open_session(client)
-        response = client.post(
+    @pytest.fixture
+    def runnerless(self) -> Iterator[TestClient]:
+        """A service whose custom builder returns sandboxes that cannot run commands."""
+
+        class Runnerless:
+            def __init__(self, session_id: str, runtime: Any) -> None:
+                self.session_id = session_id
+                self.image = runtime.image_label()
+
+            def start(self) -> None: ...
+
+            def is_alive(self) -> bool:
+                return True
+
+            def stop(self, remove: bool = False) -> None: ...
+
+        config = SandboxdConfig(token=TOKEN, runtimes={"python": "python:3.12-slim"})
+        with TestClient(create_app(config, sandbox_builder=Runnerless)) as client:
+            yield client
+
+    def test_a_sandbox_without_a_runner_cannot_run(self, runnerless: TestClient) -> None:
+        headers = {wire.TOKEN_HEADER: TOKEN}
+        created = runnerless.post("/sessions", json={}, headers=headers).json()
+        session_id = created["session"]["session_id"]
+        response = runnerless.post(
             f"/sessions/{session_id}/run",
             json={"argv": ["true"], "run_id": "0" * 32},
-            headers={wire.TOKEN_HEADER: token},
+            headers=headers,
         )
         assert response.status_code == 501
-        assert "FakeSandbox cannot run commands" in response.text
+        assert "Runnerless cannot run commands" in response.text
+        stopped = runnerless.post(f"/sessions/{session_id}/runs/{'0' * 32}/stop", headers=headers)
+        assert stopped.status_code == 204
 
-    def test_stopping_on_a_sandbox_without_a_runner_is_a_no_op(self, client: TestClient) -> None:
+    def test_stopping_a_run_reaches_the_sandbox(self, client: TestClient, harness: Harness) -> None:
         session_id, token = _open_session(client)
         response = client.post(
             f"/sessions/{session_id}/runs/{'0' * 32}/stop", headers={wire.TOKEN_HEADER: token}
         )
         assert response.status_code == 204
+        assert harness.built[session_id].stopped_runs == ["0" * 32]
 
     def test_a_run_id_must_be_a_uuid_hex(self, client: TestClient) -> None:
         session_id, token = _open_session(client)

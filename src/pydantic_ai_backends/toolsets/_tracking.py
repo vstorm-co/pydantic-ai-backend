@@ -17,7 +17,7 @@ import hashlib
 import weakref
 from typing import Any
 
-from pydantic_ai_backends.protocol import AsyncBackendProtocol
+from pydantic_ai_backends.toolsets._workspace import FileOps
 
 read_fingerprints: weakref.WeakKeyDictionary[Any, dict[str, str]] = weakref.WeakKeyDictionary()
 """Per-backend fingerprint of the content the agent last saw at each path."""
@@ -42,7 +42,7 @@ def record_read(backend: Any, path: str, data: bytes) -> None:
 
 
 async def record_path_read(
-    backend_async: AsyncBackendProtocol, backend: Any, path: str
+    backend_async: FileOps, backend: Any, path: str
 ) -> None:  # pragma: no cover - glue, exercised through the file tools
     """Fetch `path` and record its fingerprint, best effort."""
     try:
@@ -52,9 +52,7 @@ async def record_path_read(
     record_read(backend, path, data)
 
 
-async def staleness_error(
-    backend_async: AsyncBackendProtocol, backend: Any, path: str
-) -> str | None:
+async def staleness_error(backend_async: FileOps, backend: Any, path: str) -> str | None:
     """Why `path` must be re-read before editing, or `None` when it is current.
 
     Only files already seen through the tools are guarded — an edit to a file

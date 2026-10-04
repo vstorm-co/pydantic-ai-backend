@@ -1,21 +1,17 @@
-"""Custom permission ruleset — fine-grained path control."""
+"""Custom permission ruleset: read and execute allowed, writes denied."""
 
 import asyncio
-from dataclasses import dataclass
+from pathlib import Path
 
 from pydantic_ai import Agent
+from pydantic_ai.capabilities import LocalWorkspace
 
-from pydantic_ai_backends import ConsoleCapability, LocalBackend
+from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_backends.permissions import create_ruleset
 
 
-@dataclass
-class Deps:
-    backend: LocalBackend
-
-
 async def main() -> None:
-    # Allow reads and execution, deny writes
+    Path("/tmp/demo").mkdir(exist_ok=True)
     ruleset = create_ruleset(
         allow_read=True,
         allow_write=False,
@@ -24,16 +20,11 @@ async def main() -> None:
     )
 
     agent = Agent(
-        "openai:gpt-4.1",
-        deps_type=Deps,
-        capabilities=[ConsoleCapability(permissions=ruleset)],
+        "anthropic:claude-opus-5-5",
+        capabilities=[LocalWorkspace("/tmp/demo"), ConsoleCapability(permissions=ruleset)],
     )
 
-    backend = LocalBackend(root_dir="/tmp/demo")
-    result = await agent.run(
-        "Run pytest and tell me which tests pass.",
-        deps=Deps(backend=backend),
-    )
+    result = await agent.run("Run pytest and tell me which tests pass.")
     print(result.output)
 
 

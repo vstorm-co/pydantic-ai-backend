@@ -1,25 +1,40 @@
-"""Pydantic AI workspaces backed by this library's sandboxes.
+"""Pydantic AI workspaces from self-hosted and hosted sandboxes.
 
 A workspace is the environment an agent run works in, reached by every tool
-through `ctx.workspace`. The capabilities here supply one: hand an agent
-`DockerWorkspace()` and the Pydantic AI harness's `Coder`, `Shell` and
-`FileSystem` run in a container instead of on the host.
+through `ctx.workspace`. Each capability here supplies one, creates it on the
+run's first operation, records it as the run's `WorkspaceRef` so a later run
+attaches to the same environment, and never deletes it: `destroy(ref)` does.
 
-The other direction is here too: `WorkspaceSandbox` puts any workspace behind
-this library's sandbox protocol, which is how `ConsoleCapability(use_workspace=True)`
-runs its tools in whatever workspace the run has.
+| Capability | Environment | Extra |
+|---|---|---|
+| `DockerWorkspace` | A container on this host | `docker` |
+| `SandboxdWorkspace` | A `sandboxd` session, so the agent's process holds no Docker socket | — |
+| `KubernetesWorkspace` | A pod, reached through `pods/exec` | `kubernetes` |
+| `DaytonaWorkspace` | A Daytona sandbox | `daytona` |
+| `StateWorkspace` | A JSON document, files only | — |
 
-Requires `pip install "pydantic-ai-backend[workspaces]"`.
+Compose one with tools that use the workspace: this library's
+`ConsoleCapability`, or the harness's `Coder`, `Shell` and `FileSystem`.
 """
 
-from pydantic_ai_backends.workspaces._console import WorkspaceSandbox
+from pydantic_ai_backends.workspaces._daytona import DaytonaWorkspace, DaytonaWorkspaceBackend
 from pydantic_ai_backends.workspaces._docker import DockerWorkspace, DockerWorkspaceBackend
+from pydantic_ai_backends.workspaces._kubernetes import (
+    KubernetesWorkspace,
+    KubernetesWorkspaceBackend,
+)
 from pydantic_ai_backends.workspaces._sandboxd import SandboxdWorkspace, SandboxdWorkspaceBackend
+from pydantic_ai_backends.workspaces._state import StateWorkspace, StateWorkspaceBackend
 
 __all__ = [
+    "DaytonaWorkspace",
+    "DaytonaWorkspaceBackend",
     "DockerWorkspace",
     "DockerWorkspaceBackend",
+    "KubernetesWorkspace",
+    "KubernetesWorkspaceBackend",
     "SandboxdWorkspace",
     "SandboxdWorkspaceBackend",
-    "WorkspaceSandbox",
+    "StateWorkspace",
+    "StateWorkspaceBackend",
 ]

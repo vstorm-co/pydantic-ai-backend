@@ -15,13 +15,11 @@ class TestLazyLoading:
         assert DockerSandbox is not None
         assert DockerSandbox.__name__ == "DockerSandbox"
 
-    def test_lazy_import_base_sandbox(self):
-        """Test lazy import of BaseSandbox."""
+    def test_lazy_import_a_workspace(self):
+        """A workspace capability loads on first access, with Pydantic AI."""
         import pydantic_ai_backends
 
-        BaseSandbox = pydantic_ai_backends.BaseSandbox
-        assert BaseSandbox is not None
-        assert BaseSandbox.__name__ == "BaseSandbox"
+        assert pydantic_ai_backends.SandboxdWorkspace.__name__ == "SandboxdWorkspace"
 
     def test_lazy_import_session_manager(self):
         """Test lazy import of SessionManager."""
@@ -56,10 +54,9 @@ class TestLazyLoading:
         assert "NonExistentClass" in str(excinfo.value)
 
 
-def test_adapter_helpers_are_importable_from_the_root():
-    """0.2.17 documented `is_async_backend` but exported only its sibling."""
+def test_every_public_name_resolves():
+    """`__all__` is the public API reference, so every entry must import."""
     import pydantic_ai_backends as package
 
-    for name in ("ensure_async", "is_async_backend"):
-        assert name in package.__all__
-        assert getattr(package, name).__name__ == name
+    for name in package.__all__:
+        assert getattr(package, name) is not None, name

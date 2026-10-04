@@ -12,26 +12,13 @@ import anyio.to_thread
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.workspaces import (
-    CommandResult,
-    SupportsCommands,
-    WorkspaceBackend,
-    WorkspaceCommand,
-    WorkspaceRef,
-    WorkspaceUnavailableError,
-)
+from pydantic_ai.workspaces import WorkspaceBackend, WorkspaceRef
 
-from pydantic_ai_backends._limits import MAX_RUN_OUTPUT_BYTES
 from pydantic_ai_backends.backends.docker._client import docker_client
 from pydantic_ai_backends.backends.docker.sandbox import REATTACHABLE_STATUSES, DockerSandbox
 from pydantic_ai_backends.protocol import SandboxUnavailableError
 from pydantic_ai_backends.types import RuntimeConfig
-from pydantic_ai_backends.workspaces._commands import (
-    check_timeout,
-    command_argv,
-    command_result,
-    layered_env,
-)
+from pydantic_ai_backends.workspaces._container import ContainerWorkspaceBackend, RunnerSandbox
 
 DOCKER_PROVIDER = "docker"
 """`WorkspaceRef.provider` of a container workspace."""
@@ -63,13 +50,12 @@ def _remove_container(name: str) -> None:
         docker_client().containers.get(name).remove(force=True)
 
 
-class DockerWorkspaceBackend(WorkspaceBackend, SupportsCommands):
+class DockerWorkspaceBackend(ContainerWorkspaceBackend):
     """One Docker container, as the environment an agent run works in.
 
-    Commands only: `Workspace` derives the file operations through the shell,
-    which keeps the one failure contract for both. The container is named after
-    the ref and is never auto-removed, so a later run can attach to it and find
-    its files, installed packages included; it lives until :meth:`DockerWorkspace.destroy`.
+    The container is named after the ref and never auto-removed, so a later run
+    can attach to it and find its files, installed packages included; a stopped
+    one is started again. It lives until :meth:`DockerWorkspace.destroy`.
 
     Args:
         sandbox_factory: Builds the `DockerSandbox` for a container name. Holds
@@ -85,78 +71,22 @@ class DockerWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         ref: WorkspaceRef | None = None,
         env: Mapping[str, str] | None = None,
     ) -> None:
-        if ref is not None and ref.provider != DOCKER_PROVIDER:
-            raise ValueError(f"expected a {DOCKER_PROVIDER!r} workspace ref, got {ref.provider!r}")
-        self._factory = sandbox_factory
-        self._ref = ref
-        self._env = dict(env) if env else None
-        self._sandbox: DockerSandbox | None = None
-        self._lock = anyio.Lock()
-
-    @property
-    def ref(self) -> WorkspaceRef | None:
-        """The container's name once it exists; `None` before the first operation."""
-        return self._ref
-
-    async def _connect(self) -> DockerSandbox:
-        """The started sandbox, creating or attaching on the first call."""
-        async with self._lock:
-            if self._sandbox is not None:
-                return self._sandbox
-            if self._ref is None:
+        async def open_container(name: str | None) -> tuple[str, RunnerSandbox]:
+            if name is None:
                 name = f"{CONTAINER_PREFIX}{uuid.uuid4().hex[:16]}"
-                sandbox = self._factory(name)
-                # Shielded: the thread creating the container runs to completion
-                # either way, and a caller cancelled meanwhile must still leave
-                # the ref behind, or nothing could ever remove that container.
-                with anyio.CancelScope(shield=True):
-                    await anyio.to_thread.run_sync(sandbox.start)
-                    self._ref = WorkspaceRef(provider=DOCKER_PROVIDER, id=name)
             else:
-                status = await anyio.to_thread.run_sync(_container_status, self._ref.id)
+                status = await anyio.to_thread.run_sync(_container_status, name)
                 if status != "running" and status not in REATTACHABLE_STATUSES:
-                    raise WorkspaceUnavailableError(
-                        f"container {self._ref.id!r} no longer exists"
+                    raise SandboxUnavailableError(
+                        f"container {name!r} no longer exists"
                         if status is None
-                        else f"container {self._ref.id!r} is {status}"
+                        else f"container {name!r} is {status}"
                     )
-                sandbox = self._factory(self._ref.id)
-                await anyio.to_thread.run_sync(sandbox.start)
-            self._sandbox = sandbox
-            return sandbox
+            sandbox = sandbox_factory(name)
+            await anyio.to_thread.run_sync(sandbox.start)
+            return name, sandbox
 
-    async def working_dir(self) -> str:
-        """The sandbox's work directory, which commands start in."""
-        return (await self._connect()).work_dir
-
-    async def run(
-        self,
-        command: WorkspaceCommand,
-        *,
-        shell: bool = False,
-        env: Mapping[str, str] | None = None,
-        timeout: float | None = None,
-    ) -> CommandResult:
-        """Run a command in the container, stdin at EOF; see `SupportsCommands.run`.
-
-        Raises:
-            WorkspaceUnavailableError: The container is gone, before or during it.
-            WorkspaceTimeoutError: The command reached `timeout`.
-            WorkspaceOutputLimitError: Its combined output passed 10 MiB.
-        """
-        argv = command_argv(command, shell)
-        check_timeout(timeout)
-        sandbox = await self._connect()
-        try:
-            outcome = await sandbox.run_command(
-                argv,
-                run_id=uuid.uuid4().hex,
-                env=layered_env(self._env, env),
-                timeout=timeout,
-            )
-        except SandboxUnavailableError as error:
-            raise WorkspaceUnavailableError(str(error)) from error
-        return command_result(outcome, timeout=timeout, limit=MAX_RUN_OUTPUT_BYTES)
+        super().__init__(provider=DOCKER_PROVIDER, opener=open_container, ref=ref, env=env)
 
 
 @dataclass(kw_only=True)
@@ -170,7 +100,7 @@ class DockerWorkspace(AbstractCapability[object]):
 
     This supplies the environment only. Compose it with something that uses the
     workspace: `Coder`, `Shell` or `FileSystem` from the Pydantic AI harness, or
-    this library's `ConsoleCapability(use_workspace=True)`.
+    this library's `ConsoleCapability`.
 
     A container is only as isolated as its runtime: Docker's default `runc`
     shares the host kernel. See `oci_runtime`.

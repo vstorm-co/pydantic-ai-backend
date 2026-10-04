@@ -7,32 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**⚠️ Breaking: the library is now built on Pydantic AI workspaces.** Pydantic AI
+2.52 gave every tool one environment to work in, `ctx.workspace`, with its own
+file and command contract. This library had a second one — `BackendProtocol`
+and its backends — so every tool, adapter and sandbox existed twice. That
+abstraction is gone: the sandboxes are now workspaces, and the console tools
+work in whichever workspace a run has, including the harness's E2B, Modal and
+Sprites. `pydantic-ai-slim>=2.52.0` is the floor for the `console` and
+`workspaces` extras. See the "Workspaces" page for the model, and below for
+what replaces each removed name.
+
 ### Added
 
-- **Pydantic AI workspaces from this library's sandboxes.** Pydantic AI 2.52
-  gave every tool one environment to work in, `ctx.workspace`, and the harness's
-  `Coder`, `Shell` and `FileSystem` run in whichever one an agent is given — but
-  the only self-hosted container it offered was a directory on the host.
-  `pydantic_ai_backends.workspaces` adds two: `DockerWorkspace`, a container on
-  this host, and `SandboxdWorkspace`, a `sandboxd` session, so the agent's
-  process holds no Docker socket. Both pass Pydantic AI's own
-  `WorkspaceBackendSuite` against a real daemon. A ref attaches to the same
-  container or session on a later run, and one whose environment is gone fails
-  with `WorkspaceUnavailableError` rather than continuing in an empty one. New
-  `workspaces` extra; see the "Pydantic AI Workspaces" page.
-- **`ConsoleCapability(use_workspace=True)`** runs the console tools in the
-  run's workspace instead of a backend of their own — one of the above, or the
-  harness's E2B, Modal or Sprites. `WorkspaceSandbox` is the adapter underneath.
+- **Five workspace capabilities**, in `pydantic_ai_backends.workspaces` and the
+  package root: `DockerWorkspace` (a container on this host), `SandboxdWorkspace`
+  (a `sandboxd` session, so the agent's process holds no Docker socket),
+  `KubernetesWorkspace` (a pod, through `pods/exec`), `DaytonaWorkspace` (a
+  Daytona sandbox) and `StateWorkspace` (a `StateBackend` document, files only).
+  Each is created on first use, attached again by its ref on a later run, never
+  deleted for you (`await capability.destroy(ref)`), and fails with
+  `WorkspaceUnavailableError` when its environment is gone rather than
+  continuing in an empty one. `DockerWorkspace` and `SandboxdWorkspace` pass
+  Pydantic AI's `WorkspaceBackendSuite` against a real Docker daemon;
+  `StateWorkspace` passes its filesystem rules in CI. The Kubernetes and
+  Daytona suites run behind `-m kubernetes` / `-m daytona` and are not yet
+  verified against a live cluster or account.
+- **Commands that stop with everything they started.** Every command-capable
+  workspace runs commands through a small wrapper that records the command's
+  process group, so a timeout or a cancelled run stops the command and its
+  children with a second command. stdout and stderr come back apart,
+  `WorkspaceTimeoutError` carries partial output, and output past 10 MiB raises
+  `WorkspaceOutputLimitError`.
 - **`sandboxd` runs commands for a workspace: `POST /sessions/{id}/run`** takes
-  an argv, `env` and a `run_id`, keeps stdout and stderr apart, answers `410`
-  for a vanished sandbox, and `POST /sessions/{id}/runs/{run_id}/stop` stops a
-  command and its process group. `/exec` is unchanged. A session open request
-  with `attach` attaches without ever creating, answering `404` when there is
-  nothing left to attach to.
-- **`DockerSandbox.run_command` / `stop_command`**, the `CommandRunner`
-  protocol and `SandboxUnavailableError`: commands under a workspace's failure
-  contract, which raises for an unreachable container instead of folding it into
-  the output. The tool path keeps using `execute`.
+  an argv, `env` and a `run_id`, keeps stdout and stderr apart and answers `410`
+  for a vanished sandbox; `POST /sessions/{id}/runs/{run_id}/stop` stops a
+  command and its process group. A session open request with `attach` attaches
+  without ever creating, answering `404` when there is nothing left to attach to.
+- **`CommandRunner`, `CommandOutcome` and `SandboxUnavailableError`**: what a
+  sandbox implements to back a container workspace or a `sandboxd` session.
+  `DockerSandbox` and `KubernetesPodSandbox` implement it.
+- **A read-only workspace hides the mutating tools.** On `ReadOnlyWorkspace` or
+  `LocalWorkspace(read_only=True)`, `ConsoleCapability` offers no `write_file`,
+  `edit_file` or `execute`, whatever the ruleset allows.
+
+### Removed
+
+- **`BackendProtocol`, `SandboxProtocol` and their async variants**, with
+  `adapter.py` (`ensure_async` and the sync/async adapters). Tools reach the
+  environment through `ctx.workspace`.
+- **`LocalBackend`**: use Pydantic AI's `LocalWorkspace`, which takes
+  `read_only=` for a directory the agent may only read.
+- **`CompositeBackend` and `PrefixRouter`**: a run has one workspace. Compose
+  policies around it with Pydantic AI's `WrapperWorkspace`.
+- **`BaseSandbox` and `AsyncBaseSandbox`**: file operations are derived by
+  Pydantic AI's `Workspace` from the shell; a new sandbox implements
+  `CommandRunner`.
+- **`RemoteSandbox`**: use `SandboxdWorkspace`. `WorkspaceArchive` and
+  `WorkspaceArchiveError` moved to `pydantic_ai_backends.remote.archive` and stay
+  importable from the package root.
+- **`DaytonaSandbox`**: use `DaytonaWorkspace`. The `daytona` extra now installs
+  the `daytona` package; the old `daytona-sdk` installed `daytona_sdk`, which the
+  code never imported, so the previous class could not be loaded with its own
+  extra.
+- **`sandboxd` file and exec routes** — `/exec`, `/read`, `/write`, `/edit`,
+  `/ls`, `/glob`, `/grep` and `/exists` under `/sessions/{id}` — and their wire
+  models. `/run` is the one way in; the archive routes under `/workspaces` are
+  unchanged.
+- **The background shell tools** — `run_in_background`, `read_output`,
+  `kill_shell`, `list_shells` — and `ConsoleCapability(include_background=...)`.
+  Pydantic AI's workspace contract has no background processes; a command that
+  must outlive its call can be started through `execute` with its output
+  redirected — `nohup server > server.log 2>&1 &` returns at once.
+- **`ConsoleCapability(backend=...)` and `ConsoleDeps`**: the tools work in the
+  run's workspace, supplied by a workspace capability or `agent.run(workspace=...)`.
+- **`KubernetesPodSandbox`'s HTTP mode**: it reaches the pod only through
+  `pods/exec`, and the default pod runs `sleep infinity`.
+- **`DockerSandbox` file operations** (`read`, `write`, `edit`, `ls_info`,
+  `glob_info`, `grep_raw`, `execute`) and `max_read_bytes`: reach files through
+  a workspace, run commands with `run_command`.
+- **The live file browser in the `sandboxd` dashboard.** The terminal runs
+  through `/run`; files are browsed in the stored workspace.
+
+### Changed
+
+- **`StateBackend` is a document store, not a backend.** It keeps `files` and
+  the `directories` made empty — both JSON — and follows a filesystem's rules,
+  raising `FileNotFoundError`, `IsADirectoryError` and `NotADirectoryError`.
+  `StateWorkspace` serves documents from a store the application owns. A
+  document written by an earlier version loads unchanged.
+
+### Fixed
+
+- **`grep` found nothing on macOS.** BSD `grep` matches `--exclude` against the
+  whole path (`./f.txt`), so excluding hidden files with `.*` excluded every
+  file. Hidden directories are excluded by the shell and hidden files filtered
+  afterwards.
+- **`glob` and `grep` reported "no matches" when the sandbox was unreachable.**
+  Transport failures now surface as errors.
+- **File-read tracking was lost between tool calls** when the tools ran in a
+  workspace: the guarded operations are cached per workspace instead of rebuilt
+  on every call.
 
 ## [0.2.29] - 2026-08-22
 

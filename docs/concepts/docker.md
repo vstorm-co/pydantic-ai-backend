@@ -1,55 +1,51 @@
-# Docker Sandbox
+# Docker
 
-`DockerSandbox` provides isolated code execution for your pydantic-ai agents. Run untrusted code safely in Docker containers.
+`DockerWorkspace` gives an agent a Docker container on this host as its
+[workspace](workspaces.md): every command and file operation of the run happens in the
+container, and a later run attaches to the same one by its ref.
 
 !!! warning "Requires Docker"
     ```bash
-    pip install pydantic-ai-backend[docker]
+    pip install "pydantic-ai-backend[console,docker]"
     ```
-    Ensure Docker is installed and the daemon is running.
+    Ensure Docker is installed and the daemon is running. For an application that must
+    not hold the Docker socket itself, run [`sandboxd`](remote.md) and use
+    `SandboxdWorkspace` instead.
 
-## Basic Usage with pydantic-ai
+## Basic Usage
 
 ```python
-from dataclasses import dataclass
 from pydantic_ai import Agent
-from pydantic_ai_backends import DockerSandbox, create_console_toolset
 
+from pydantic_ai_backends import ConsoleCapability, DockerWorkspace
 
-@dataclass
-class Deps:
-    backend: DockerSandbox
+workspace = DockerWorkspace(runtime="python-datascience")
+agent = Agent("anthropic:claude-opus-5-5", capabilities=[workspace, ConsoleCapability()])
 
+result = agent.run_sync(
+    "Load the iris dataset with sklearn, analyze it with pandas, "
+    "and create a visualization with matplotlib"
+)
+print(result.output)
 
-# Create sandbox with pre-configured runtime
-sandbox = DockerSandbox(runtime="python-datascience")
-
-try:
-    # Add console tools to your agent
-    toolset = create_console_toolset()
-    agent = Agent("openai:gpt-4o", deps_type=Deps)
-    agent = agent.with_toolset(toolset)
-
-    # Agent can safely execute arbitrary code in Docker
-    result = agent.run_sync(
-        "Load the iris dataset with sklearn, analyze it with pandas, "
-        "and create a visualization with matplotlib",
-        deps=Deps(backend=sandbox),
-    )
-    print(result.output)
-finally:
-    sandbox.stop()  # Clean up container
+# The container outlives the run; remove it when the conversation is over.
+await workspace.destroy(result.workspace.ref)
 ```
+
+The first operation creates a container named `pydantic-ai-workspace-…`. Pass the message
+history to the next run and it attaches to the same container — files, installed packages
+and all; a stopped one is started again, and one that was removed fails with
+`WorkspaceUnavailableError` rather than continuing in an empty container.
 
 ## Runtime Configurations
 
 Pre-configured environments with packages pre-installed:
 
 ```python
-from pydantic_ai_backends import DockerSandbox, RuntimeConfig
+from pydantic_ai_backends import DockerWorkspace, RuntimeConfig
 
 # Use built-in runtime
-sandbox = DockerSandbox(runtime="python-datascience")
+workspace = DockerWorkspace(runtime="python-datascience")
 
 # Or define custom runtime for your use case
 runtime = RuntimeConfig(
@@ -57,7 +53,7 @@ runtime = RuntimeConfig(
     base_image="python:3.12-slim",
     packages=["torch", "transformers", "pandas"],
 )
-sandbox = DockerSandbox(runtime=runtime)
+workspace = DockerWorkspace(runtime=runtime)
 ```
 
 ### Built-in Runtimes
@@ -115,130 +111,52 @@ of it through its own `env_vars`.
   pip survives. Capped it fits, and is still 6.6× faster than pip.
 - **`LANG=C.UTF-8`**, because `node:20-slim` ships no locale at all.
 
-## SessionManager for Multi-User
+## One Container per Conversation
 
-For web apps where each user needs isolated execution:
+The ref is the conversation's container. Store the message history (or `result.workspace.ref`)
+with the conversation, and every turn reaches the same environment; a different conversation
+gets a container of its own. Call `destroy(ref)` when a conversation is deleted — nothing
+removes a container for you.
+
+What `DockerWorkspace` does not do is manage a fleet: idle reaping, a ceiling on running
+containers, per-tenant capacity, hibernation. That is what [`sandboxd`](remote.md) is for,
+built on the same `DockerSandbox` and the same command path.
+
+## Options
+
+`image`, `runtime`, `work_dir`, `network_mode`, `mem_limit`, `cpus` and `oci_runtime` are
+fields of `DockerWorkspace`. For a container option it does not expose — volumes, a tmpfs,
+a pids limit — build the backend yourself with a factory that returns the `DockerSandbox`
+you want:
 
 ```python
-from dataclasses import dataclass
-from pydantic_ai import Agent
-from pydantic_ai_backends import SessionManager, DockerSandbox, create_console_toolset
+from pydantic_ai_backends import DockerSandbox, DockerWorkspaceBackend
 
 
-@dataclass
-class UserDeps:
-    backend: DockerSandbox
-    user_id: str
-
-
-# Create session manager
-manager = SessionManager(
-    default_runtime="python-datascience",
-    workspace_root="/app/workspaces",  # Persistent storage per user
-)
-
-
-async def handle_user_request(user_id: str, message: str):
-    # Get or create sandbox for this user
-    sandbox = await manager.get_or_create(user_id)
-
-    # Create agent with user's isolated sandbox
-    toolset = create_console_toolset()
-    agent = Agent("openai:gpt-4o", deps_type=UserDeps)
-    agent = agent.with_toolset(toolset)
-
-    result = await agent.run(
-        message,
-        deps=UserDeps(backend=sandbox, user_id=user_id),
+def sandbox(name: str) -> DockerSandbox:
+    return DockerSandbox(
+        image="python:3.12-slim",
+        container_name=name,
+        volumes={"/host/data": "/workspace/data"},
+        tmpfs={"/tmp": "size=64m"},
+        pids_limit=256,
     )
-    return result.output
 
 
-# Each user's code runs in isolated container
-# User A cannot see User B's files
+result = await agent.run("...", workspace=DockerWorkspaceBackend(sandbox_factory=sandbox))
 ```
-
-### Architecture
-
-```
-                    ┌─────────────────┐
-                    │ SessionManager  │
-                    └────────┬────────┘
-                             │
-        ┌────────────────────┼────────────────────┐
-        │                    │                    │
-┌───────▼───────┐   ┌───────▼───────┐   ┌───────▼───────┐
-│ DockerSandbox │   │ DockerSandbox │   │ DockerSandbox │
-│   (User A)    │   │   (User B)    │   │   (User C)    │
-│  pydantic-ai  │   │  pydantic-ai  │   │  pydantic-ai  │
-│    Agent      │   │    Agent      │   │    Agent      │
-└───────────────┘   └───────────────┘   └───────────────┘
-```
-
-## Persistent Storage
-
-By default, files are lost when container stops. Use volumes for persistence:
-
-```python
-sandbox = DockerSandbox(
-    runtime="python-datascience",
-    volumes={"/host/data": "/workspace/data"},  # Mount host directory
-)
-```
-
-### Named Containers (Reusable)
-
-Use `container_name` to create containers that persist between sessions.
-Installed packages, caches, and filesystem state survive restarts:
-
-```python
-sandbox = DockerSandbox(
-    image="python:3.12-slim",
-    container_name="my-dev-env",  # implies auto_remove=False
-    volumes={"/my/project": "/workspace"},
-)
-# First run: creates container "my-dev-env"
-# Next run: finds it, restarts if stopped, reattaches
-```
-
-With SessionManager, each user gets their own persistent directory:
-
-```python
-manager = SessionManager(
-    workspace_root="/app/workspaces",  # Creates /app/workspaces/{user_id}/
-)
-```
-
-### Custom Sandbox Factory
-
-`SessionManager` accepts a `sandbox_factory` callable to use any sandbox
-backend (Daytona, custom implementations, etc.):
-
-```python
-from pydantic_ai_backends import SessionManager, DaytonaSandbox
-
-
-def daytona_factory(session_id: str) -> DaytonaSandbox:
-    return DaytonaSandbox(sandbox_id=session_id)
-
-
-manager = SessionManager(sandbox_factory=daytona_factory)
-sandbox = await manager.get_or_create("user-123")
-```
-
-When no factory is provided, `SessionManager` defaults to creating
-`DockerSandbox` instances (fully backward compatible).
 
 ## Security
 
-- Each user gets a separate Docker container
-- Users cannot access each other's files
-- Containers can have resource limits (CPU, memory)
-- Network isolation available via Docker networking
-- No host filesystem access (unless explicitly mounted)
+- Each workspace is its own container; conversations cannot see each other's files.
+- `no-new-privileges`, an init process and a pids limit are on by default; memory and CPU
+  ceilings are fields.
+- `network_mode="none"` keeps a container off the network.
+- Under Docker's default `runc` a container shares the host kernel. `oci_runtime="runsc"`
+  (gVisor) or `"kata"` moves that boundary, which is the right trade for model-written code.
 
 ## Next Steps
 
-- [Multi-User Example](../examples/multi-user.md) - Web app with SessionManager
-- [Docker Sandbox Example](../examples/docker-sandbox.md) - Full example
+- [Workspaces](workspaces.md) - refs, removal, the conformance results
+- [sandboxd](remote.md) - the same containers behind an HTTP service
 - [API Reference](../api/docker.md) - Complete API

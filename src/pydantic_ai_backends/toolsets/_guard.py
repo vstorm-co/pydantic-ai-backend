@@ -1,8 +1,8 @@
-"""Applying a permission ruleset from code that cannot prompt the user.
+"""Applying a permission ruleset to the console tools' workspace operations.
 
-A ruleset can resolve an operation to "ask", but file operations on a sync
-backend have nobody to ask. This module holds that reconciliation in one place:
-which operations refuse outright, which quietly hide results, and how an
+A ruleset can resolve an operation to "ask", but a file operation in the middle
+of a tool call has nobody to ask. This module holds that reconciliation in one
+place: which operations refuse outright, which quietly hide results, and how an
 `execute` is inspected for the paths it would touch.
 """
 
@@ -17,12 +17,10 @@ from pydantic_ai_backends.permissions.checker import PermissionAskError, Permiss
 from pydantic_ai_backends.types import EditResult, WriteResult
 
 if TYPE_CHECKING:
-    from typing import Any
-
     from pydantic_ai_backends.permissions.checker import AskCallback, AskFallback
     from pydantic_ai_backends.permissions.types import PermissionOperation, PermissionRuleset
-    from pydantic_ai_backends.protocol import AsyncBackendProtocol, BackendProtocol
-    from pydantic_ai_backends.types import FileInfo, GrepMatch
+    from pydantic_ai_backends.toolsets._workspace import FileOps
+    from pydantic_ai_backends.types import ExecuteResponse, FileInfo, GrepMatch
 
 GUARDED_COMMAND_OPERATIONS: tuple[PermissionOperation, ...] = ("read", "write")
 """Operations whose deny rules also block a command that names such a path."""
@@ -115,7 +113,7 @@ class PermissionGuard:
 
         This is defense in depth, not a boundary — a shell can reach a file in
         ways string inspection cannot see. For enforced isolation use a
-        sandboxed backend such as `DockerSandbox`.
+        sandboxed workspace such as `DockerWorkspace`.
         """
         reason = self.denial_reason("execute", command)
         if reason is not None:
@@ -166,22 +164,13 @@ class PermissionGuard:
         return targets
 
 
-class GuardedBackend:
-    """Any backend, with a ruleset's per-path rules actually applied.
+class GuardedOps:
+    """The console tools' operations, with a ruleset's per-path rules applied.
 
-    `PermissionGuard` has existed since `LocalBackend` needed it, and only
-    `LocalBackend` ever used it — so a ruleset handed to `ConsoleCapability`
-    reached `requires_approval` (the approval flags) and `_denied_tools` (drop a
-    tool whose *operation* defaults to deny) and nothing else. Per-path `rules`
-    were never read. With every operation left at `default="allow"` and the
-    patterns in `rules`, a caller who had written out `**/.env`, `**/*.pem` and
-    `/etc/**` got no enforcement at all, and the result looked like a working
-    boundary — which is worse than rejecting the ruleset outright.
-
-    Wrapping the backend rather than checking inside each tool is what makes it
-    total: every console tool reaches the filesystem through this protocol, so a
-    tool added in a later release is covered on the day it arrives rather than the
-    day somebody remembers to list it.
+    Wrapping the operations rather than checking inside each tool is what makes
+    it total: every console tool reaches the workspace through them, so a tool
+    added in a later release is covered on the day it arrives rather than the day
+    somebody remembers to list it.
 
     **Content and mutation are refused; listings are filtered by their own rules.**
     `read`, `read_bytes` and `grep_raw` are the three ways bytes leave a file, and
@@ -193,27 +182,19 @@ class GuardedBackend:
     `read`, which is what `PermissionGuard.hides_from_grep` is for.
 
     `ls_info` and `glob_info` drop entries denied for `ls` and `glob`
-    respectively, matching `LocalBackend` — and deliberately **not** consulting
-    the `read` rules. So a ruleset that denies reading `**/.env` still lists it by
-    name, and one that wants the name hidden has to say so on `ls` and `glob`.
-    Worth knowing rather than guessing at: a name is a weaker claim than the
-    contents, `ls` returning nothing for a file an agent can see with `exists`
-    would send it rewriting one it cannot read, and a ruleset defaulting to
-    `"ask"` would otherwise blank out every listing.
+    respectively — and deliberately **not** consulting the `read` rules. So a
+    ruleset that denies reading `**/.env` still lists it by name, and one that
+    wants the name hidden has to say so on `ls` and `glob`. A name is a weaker
+    claim than the contents, and a ruleset defaulting to `"ask"` would otherwise
+    blank out every listing.
 
     `execute` goes through `execute_denial_reason`, so the obvious bypass
     (`cat restricted/secret.txt`) is caught. That is defence in depth and not a
     boundary: a shell reaches files in ways string inspection cannot see, and real
-    isolation is a sandboxed backend's job.
-
-    Async throughout, and `ensure_async` is applied to what it wraps. A sync guard
-    over an async backend would return un-awaited coroutines, and the alternative —
-    two parallel implementations — is two things to keep in agreement. The console
-    toolset calls `ensure_async` on every tool call anyway, so this costs nothing
-    that was not already paid.
+    isolation is the workspace's job.
 
     Args:
-        backend: What to wrap. Sync or async; both come out async.
+        ops: What to wrap.
         ruleset: Rules to apply.
         root: Directory commands run in, for resolving their path arguments.
         ask_callback: Async approval callback, passed to the checker.
@@ -222,36 +203,20 @@ class GuardedBackend:
 
     def __init__(
         self,
-        backend: BackendProtocol | AsyncBackendProtocol,
+        ops: FileOps,
         ruleset: PermissionRuleset,
         *,
         root: Path | None = None,
         ask_callback: AskCallback | None = None,
         ask_fallback: AskFallback = "error",
     ) -> None:
-        from pydantic_ai_backends.adapter import ensure_async
-
-        self._backend = ensure_async(backend)
-        # Kept as well: the async adapter proxies the protocol and `execute`, but
-        # not `stop`, `id` or a backend's own extras, and `__getattr__` below has
-        # to be able to reach them.
-        self._raw = backend
+        self._backend = ops
         self._guard = PermissionGuard(
             ruleset,
             root if root is not None else Path("/"),
             ask_callback=ask_callback,
             ask_fallback=ask_fallback,
         )
-
-    @property
-    def permissions(self) -> PermissionRuleset:
-        """The ruleset in force.
-
-        Present so a caller — and `create_console_toolset` — can tell a backend
-        that already enforces its own rules from one that does not, and avoid
-        wrapping twice.
-        """
-        return self._guard.checker.ruleset
 
     async def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
         reason = self._guard.denial_reason("read", path)
@@ -303,76 +268,26 @@ class GuardedBackend:
             return found
         return [match for match in found if not self._guard.hides_from_grep(match["path"])]
 
-    def _guarded_execute(self) -> Any:
-        """`execute`, refusing a command that names a path the rules deny.
-
-        Deliberately **not** a method on the class, and that is not a style
-        choice. The console toolset asks `hasattr(backend, "execute")` to decide
-        whether a backend can run commands at all, and answers
-        "Backend does not support command execution" when it cannot. A declared
-        method would make that true for every backend - so a `StateBackend`, which
-        has no shell, would stop giving that answer and start raising instead.
-
-        Reached through `__getattr__`, the `getattr` below raises `AttributeError`
-        for a backend with no `execute`, which is exactly what `hasattr` needs to
-        see.
-
-        Raises:
-            AttributeError: If the wrapped backend cannot execute anything.
-        """
-        inner = getattr(self._backend, "execute")  # noqa: B009 - AttributeError is the point
-
-        async def execute(command: str, timeout: int | None = None) -> Any:
-            reason = self._guard.execute_denial_reason(command)
-            if reason is not None:
-                raise PermissionError(reason)
-            return await inner(command, timeout)
-
-        return execute
-
-    def __getattr__(self, name: str) -> Any:
-        """Everything the protocol does not name, straight through to the backend.
-
-        A sandbox is more than the protocol: `stop`, `start`, `id`, `files` on a
-        `StateBackend`. Delegating by name keeps this wrapper from quietly removing
-        a capability the way an explicit list would.
-
-        `execute` is the exception, because it is the one non-protocol operation
-        the rules have something to say about - see `_guarded_execute`.
-
-        Everything else comes back with the shape the *unwrapped* backend has, so
-        `stop` stays synchronous. That is the right contract for a transparent
-        wrapper: code that worked on the backend works on this.
-        """
-        if name == "execute":
-            return self._guarded_execute()
-        return getattr(self._raw, name)
-
-    def __repr__(self) -> str:
-        return f"<GuardedBackend({self._raw!r})>"
+    async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
+        reason = self._guard.execute_denial_reason(command)
+        if reason is not None:
+            raise PermissionError(reason)
+        return await self._backend.execute(command, timeout)
 
 
 def guarding(
-    backend: BackendProtocol | AsyncBackendProtocol,
+    ops: FileOps,
     ruleset: PermissionRuleset | None,
     *,
     root: Path | None = None,
     ask_callback: AskCallback | None = None,
     ask_fallback: AskFallback = "error",
-) -> BackendProtocol | AsyncBackendProtocol:
-    """`backend` with `ruleset` enforced, or `backend` unchanged.
-
-    Unchanged in the two cases where wrapping would be wrong rather than merely
-    unnecessary: there is no ruleset to apply, or the backend already applies one
-    of its own — `LocalBackend` does, and wrapping it would check every path twice
-    and report the second refusal.
-    """
+) -> FileOps:
+    """`ops` with `ruleset` enforced, or `ops` unchanged when there is none."""
     if ruleset is None:
-        return backend
-    if getattr(backend, "permissions", None) is not None:
-        return backend
-    return GuardedBackend(
-        backend,
+        return ops
+    return GuardedOps(
+        ops,
         ruleset,
         root=root,
         ask_callback=ask_callback,

@@ -1,5 +1,5 @@
 site_name: Pydantic AI Backend
-site_description: Console Toolset, Docker Sandbox, and Permission System for AI Agents
+site_description: Workspaces, console tools and permissions for Pydantic AI agents
 site_url: https://vstorm-co.github.io/pydantic-ai-backend/
 repo_url: https://github.com/vstorm-co/pydantic-ai-backend
 repo_name: vstorm-co/pydantic-ai-backend
@@ -145,23 +145,22 @@ extra_css:
   - stylesheets/extra.css
 
 nav:
-  - Backends: index.md
+  - Home: index.md
   - Installation: installation.md
   - Getting Help: getting-help.md
   - Core Concepts:
     - concepts/index.md
+    - Workspaces: concepts/workspaces.md
     - Capability: concepts/capability.md
-    - Backends: concepts/backends.md
-    - Permissions: concepts/permissions.md
-    - Docker Sandbox: concepts/docker.md
-    - Daytona Sandbox: concepts/daytona.md
-    - Kubernetes Sandbox: concepts/kubernetes.md
-    - Remote Sandboxes: concepts/remote.md
-    - Pydantic AI Workspaces: concepts/workspaces.md
     - Console Toolset: concepts/console-toolset.md
+    - Permissions: concepts/permissions.md
+    - Docker: concepts/docker.md
+    - sandboxd: concepts/remote.md
+    - Kubernetes: concepts/kubernetes.md
+    - Daytona: concepts/daytona.md
   - Examples:
     - examples/index.md
-    - Local Backend: examples/local-backend.md
+    - Local Workspace: examples/local-workspace.md
     - Docker Sandbox: examples/docker-sandbox.md
     - Kubernetes Sandbox: examples/kubernetes-sandbox.md
     - Remote Sandbox: examples/remote-sandbox.md
@@ -170,13 +169,11 @@ nav:
   - API Reference:
     - api/index.md
     - Capability: api/capability.md
-    - Backends: api/backends.md
+    - Workspaces: api/workspaces.md
     - Permissions: api/permissions.md
     - Docker: api/docker.md
-    - Daytona: api/daytona.md
     - Kubernetes: api/kubernetes.md
-    - Remote: api/remote.md
-    - Workspaces: api/workspaces.md
+    - sandboxd: api/remote.md
     - Toolsets: api/toolsets.md
     - Types: api/types.md
   - Changelog: changelog.md

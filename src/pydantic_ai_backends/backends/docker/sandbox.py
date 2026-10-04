@@ -1,38 +1,21 @@
-"""Sandbox that runs commands and holds files inside a Docker container."""
+"""A Docker container the workspaces and `sandboxd` run commands in."""
 
 from __future__ import annotations
 
 import contextlib
-import io
-import shlex
-import tarfile
 import time
+import uuid
 import warnings
-from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
-from pydantic_ai_backends._editing import Replacement, replace_in_content
-from pydantic_ai_backends._limits import (
-    DEFAULT_MAX_READ_BYTES,
-    MAX_EXECUTE_OUTPUT_BYTES,
-    MAX_RUN_OUTPUT_BYTES,
-    READ_LIMIT_HINT,
-)
-from pydantic_ai_backends._text import bytes_to_text
-from pydantic_ai_backends.backends.base import BaseSandbox
+from pydantic_ai_backends._limits import MAX_RUN_OUTPUT_BYTES
 from pydantic_ai_backends.backends.docker._client import docker_client
 from pydantic_ai_backends.backends.docker._image import resolve_image
 from pydantic_ai_backends.backends.docker._stats import parse_usage
-from pydantic_ai_backends.types import (
-    EditResult,
-    ExecuteResponse,
-    RuntimeConfig,
-    SandboxUsage,
-    WriteResult,
-)
+from pydantic_ai_backends.types import RuntimeConfig, SandboxUsage
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Mapping, Sequence
+    from collections.abc import Mapping, Sequence
 
     from docker import DockerClient
     from docker.models.containers import Container
@@ -114,21 +97,14 @@ leave git reading configuration that is not there.
 """
 
 
-class ReadLimitExceeded(Exception):
-    """Raised when a file is too large to pull out of the container.
+class DockerSandbox:
+    """One Docker container: its lifecycle, its limits, and commands run in it.
 
-    Distinct from the empty-bytes result used for a missing file: callers turn
-    this into a message explaining what to do instead (read a slice), which an
-    empty `bytes` return could not convey.
-    """
-
-
-class DockerSandbox(BaseSandbox):
-    """Docker-based sandbox for isolated command execution.
-
-    The container starts lazily on the first operation. File transfers use
-    Docker's archive API rather than shell heredocs, so content with quotes,
-    newlines or arbitrary bytes survives a round trip intact.
+    The container starts lazily on the first command or an explicit
+    :meth:`start`. Commands go through :meth:`run_command`, which keeps the
+    workspace contract; files are reached through those commands by whoever uses
+    the container — :class:`~pydantic_ai_backends.workspaces.DockerWorkspace`, or
+    `sandboxd`, which also mounts the work directory from the host.
 
     Example:
         ```python
@@ -163,7 +139,6 @@ class DockerSandbox(BaseSandbox):
         cpu_shares: int | None = None,
         pids_limit: int | None = DEFAULT_PIDS_LIMIT,
         tmpfs: dict[str, str] | None = None,
-        max_read_bytes: int = DEFAULT_MAX_READ_BYTES,
         oci_runtime: str | None = None,
     ):
         """Initialize the sandbox without starting its container.
@@ -221,9 +196,6 @@ class DockerSandbox(BaseSandbox):
                 that fills a 64m `/tmp` has that much less left for its own
                 processes, and one that tries to exceed the limit through `/tmp`
                 is killed by its own cgroup rather than troubling the host.
-            max_read_bytes: Largest file `read`/`read_bytes`/`edit` will pull
-                out of the container. Oversized files are refused instead of
-                being buffered into the host's memory.
             oci_runtime: Low-level runtime the daemon starts this container
                 with — Docker's `--runtime`. `None` takes the daemon's default,
                 normally `runc`.
@@ -241,7 +213,7 @@ class DockerSandbox(BaseSandbox):
                 daemon refuse to start the container. See the installation docs
                 for the host side, including `crun` as a faster drop-in default.
         """
-        super().__init__(session_id or sandbox_id)
+        self._id = session_id or sandbox_id or str(uuid.uuid4())
 
         self._container_name = container_name
         self._auto_remove = False if container_name else auto_remove
@@ -256,7 +228,6 @@ class DockerSandbox(BaseSandbox):
         self._cpu_shares = cpu_shares
         self._pids_limit = pids_limit
         self._tmpfs = tmpfs or {}
-        self._max_read_bytes = max_read_bytes
         self._oci_runtime = oci_runtime
         self._alive = False
         self._alive_checked_at: float | None = None
@@ -275,6 +246,20 @@ class DockerSandbox(BaseSandbox):
         return self._runtime
 
     @property
+    def id(self) -> str:
+        """Unique identifier for this sandbox."""
+        return self._id
+
+    @property
+    def last_activity(self) -> float:
+        """Wall clock of the last operation, which idle cleanup reaps against."""
+        return self._last_activity
+
+    def touch(self) -> None:
+        """Record activity, so idle cleanup does not reap a sandbox in use."""
+        self._last_activity = time.time()
+
+    @property
     def session_id(self) -> str:
         """Alias for the sandbox id, used for session management."""
         return self._id
@@ -288,12 +273,6 @@ class DockerSandbox(BaseSandbox):
     def work_dir(self) -> str:
         """Directory commands start in and relative paths resolve against."""
         return self._work_dir
-
-    def _resolve_path(self, path: str) -> str:
-        """Resolve a relative path against the container's working directory."""
-        if not PurePosixPath(path).is_absolute():
-            return str(PurePosixPath(self._work_dir) / path)
-        return path
 
     # ── Container lifecycle ────────────────────────────────────────────
 
@@ -462,9 +441,8 @@ class DockerSandbox(BaseSandbox):
         Args:
             purge: Also remove the container, discarding its filesystem state.
                 Named `purge` so that one call site can end any sandbox this
-                library offers - `RemoteSandbox`, `DaytonaSandbox` and the
-                Kubernetes pod all spell the same idea this way, and this one
-                used to spell it `remove`. A caller holding "a sandbox" could
+                library offers - the Kubernetes pod spells the same idea this
+                way, and this one used to spell it `remove`. A caller holding "a sandbox" could
                 not call `stop` without knowing which it had.
             remove: The old name for `purge`, still honoured so nothing that
                 passes it breaks. Deprecated; pass `purge` instead.
@@ -502,37 +480,6 @@ class DockerSandbox(BaseSandbox):
                 self.stop()
 
     # ── Commands ───────────────────────────────────────────────────────
-
-    def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
-        """Run a command in the container.
-
-        Output beyond `MAX_EXECUTE_OUTPUT_BYTES` is discarded before decoding,
-        so the cap is measured in bytes rather than characters.
-        """
-        self._ensure_container()
-        self._last_activity = time.time()
-        assert self._container is not None
-
-        # The Docker SDK's exec_run takes no timeout, so the command is wrapped
-        # in the `timeout` utility instead.
-        argv = ["sh", "-c", command]
-        if timeout is not None:
-            argv = ["timeout", str(timeout), *argv]
-
-        try:
-            exit_code, output = self._container.exec_run(argv, workdir=self._work_dir)
-            if not isinstance(output, bytes):
-                output = b"".join(output)
-        except Exception as e:
-            return ExecuteResponse(output=f"Error: {e}", exit_code=1, truncated=False)
-
-        # Sliced before decoding: decoding the whole payload only to throw most
-        # of it away doubled peak memory on commands like `cat big.log`.
-        return ExecuteResponse(
-            output=output[:MAX_EXECUTE_OUTPUT_BYTES].decode("utf-8", errors="replace"),
-            exit_code=exit_code,
-            truncated=len(output) > MAX_EXECUTE_OUTPUT_BYTES,
-        )
 
     async def run_command(
         self,
@@ -591,194 +538,9 @@ class DockerSandbox(BaseSandbox):
         if self._container is not None:
             await _exec.stop_in_container(self._container, run_id)
 
-    # ── Files ──────────────────────────────────────────────────────────
-
-    def read_bytes(self, path: str) -> bytes:
-        """Read a whole file as bytes.
-
-        Returns:
-            The content, or `b""` when the file is missing, unreadable, or over
-            `max_read_bytes`. Use `read` when the reason matters — it reports
-            the limit explicitly.
-        """
-        try:
-            return self._fetch_file_bytes(self._resolve_path(path))
-        except ReadLimitExceeded:
-            return b""
-
-    def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
-        """Read a slice of a text file, decoding or extracting it as needed."""
-        resolved = self._resolve_path(path)
-        try:
-            data = self._fetch_file_bytes(resolved)
-            if not data:
-                return f"Error: File '{path}' not found"
-
-            extension = Path(resolved).suffix.lower().lstrip(".")
-            try:
-                lines = bytes_to_text(extension, data).splitlines()
-            except ValueError as e:
-                return f"[Error: {e}]"
-
-            if offset >= len(lines):
-                return "[End of file]"
-
-            end = offset + limit
-            chunk = "\n".join(lines[offset:end])
-            if end >= len(lines):
-                return chunk
-            remaining = len(lines) - end
-            return f"{chunk}\n\n[... {remaining} more lines. Use offset={end} to read more.]"
-
-        except ReadLimitExceeded as e:
-            return f"[Error: {e}]"
-        except Exception as e:
-            return f"[Error reading file: {e}]"
-
-    def edit(
-        self, path: str, old_string: str, new_string: str, replace_all: bool = False
-    ) -> EditResult:
-        """Edit a file by replacing a string.
-
-        The file is fetched, edited in Python and written back, so multiline
-        strings need no shell escaping.
-        """
-        resolved = self._resolve_path(path)
-        try:
-            data = self._fetch_file_bytes(resolved)
-            if not data:
-                return EditResult(error=f"File '{path}' not found")
-
-            extension = Path(resolved).suffix.lower().lstrip(".")
-            try:
-                content = bytes_to_text(extension, data)
-            except ValueError as e:
-                return EditResult(error=str(e))
-
-            outcome = replace_in_content(content, old_string, new_string, replace_all)
-            if not isinstance(outcome, Replacement):
-                return EditResult(error=outcome)
-
-            written = self.write(resolved, outcome.content)
-            if written.error:
-                return EditResult(error=written.error)
-            return EditResult(path=resolved, occurrences=outcome.occurrences)
-
-        except ReadLimitExceeded as e:
-            return EditResult(error=str(e))
-        except Exception as e:
-            return EditResult(error=f"Failed to edit file: {e}")
-
-    def write(self, path: str, content: str | bytes) -> WriteResult:
-        """Write a file, creating parent directories as needed."""
-        path = self._resolve_path(path)
-        self._ensure_container()
-        assert self._container is not None
-
-        try:
-            parent = str(PurePosixPath(path).parent)
-            mkdir = self.execute(f"mkdir -p {shlex.quote(parent)}")
-            if mkdir.exit_code != 0:
-                return WriteResult(error=f"Failed to create directory: {mkdir.output}")
-
-            raw = content if isinstance(content, bytes) else content.encode()
-            archive = _single_file_archive(PurePosixPath(path).name, raw)
-
-            # put_archive returns False when the target is not a directory or
-            # the upload otherwise fails.
-            if not self._container.put_archive(parent, archive):
-                return WriteResult(error=f"Failed to write file: put_archive to {parent}")
-            return WriteResult(path=path)
-        except Exception as e:
-            return WriteResult(error=f"Failed to write file: {e}")
-
-    def _fetch_file_bytes(self, path: str) -> bytes:
-        """Fetch a file's raw bytes out of the container.
-
-        Args:
-            path: Absolute path inside the container.
-
-        Returns:
-            The content, or `b""` when the path is missing or holds no regular
-            file.
-
-        Raises:
-            ReadLimitExceeded: If the file is over `max_read_bytes`.
-        """
-        self._ensure_container()
-        assert self._container is not None
-
-        try:
-            raw_stream, stat = self._container.get_archive(path)
-        except Exception:
-            return b""
-
-        # docker-py streams the archive from a generator, so it can be closed to
-        # release the socket as soon as the file turns out to be too large. The
-        # stub only promises an Iterator, which has no `close`.
-        stream = cast("Generator[bytes, None, None]", raw_stream)
-
-        # get_archive reports the size in a response header, so an oversized
-        # file is refused before any of its content crosses the socket.
-        reported_size = stat.get("size") if stat else None
-        if reported_size is not None and reported_size > self._max_read_bytes:
-            stream.close()
-            raise ReadLimitExceeded(
-                f"File is {reported_size} bytes, over the "
-                f"{self._max_read_bytes}-byte read limit. {READ_LIMIT_HINT}"
-            )
-
-        # Accumulated straight into the buffer tarfile reads from; a
-        # `b"".join(stream)` -> `BytesIO(...)` chain held several copies at once.
-        buffer = io.BytesIO()
-        try:
-            for chunk in stream:
-                buffer.write(chunk)
-                # Re-checked while streaming to stay bounded even when the
-                # daemon omits the size header.
-                if buffer.tell() > self._max_read_bytes:
-                    stream.close()
-                    raise ReadLimitExceeded(
-                        f"File exceeds the {self._max_read_bytes}-byte read limit. "
-                        f"{READ_LIMIT_HINT}"
-                    )
-        except ReadLimitExceeded:
-            raise
-        except Exception:
-            return b""
-
-        return _extract_single_file(buffer)
-
 
 def _with_exec(options: str) -> str:
     """Add `exec` to a tmpfs option string unless it is already spelled out."""
     if "exec" in {option.strip() for option in options.split(",")}:
         return options
     return f"{options},{TMPFS_OPTIONS}" if options else TMPFS_OPTIONS
-
-
-def _single_file_archive(name: str, content: bytes) -> io.BytesIO:
-    """Wrap one file's content in the tar stream `put_archive` expects."""
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w") as tar:
-        entry = tarfile.TarInfo(name=name)
-        entry.size = len(content)
-        entry.mtime = int(time.time())
-        entry.mode = 0o644
-        tar.addfile(entry, io.BytesIO(content))
-    buffer.seek(0)
-    return buffer
-
-
-def _extract_single_file(buffer: io.BytesIO) -> bytes:
-    """Read the first regular file out of a tar stream, or `b""`."""
-    try:
-        buffer.seek(0)
-        with buffer, tarfile.open(fileobj=buffer, mode="r") as tar:
-            member = next((m for m in tar.getmembers() if m.isfile()), None)
-            if member is None:
-                return b""
-            extracted = tar.extractfile(member)
-            return extracted.read() if extracted is not None else b""
-    except Exception:
-        return b""

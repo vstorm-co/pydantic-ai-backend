@@ -1,8 +1,8 @@
 # Workspaces API
 
-Pydantic AI workspaces backed by this library's sandboxes, and this library's
-sandbox protocol over any workspace. See [Pydantic AI Workspaces](../concepts/workspaces.md)
-for the concepts. Needs the `workspaces` extra.
+Pydantic AI workspace capabilities backed by this library's sandboxes. See
+[Workspaces](../concepts/workspaces.md) for the concepts. Needs the `workspaces`
+extra, plus the provider's own (`docker`, `kubernetes`, `daytona`).
 
 ## DockerWorkspace
 
@@ -41,22 +41,69 @@ for the concepts. Needs the `workspaces` extra.
         - run
         - purge
 
-## WorkspaceSandbox
+## KubernetesWorkspace
 
-::: pydantic_ai_backends.workspaces.WorkspaceSandbox
+::: pydantic_ai_backends.workspaces.KubernetesWorkspace
     options:
       show_root_heading: true
+      members:
+        - backend
+        - get_workspace
+        - destroy
+
+::: pydantic_ai_backends.workspaces.KubernetesWorkspaceBackend
+    options:
+      show_root_heading: true
+      members:
+        - ref
+        - working_dir
+        - run
+
+## DaytonaWorkspace
+
+::: pydantic_ai_backends.workspaces.DaytonaWorkspace
+    options:
+      show_root_heading: true
+      members:
+        - backend
+        - get_workspace
+        - destroy
+
+::: pydantic_ai_backends.workspaces.DaytonaWorkspaceBackend
+    options:
+      show_root_heading: true
+      members:
+        - ref
+        - working_dir
+        - run
+        - purge
+
+## StateWorkspace
+
+::: pydantic_ai_backends.workspaces.StateWorkspace
+    options:
+      show_root_heading: true
+      members:
+        - backend
+        - get_workspace
+        - destroy
+
+::: pydantic_ai_backends.workspaces.StateWorkspaceBackend
+    options:
+      show_root_heading: true
+      members:
+        - ref
+        - working_dir
+        - read_bytes
+        - write_bytes
+        - stat
+        - list_dir
+        - make_dir
+        - remove
+        - exists
 
 ## Commands under the workspace contract
 
-::: pydantic_ai_backends.protocol.CommandRunner
-    options:
-      show_root_heading: true
-
 ::: pydantic_ai_backends.types.CommandOutcome
-    options:
-      show_root_heading: true
-
-::: pydantic_ai_backends.protocol.SandboxUnavailableError
     options:
       show_root_heading: true

@@ -1,6 +1,6 @@
 # Predictive Analytics Demo
 
-PydanticAI agent with Docker sandbox for data science predictions.
+Pydantic AI agent with a Docker workspace for data science predictions.
 
 ![3 products comparison — historical trends + 6-month forecast](../../assets/3_products_example.png)
 
@@ -25,7 +25,7 @@ FastAPI Server
     |
 PydanticAI Agent
     ├── query_data      → reads sales_data.json
-    ├── predict          → sub-agent + DockerSandbox
+    ├── predict          → sub-agent working in a DockerWorkspace container
     └── generate_chart   → LineChartData → Chart.js
 ```
 

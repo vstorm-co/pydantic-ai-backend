@@ -17,10 +17,10 @@ Multi-user web service with isolated Docker sandboxes, AI agent, and web UI.
 ├─────────────────────────────────────────────────────────────┤
 │                      FastAPI Server                         │
 ├─────────────────────────────────────────────────────────────┤
-│                    SessionManager                           │
+│        DockerWorkspace — one container per session ref      │
 ├───────────────┬───────────────┬───────────────┬────────────┤
-│ DockerSandbox │ DockerSandbox │ DockerSandbox │    ...     │
-│   (User A)    │   (User B)    │   (User C)    │            │
+│   container   │   container   │   container   │    ...     │
+│  (session A)  │  (session B)  │  (session C)  │            │
 └───────────────┴───────────────┴───────────────┴────────────┘
 ```
 
@@ -28,10 +28,10 @@ Multi-user web service with isolated Docker sandboxes, AI agent, and web UI.
 
 ```bash
 # Install dependencies
-pip install pydantic-ai-backend[docker] fastapi uvicorn pydantic-ai jinja2
+pip install "pydantic-ai-backend[console,docker]" fastapi uvicorn jinja2
 
 # Set API key
-export OPENAI_API_KEY="your-key"
+export ANTHROPIC_API_KEY="your-key"
 
 # Start server
 python server.py

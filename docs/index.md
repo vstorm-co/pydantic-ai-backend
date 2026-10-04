@@ -24,38 +24,47 @@
     Claude Code alternative & Python agent framework. Use it standalone, or get every
     library wired together in a single `create_deep_agent()` call.
 
-**pydantic-ai-backend** provides file storage, sandbox execution, and a ready-to-use console toolset for [pydantic-ai](https://ai.pydantic.dev/) agents. Give your AI agents the ability to read, write, and execute code safely.
+**pydantic-ai-backend** gives [pydantic-ai](https://ai.pydantic.dev/) agents somewhere to
+work and the tools to work there: [workspaces](concepts/workspaces.md) Pydantic AI does not
+ship — a Docker container, a `sandboxd` session, a Kubernetes pod, a Daytona sandbox, a JSON
+document — and file and shell tools that run in whichever workspace the run has.
 
 <div class="grid cards" markdown>
 
-- :material-console: **Console Toolset**
+- :material-docker: **Self-hosted sandboxes**
 
-    Ready-to-use tools: ls, read, write, edit, glob, grep, execute
+    A container on this host, or behind `sandboxd` so your app never holds the Docker socket
 
-- :material-docker: **Docker Isolation**
+- :material-console: **Console tools**
 
-    Execute code safely in isolated containers
+    ls, read, write, edit, glob, grep, execute — in any Pydantic AI workspace
 
-- :material-folder-multiple: **Multiple Backends**
+- :material-shield-lock: **Permission system**
 
-    In-memory, filesystem, Docker — same interface
+    Per-path and per-command rules, approvals and presets
 
-- :material-shield-lock: **Permission System**
+- :material-check-decagram: **Checked against the contract**
 
-    Fine-grained access control with presets
+    Pydantic AI's own workspace conformance suite, on a real Docker daemon
 
 </div>
 
-## Quick Start (Capability API)
-
-The recommended way to add filesystem tools:
+## Quick Start
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_backends import ConsoleCapability
 
-agent = Agent("openai:gpt-4.1", capabilities=[ConsoleCapability()])
+from pydantic_ai_backends import ConsoleCapability, DockerWorkspace
+
+agent = Agent(
+    "anthropic:claude-opus-5-5",
+    capabilities=[DockerWorkspace(image="python:3.12-slim"), ConsoleCapability()],
+)
+result = agent.run_sync("Write fizzbuzz.py and run it.")
 ```
+
+The container is created on the first tool call and kept after the run; pass the message
+history to the next run and it works in the same container.
 
 ### With Permissions
 
@@ -63,66 +72,44 @@ agent = Agent("openai:gpt-4.1", capabilities=[ConsoleCapability()])
 from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_backends.permissions import READONLY_RULESET
 
-# Read-only agent — write/edit/execute tools hidden from model
-agent = Agent(
-    "openai:gpt-4.1",
-    capabilities=[
-        ConsoleCapability(permissions=READONLY_RULESET),
-    ],
-)
+# Read-only agent — write/edit/execute tools hidden from the model
+capability = ConsoleCapability(permissions=READONLY_RULESET)
 ```
 
-### Alternative: Toolset API
+## Choose Your Workspace
 
-```python
-from dataclasses import dataclass
-from pydantic_ai import Agent
-from pydantic_ai_backends import LocalBackend, create_console_toolset
-
-
-@dataclass
-class Deps:
-    backend: LocalBackend
-
-
-agent = Agent("openai:gpt-4.1", deps_type=Deps, toolsets=[create_console_toolset()])
-```
-
-## Choose Your Backend
-
-Same toolset, different backends — swap based on your use case:
+Same tools, different environments:
 
 === "Local Development"
 
     ```python
-    from pydantic_ai_backends import LocalBackend
+    from pydantic_ai.capabilities import LocalWorkspace
 
-    backend = LocalBackend(root_dir="./workspace")
+    workspace = LocalWorkspace("./workspace")  # Pydantic AI's own; isolates nothing
     ```
 
 === "Testing"
 
     ```python
-    from pydantic_ai_backends import StateBackend
+    from pydantic_ai_backends import StateWorkspace
 
-    backend = StateBackend()  # In-memory, no side effects
+    workspace = StateWorkspace()  # a JSON document, no side effects
     ```
 
 === "Production (Docker)"
 
     ```python
-    from pydantic_ai_backends import DockerSandbox
+    from pydantic_ai_backends import DockerWorkspace
 
-    backend = DockerSandbox(runtime="python-datascience")
+    workspace = DockerWorkspace(runtime="python-datascience")
     ```
 
-=== "Multi-User"
+=== "Containerised App"
 
     ```python
-    from pydantic_ai_backends import SessionManager
+    from pydantic_ai_backends import SandboxdWorkspace
 
-    manager = SessionManager(workspace_root="/app/workspaces")
-    backend = await manager.get_or_create("alice")
+    workspace = SandboxdWorkspace(service_url="http://sandboxd:8080", token="...")
     ```
 
 ## Available Tools
@@ -130,33 +117,22 @@ Same toolset, different backends — swap based on your use case:
 | Tool | Description |
 |------|-------------|
 | `ls` | List files in a directory |
-| `read_file` | Read file content with line numbers |
+| `read_file` | Read file content with line numbers, or an image or PDF the model can see |
 | `write_file` | Create or overwrite a file |
 | `edit_file` | Replace strings in a file |
 | `glob` | Find files matching a pattern |
 | `grep` | Search for patterns in files |
 | `execute` | Run shell commands (optional) |
 
-## Backend Comparison
+## Workspace Comparison
 
-| Backend | Persistence | Execution | Best For |
+| Workspace | Kept between runs | Commands | Best For |
 |---------|-------------|-----------|----------|
-| `LocalBackend` | Persistent | Yes | CLI tools, local dev |
-| `StateBackend` | Ephemeral | No | Testing, mocking |
-| `DockerSandbox` | Ephemeral* | Yes | Safe execution, multi-user |
-| `DaytonaSandbox` | Ephemeral | Yes | Cloud deployments, CI/CD, multi-user |
-| `RemoteSandbox` | Ephemeral† | Yes | Containerised apps that must not hold the Docker socket |
-| `CompositeBackend` | Mixed | Depends | Route by path prefix |
-
-*[`DockerSandbox`][pydantic_ai_backends.backends.docker.sandbox.DockerSandbox]
-supports persistent storage by mounting host directories with its `volumes`
-parameter (and `container_name` to reuse a named container across restarts).
-The [`SessionManager`][pydantic_ai_backends.backends.docker.session.SessionManager] `workspace_root`
-parameter builds these volume mounts automatically, one per session.
-
-†[`RemoteSandbox`](concepts/remote.md) is a Docker sandbox in another process, so
-persistence is the service's to configure — `SandboxdConfig(workspace_root=...)`
-gives each session a host-backed workspace that survives its container.
+| `StateWorkspace` | In your store | No | Tests, files kept in a database |
+| `DockerWorkspace` | Until destroyed | Yes | Safe execution on one host |
+| `SandboxdWorkspace` | Until destroyed, or the service's TTL | Yes | Containerised apps, many users |
+| `KubernetesWorkspace` | Until destroyed | Yes | Cluster-scheduled sandboxes |
+| `DaytonaWorkspace` | Until destroyed, or Daytona's auto-delete | Yes | Hosted sandboxes |
 
 ## Related Projects
 

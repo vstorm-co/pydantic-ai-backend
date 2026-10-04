@@ -37,7 +37,7 @@ from typing import Any
 from pydantic_ai import ModelRetry
 from pydantic_ai.tools import RunContext
 
-from pydantic_ai_backends.backends._guard import PERMISSION_DENIED_PREFIX
+from pydantic_ai_backends.toolsets._guard import PERMISSION_DENIED_PREFIX
 
 
 def is_refusal(message: str) -> bool:

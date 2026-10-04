@@ -315,7 +315,7 @@ class SandboxdWorkspace(AbstractCapability[object]):
 
     This supplies the environment only. Compose it with something that uses the
     workspace: `Coder`, `Shell` or `FileSystem` from the Pydantic AI harness, or
-    this library's `ConsoleCapability(use_workspace=True)`.
+    this library's `ConsoleCapability`.
 
     Example:
         ```python

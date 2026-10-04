@@ -1,13 +1,10 @@
-"""Wire protocol shared by the remote sandbox client and server.
+"""Wire protocol between `sandboxd` and its clients.
 
-These models are the single source of truth for the HTTP contract. The
-operation endpoints (`/exec`, `/read`, `/write`, `/ls`, `/glob`) keep the field
-names that :class:`~pydantic_ai_backends.backends.kubernetes.KubernetesPodSandbox`
-already sends in `mode="http"`, so one server can serve both clients; `/edit`,
-`/grep`, `/exists` and `/read_bytes` are additions.
+These models are the single source of truth for the HTTP contract: sessions,
+`/run` for a Pydantic AI workspace, the archive reads, the policy.
 
-Binary-capable payloads travel base64-encoded (`content_b64`) because JSON
-cannot carry arbitrary bytes, and a sandbox holds real files.
+Binary payloads travel base64-encoded (`content_b64`) because JSON cannot carry
+arbitrary bytes, and a workspace holds real files.
 """
 
 from __future__ import annotations
@@ -31,28 +28,11 @@ TENANT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 restriction as session ids rather than being free text."""
 
 
-class ExecRequest(BaseModel):
-    """Run a shell command inside the sandbox."""
-
-    command: str
-    timeout_seconds: int | None = None
-
-
-class ExecResponse(BaseModel):
-    """Result of a command, mirroring `ExecuteResponse`."""
-
-    output: str
-    exit_code: int | None = None
-    truncated: bool = False
-
-
 class RunRequest(BaseModel):
     """Run one program, under the contract a Pydantic AI workspace needs.
 
-    Beside `/exec` rather than replacing it: `/exec` serves an agent's tool path,
-    which must never fail and so folds a refused command into its output, while a
-    workspace needs the streams apart, a dead sandbox reported as one, and a way
-    to stop a command whose caller gave up.
+    The streams come back apart, a dead sandbox is reported as one rather than
+    as a command that failed, and a command whose caller gave up can be stopped.
     """
 
     argv: list[str] = Field(min_length=1)
@@ -117,48 +97,10 @@ class ReadBytesResponse(BaseModel):
     content_b64: str
 
 
-class WriteRequest(BaseModel):
-    """Write a file, creating parent directories as needed."""
-
-    path: str
-    content_b64: str
-
-
-class WriteResponse(BaseModel):
-    """Result of a write, mirroring `WriteResult`."""
-
-    path: str | None = None
-    error: str | None = None
-
-
-class EditRequest(BaseModel):
-    """Replace a string inside an existing file."""
-
-    path: str
-    old_string: str
-    new_string: str
-    replace_all: bool = False
-
-
-class EditResponse(BaseModel):
-    """Result of an edit, mirroring `EditResult`."""
-
-    path: str | None = None
-    error: str | None = None
-    occurrences: int | None = None
-
-
 class LsRequest(BaseModel):
     """List one directory."""
 
     path: str
-
-
-class GlobRequest(BaseModel):
-    """Match files by glob pattern under a root."""
-
-    pattern: str
-    path: str = "/"
 
 
 class FileEntry(BaseModel):
@@ -171,46 +113,6 @@ class FileEntry(BaseModel):
     modified_at: str | None = None
     """ISO 8601, when the backend reports one. Defaults absent so a client and a
     service on either side of this release keep understanding each other."""
-
-
-class GrepRequest(BaseModel):
-    """Search file contents by regular expression."""
-
-    pattern: str
-    path: str | None = None
-    glob: str | None = None
-    ignore_hidden: bool = True
-
-
-class GrepMatchEntry(BaseModel):
-    """One grep hit, mirroring `GrepMatch`."""
-
-    path: str
-    line_number: int
-    line: str
-
-
-class GrepResponse(BaseModel):
-    """Grep hits, or `error` when the search itself failed.
-
-    Models `grep_raw`'s `list[GrepMatch] | str` return: `error` set means the
-    string branch, and `matches` is then empty.
-    """
-
-    matches: list[GrepMatchEntry] = Field(default_factory=list)
-    error: str | None = None
-
-
-class ExistsRequest(BaseModel):
-    """Test whether a path is a regular file."""
-
-    path: str
-
-
-class ExistsResponse(BaseModel):
-    """Whether the path is a regular file."""
-
-    exists: bool
 
 
 class CreateSessionRequest(BaseModel):
@@ -268,7 +170,7 @@ class SessionEvent(BaseModel):
     """Monotonic per-session sequence number, for incremental polling."""
     at: float
     op: str
-    """Operation name: `exec`, `run`, `read`, `write`, `edit`, `ls`, `glob`, `grep`, `exists`."""
+    """Operation name: `run` for a command, which is the one operation a session takes."""
     target: str
     """Command or path the operation addressed, truncated."""
     ok: bool

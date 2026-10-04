@@ -1,15 +1,17 @@
-# Remote Sandboxes
+# sandboxd
 
-`RemoteSandbox` runs your agent's sandbox in **another process**, so your
-application never needs Docker access. A separate service — `sandboxd` — owns the
-Docker socket and rents out sandboxes over HTTP.
+`sandboxd` runs your agents' sandboxes in **another process**, so your application
+never needs Docker access. The service owns the Docker socket and rents out
+sandboxes over HTTP; an agent reaches one as a [workspace](workspaces.md) through
+`SandboxdWorkspace`.
 
 ```python
-from pydantic_ai_backends.remote import RemoteSandbox
+from pydantic_ai import Agent
 
-sandbox = RemoteSandbox("http://sandboxd:8080", token="...")
-print(sandbox.execute("python -c 'print(1+1)'").output)  # "2"
-sandbox.stop()
+from pydantic_ai_backends import ConsoleCapability, SandboxdWorkspace
+
+sandbox = SandboxdWorkspace(service_url="http://sandboxd:8080", token="...")
+agent = Agent("anthropic:claude-opus-5-5", capabilities=[sandbox, ConsoleCapability()])
 ```
 
 The session — and the container behind it — opens on the **first operation**, so
@@ -24,19 +26,19 @@ only three options:
 |---|---|
 | Mount `/var/run/docker.sock` into the app | The socket is an unauthenticated API for **root on the host**. Anything that can reach it can start a privileged container that bind-mounts `/`. |
 | Docker-in-Docker | Needs `--privileged`. Same outcome, more moving parts. |
-| **`sandboxd` + `RemoteSandbox`** | The app holds only an HTTP token. One small service holds the socket. |
+| **`sandboxd` + `SandboxdWorkspace`** | The app holds only an HTTP token. One small service holds the socket. |
 
 The third is what this module is. No docker-in-docker.
 
 ## Installation
 
-The client needs only `httpx`; the service needs FastAPI and the Docker SDK, so
-they are separate extras — install the client extra in your app image and the
-server extra in the sandbox service image.
+The client needs Pydantic AI and `httpx`; the service needs FastAPI and the Docker
+SDK, so they are separate extras — install the client extra in your app image and
+the server extra in the sandbox service image.
 
 ```bash
-pip install pydantic-ai-backend[remote]   # RemoteSandbox (client)
-pip install pydantic-ai-backend[server]   # sandboxd (service)
+pip install "pydantic-ai-backend[workspaces]"   # SandboxdWorkspace (client)
+pip install "pydantic-ai-backend[server]"       # sandboxd (service)
 ```
 
 ## Running the service
@@ -292,20 +294,17 @@ Two things it asks of the deployment:
 
 ## Sessions that outlive a run
 
-By default, opening a session id that is already in use is a `409` — silently
-sharing another caller's sandbox is the worse failure. Pass `reuse=True` when a
-sandbox is meant to span several runs, such as one conversation:
+`SandboxdWorkspace` opens a new session on a run's first operation and records
+its id as the run's ref; a later run carrying that ref attaches to the same session,
+in a new process even, and finds its files.
 
-```python
-# First turn: creates the session.
-sandbox = RemoteSandbox(url, token=token, session_id=session_id, reuse=True)
-sandbox.start()
-sandbox.write("/notes.md", "draft")
+On the wire, opening a session id that is already in use is a `409` — silently
+sharing another caller's sandbox is the worse failure. `reuse` attaches instead,
+for a client that names its own session ids:
 
-# Later turn, new process even: attaches to the same sandbox.
-sandbox = RemoteSandbox(url, token=token, session_id=session_id, reuse=True)
-sandbox.start()
-assert sandbox.read_bytes("/notes.md") == b"draft"
+```bash
+curl -X POST http://sandboxd:8080/sessions -H "X-Sandbox-Token: $TOKEN" \
+     -d '{"session_id": "conv-42", "reuse": true}'
 ```
 
 A `runtime` that disagrees with the open session is **refused**, not honoured.
@@ -318,12 +317,12 @@ creates: it attaches to an open session or to a workspace the service still
 holds, and answers `404` otherwise. [`SandboxdWorkspace`](workspaces.md) opens
 every ref this way.
 
-### Choosing what the session id keys on
+### Choosing what shares a session
 
-The session id is the only thing you choose, so it is what decides who shares
-files with whom:
+A ref is what decides who shares files with whom, so it matters what you store it
+on:
 
-| Keyed on | Who shares the sandbox | Good for |
+| Ref stored on | Who shares the sandbox | Good for |
 |---|---|---|
 | a run id | nobody — ephemeral | one-shot analysis |
 | a conversation id | **everyone in that chat**, group chats included | a Slack channel, a web thread |
@@ -334,8 +333,9 @@ The last two are data-sharing decisions rather than technical ones: with an
 agent-keyed sandbox, any user reads what any other user wrote. Make that visible
 wherever the choice is made.
 
-Keep ids unguessable — derive them from a UUID you generated, never from a
-sequential id or user input — and inside 64 characters.
+The service generates session ids, so they are unguessable; an application naming
+its own with `reuse` should derive them from a UUID it generated, never from a
+sequential id or user input, and keep them inside 64 characters.
 
 ## Making it fast on a small host
 
@@ -581,7 +581,7 @@ does the bounding.
 many tenants: the busiest one fills the pool and everybody else gets `429`.
 
 ```python
-sandbox = RemoteSandbox(url, token=token, session_id=session_id, tenant=str(org_id))
+sandbox = SandboxdWorkspace(service_url=url, token=token, tenant=str(org_id))
 ```
 
 With `max_sessions_per_tenant` set, a tenant at its own ceiling is refused while
@@ -592,26 +592,20 @@ see who is holding what.
 
 ## Nothing starts until it is used
 
-Constructing a `RemoteSandbox` performs no I/O. The session is opened by the
-first operation, which means a container starts only when the model actually
-reaches for a file or a command:
+Building a `SandboxdWorkspace` backend performs no I/O. The session is opened by
+the run's first operation, which means a container starts only when the model
+actually reaches for a file or a command:
 
 ```python
-sandbox = RemoteSandbox(url, token=token, session_id=session_id)  # no HTTP yet
-agent = Agent("openai:gpt-4.1", capabilities=[ConsoleCapability(backend=sandbox)])
+agent = Agent("anthropic:claude-opus-5-5", capabilities=[sandbox, ConsoleCapability()])
 
 result = agent.run_sync("What is 2 + 2?")  # answered without any container
 result = agent.run_sync("Write hello.py")  # this is what opens one
 ```
 
 That matters most for an agent that *may* need a sandbox: granting the capability
-no longer costs a container per run. Call `start()` yourself only to pre-warm one
-before a latency-sensitive turn.
-
-Opening is guarded, so two operations arriving at once on a thread pool open one
-session rather than racing each other into a `409`. A failure to open degrades
-like any other operation failure — the tool call reports an error, the run
-continues.
+costs no container per run. Opening is guarded, so two first operations arriving at
+once open one session rather than racing each other into a `409`.
 
 ## Browsing files without a sandbox
 
@@ -641,9 +635,9 @@ Four things to know:
 - **Service token only.** A reaped session has no token of its own left, and the
   intended caller is an application proxying file views to its users *after*
   applying its own authorization.
-- **It raises rather than degrading**, unlike `RemoteSandbox`. No model is waiting
-  on it, and an application answering "show me my files" needs to tell "there are
-  none" apart from "the service is misconfigured".
+- **It raises.** No model is waiting on it, and an application answering "show me
+  my files" needs to tell "there are none" apart from "the service is
+  misconfigured".
   `WorkspaceArchiveError.status_code` carries what the service said.
 - **Only the work directory is stored.** A file the agent wrote to `/tmp` is not
   in the volume and so not in the archive.
@@ -668,25 +662,16 @@ resolving first and checking after:
 ### Never hand a session token to a browser
 
 Worth stating separately, because the fix is not obvious: the **session** token
-authorizes `/exec` as well as `/ls` and `/read`. Putting one in a web page gives
-whoever opens DevTools a shell inside the sandbox. The service token is worse.
+authorizes `/run`. Putting one in a web page gives whoever opens DevTools a shell
+inside the sandbox. The service token is worse.
 
 Proxy instead — your backend holds the token, checks that this user may see this
 conversation, and forwards only listing and reading.
 
 ## Failure behaviour
 
-`RemoteSandbox`'s file and command operations **degrade rather than raise**: a transport failure
-surfaces the same way a missing file does — `b""`, `[]`, or an `Error: ...`
-string — matching `LocalBackend` and `DockerSandbox`. A tool call must not take
-down an agent run because a socket blipped.
-
-`start()` is the exception and does raise: a caller who cannot get a sandbox at
-all needs to know why.
-
-`POST /sessions/{id}/run` is the service's other way to run a command, for a
-caller that must not degrade: a [Pydantic AI workspace](workspaces.md). It takes
-an argv, an `env` and a client-chosen `run_id`, keeps stdout and stderr apart,
+`POST /sessions/{id}/run` is how a command runs. It takes an argv, an `env` and a
+client-chosen `run_id`, keeps stdout and stderr apart,
 answers `410` when the sandbox has gone, and reports a command stopped at its
 deadline or over its output limit as `timed_out` or `output_limited` instead of
 an exit code. `POST /sessions/{id}/runs/{run_id}/stop` stops such a command and
@@ -828,32 +813,23 @@ setting in force.
 
 ![sandboxd dashboard, runtimes and policy view](../assets/dashboard-runtimes.png)
 
-The Files browser reads the **live sandbox** by default and can switch to the
-**stored workspace**, which is served from the host volume. That distinction is
-worth knowing: reading a stopped session live restarts its container, while the
-stored workspace needs no container at all — and shows only the work directory.
+The Files browser reads the **stored workspace** off the host volume, so it needs
+`workspace_root`, starts no container, and shows only the work directory. The
+terminal runs commands through `/run`.
 
 Off by default: the page asks a human for the **service** token, and that token
 can start containers on the host. Keep it on localhost or a private network.
 
 ## Using it with an agent
 
-`RemoteSandbox` implements the same synchronous surface as `DockerSandbox`, so it
-drops into a console toolset or `SessionManager` unchanged:
-
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_backends import ConsoleCapability
-from pydantic_ai_backends.remote import RemoteSandbox
 
-sandbox = RemoteSandbox("http://sandboxd:8080", token=token, session_id=session_id)
-sandbox.start()
+from pydantic_ai_backends import ConsoleCapability, SandboxdWorkspace
 
-agent = Agent(
-    "openai:gpt-4.1",
-    capabilities=[ConsoleCapability(backend=sandbox)],
-)
+sandbox = SandboxdWorkspace(service_url="http://sandboxd:8080", token=token)
+agent = Agent("anthropic:claude-opus-5-5", capabilities=[sandbox, ConsoleCapability()])
 ```
 
-Passing the sandbox to the capability keeps it out of your deps type — see
-[Capability](capability.md#a-capability-owned-backend).
+The harness's `Coder`, `Shell` and `FileSystem` work in the same workspace. See
+[Workspaces](workspaces.md#sandboxd) for refs, removal and the command ceiling.

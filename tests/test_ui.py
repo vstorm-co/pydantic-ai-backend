@@ -261,9 +261,7 @@ class TestWireCoupling:
             "/policy",
             "/sessions",
             "/sessions/{session_id}",
-            "/sessions/{session_id}/exec",
-            "/sessions/{session_id}/ls",
-            "/sessions/{session_id}/read",
+            "/sessions/{session_id}/run",
             "/sessions/{session_id}/events",
             "/workspaces/{session_id}/ls",
             "/workspaces/{session_id}/read",
@@ -271,7 +269,15 @@ class TestWireCoupling:
 
     @pytest.mark.parametrize(
         "fragment",
-        ["/healthz", "/policy", '"/sessions', '"/workspaces/', "/exec", "/events?after="],
+        ["/healthz", "/policy", '"/sessions', '"/workspaces/', '"/run"', "/events?after="],
     )
     def test_the_page_still_reaches_for_each_of_them(self, fragment: str):
         assert fragment in PAGE
+
+
+class TestTheTerminal:
+    def test_it_runs_commands_through_run_with_a_hex_run_id(self):
+        """`/run` needs a 32-hex `run_id`, and `randomUUID` is absent over plain HTTP."""
+        assert "run_id: runId()" in PAGE
+        assert "crypto.getRandomValues(new Uint8Array(16))" in PAGE
+        assert "randomUUID" not in PAGE.split("function runId()")[1].split("}")[0]
