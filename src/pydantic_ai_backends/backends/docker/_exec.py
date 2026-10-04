@@ -226,26 +226,28 @@ async def run_in_container(
     sink = _Sink(output_limit)
     stopped = threading.Event()
     drain = functools.partial(_drain, api, exec_id, sink, stopped)
+    finished = False
     try:
         with anyio.move_on_after(timeout) as deadline:
             await anyio.to_thread.run_sync(drain, abandon_on_cancel=True)
+        finished = not (deadline.cancelled_caught or sink.over_limit)
+        if not finished:
+            stdout, stderr = sink.text(partial=True)
+            return CommandOutcome(
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=deadline.cancelled_caught,
+                output_limited=not deadline.cancelled_caught,
+            )
     except Exception as error:
         raise _translate(error) from error
-    except BaseException:
-        stopped.set()
-        await stop_in_container(container, run_id)
-        raise
-
-    if deadline.cancelled_caught or sink.over_limit:
-        stopped.set()
-        await stop_in_container(container, run_id)
-        stdout, stderr = sink.text(partial=True)
-        return CommandOutcome(
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=deadline.cancelled_caught,
-            output_limited=not deadline.cancelled_caught,
-        )
+    finally:
+        # Every way out but a finished command leaves one running: stopped at
+        # its deadline or its limit, abandoned by a cancelled caller, or cut off
+        # by a broken stream.
+        if not finished:
+            stopped.set()
+            await stop_in_container(container, run_id)
 
     try:
         info = await anyio.to_thread.run_sync(api.exec_inspect, exec_id)

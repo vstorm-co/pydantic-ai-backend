@@ -231,6 +231,7 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
             session.execute_timeout if timeout is None else min(timeout, session.execute_timeout)
         )
         path = f"/sessions/{session.session_id}"
+        answered = False
         try:
             response = await self._post(
                 f"{path}/run",
@@ -238,9 +239,12 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
                 token=session.token,
                 timeout=deadline + TRANSPORT_SLACK_SECONDS,
             )
-        except BaseException:
-            await self._stop(f"{path}/runs/{request.run_id}/stop", session.token)
-            raise
+            answered = True
+        finally:
+            # A caller cancelled mid-command, or a request that failed in
+            # transit, may have left the command running on the service.
+            if not answered:
+                await self._stop(f"{path}/runs/{request.run_id}/stop", session.token)
         if response.status_code in _GONE:
             raise WorkspaceUnavailableError(
                 f"sandboxd session {session.session_id!r} is gone: {response.text}"
