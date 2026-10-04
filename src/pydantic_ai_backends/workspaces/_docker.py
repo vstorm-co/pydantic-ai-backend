@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -26,8 +27,22 @@ DOCKER_PROVIDER = "docker"
 CONTAINER_PREFIX = "pydantic-ai-workspace-"
 """Name prefix of the containers a :class:`DockerWorkspace` creates."""
 
+_CONTAINER_NAME = re.compile(rf"{re.escape(CONTAINER_PREFIX)}[0-9a-f]{{16}}")
+"""Exactly the names :class:`DockerWorkspaceBackend` gives the containers it creates."""
+
 SandboxFactory = Callable[[str], DockerSandbox]
 """Builds the sandbox for a container name, without starting it."""
+
+
+def _created_here(name: str) -> bool:
+    """Whether `name` is one this library gives a container it creates.
+
+    A ref arrives with the message history, which an application may have taken
+    from its client. Without this check a ref naming any container on the host -
+    a database, the application itself - would have the model's commands run in
+    it, and `destroy` would remove it.
+    """
+    return _CONTAINER_NAME.fullmatch(name) is not None
 
 
 def _container_status(name: str) -> str | None:
@@ -55,7 +70,9 @@ class DockerWorkspaceBackend(ContainerWorkspaceBackend):
 
     The container is named after the ref and never auto-removed, so a later run
     can attach to it and find its files, installed packages included; a stopped
-    one is started again. It lives until :meth:`DockerWorkspace.destroy`.
+    one is started again. It lives until :meth:`DockerWorkspace.destroy`. A ref
+    attaches only to a container named the way this class names the ones it
+    creates, never to any other container on the host.
 
     Args:
         sandbox_factory: Builds the `DockerSandbox` for a container name. Holds
@@ -74,6 +91,10 @@ class DockerWorkspaceBackend(ContainerWorkspaceBackend):
         async def open_container(name: str | None) -> tuple[str, RunnerSandbox]:
             if name is None:
                 name = f"{CONTAINER_PREFIX}{uuid.uuid4().hex[:16]}"
+            elif not _created_here(name):
+                raise SandboxUnavailableError(
+                    f"container {name!r} was not created by a DockerWorkspace"
+                )
             else:
                 status = await anyio.to_thread.run_sync(_container_status, name)
                 if status != "running" and status not in REATTACHABLE_STATUSES:
@@ -176,8 +197,11 @@ class DockerWorkspace(AbstractCapability[object]):
         """Remove the container `ref` names, files and all. Already gone is fine.
 
         Raises:
-            ValueError: `ref` belongs to another provider.
+            ValueError: `ref` belongs to another provider, or names a container
+                no `DockerWorkspace` created.
         """
         if ref.provider != DOCKER_PROVIDER:
             raise ValueError(f"expected a {DOCKER_PROVIDER!r} workspace ref, got {ref.provider!r}")
+        if not _created_here(ref.id):
+            raise ValueError(f"container {ref.id!r} was not created by a DockerWorkspace")
         await anyio.to_thread.run_sync(_remove_container, ref.id)

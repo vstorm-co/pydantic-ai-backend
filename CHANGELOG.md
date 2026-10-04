@@ -31,7 +31,10 @@ what replaces each removed name.
   Pydantic AI's `WorkspaceBackendSuite` against a real Docker daemon;
   `StateWorkspace` passes its filesystem rules in CI. The Kubernetes and
   Daytona suites run behind `-m kubernetes` / `-m daytona` and are not yet
-  verified against a live cluster or account.
+  verified against a live cluster or account. A ref is input — it arrives with
+  the message history — so `DockerWorkspace` attaches to and destroys only
+  containers named the way it names its own, never another container on the
+  host.
 - **Commands that stop with everything they started.** Every command-capable
   workspace runs commands through a small wrapper that records the command's
   process group, so a timeout or a cancelled run stops the command and its
@@ -49,6 +52,15 @@ what replaces each removed name.
 - **A read-only workspace hides the mutating tools.** On `ReadOnlyWorkspace` or
   `LocalWorkspace(read_only=True)`, `ConsoleCapability` offers no `write_file`,
   `edit_file` or `execute`, whatever the ruleset allows.
+- **Permission rules bind however a path is spelled.** The console tools check
+  a path as the model wrote it and as the workspace resolves it against its
+  working directory, so a deny on `/workspace/private/**` also refuses
+  `private/notes.txt`, and command arguments resolve against the same directory.
+  `LocalBackend` resolved paths against its root; this keeps that protection on
+  `LocalWorkspace` and gives it to every other workspace.
+- **An unavailable workspace is reported, not read as empty.** With no
+  workspace attached, or its environment gone, `ls`, `glob`, `grep` and an image
+  read answer with that error instead of an empty directory or a missing file.
 
 ### Removed
 

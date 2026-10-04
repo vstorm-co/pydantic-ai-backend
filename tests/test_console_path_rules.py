@@ -18,11 +18,12 @@ call, with a path in hand.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from pydantic_ai_backends import ConsoleCapability
+from pydantic_ai_backends import ConsoleCapability, create_console_toolset
 from pydantic_ai_backends.permissions import (
     SECRETS_PATTERNS,
     SYSTEM_PATTERNS,
@@ -33,7 +34,7 @@ from pydantic_ai_backends.permissions import (
 from pydantic_ai_backends.toolsets._guard import GuardedOps, guarding
 from pydantic_ai_backends.toolsets._workspace import WorkspaceOps
 from pydantic_ai_backends.types import ExecuteResponse
-from tests.support import call, ctx, document
+from tests.support import call, ctx, document, local
 
 OFF_LIMITS = (*SECRETS_PATTERNS, *SYSTEM_PATTERNS)
 
@@ -252,3 +253,62 @@ class TestThroughTheCapability:
         capability = ConsoleCapability(include_execute=False)
 
         assert "root:x:0:0" in await self._read(capability, "/etc/passwd")
+
+
+class TestARuleBindsHoweverThePathIsSpelled:
+    """A rule names a file absolutely; a model often reaches it relatively.
+
+    Checked against the spelling the model chose, `private/secret.txt` read the
+    very file a rule on `<work dir>/private/**` denies — the migration from
+    `LocalBackend`, which resolved paths against its root, to `LocalWorkspace`
+    lost that resolution.
+    """
+
+    @pytest.fixture
+    def workdir(self, tmp_path: Path) -> Path:
+        root = tmp_path.resolve()
+        (root / "private").mkdir()
+        (root / "private" / "secret.txt").write_text("TOP SECRET\n")
+        (root / "notes.txt").write_text("ordinary work\n")
+        return root
+
+    def rules(self, workdir: Path) -> PermissionRuleset:
+        deny = [PermissionRule(pattern=f"{workdir}/private/**", action="deny")]
+        return PermissionRuleset(
+            default="allow",
+            read=OperationPermissions(default="allow", rules=deny),
+            write=OperationPermissions(default="allow", rules=deny),
+            edit=OperationPermissions(default="allow", rules=deny),
+        )
+
+    @pytest.mark.parametrize(
+        "path", ["private/secret.txt", "./private/secret.txt", "notes/../private/secret.txt"]
+    )
+    async def test_a_relative_read_is_refused(self, workdir: Path, path: str) -> None:
+        toolset = create_console_toolset(permissions=self.rules(workdir))
+        out = await call(toolset, "read_file", ctx(local(workdir)), path=path)
+        assert "Permission denied" in str(out) and "TOP SECRET" not in str(out)
+
+    async def test_a_relative_write_is_refused(self, workdir: Path) -> None:
+        toolset = create_console_toolset(permissions=self.rules(workdir))
+        await call(toolset, "write_file", ctx(local(workdir)), path="private/x.txt", content="x")
+        assert not (workdir / "private" / "x.txt").exists()
+
+    async def test_grep_from_the_working_directory_hides_the_match(self, workdir: Path) -> None:
+        toolset = create_console_toolset(permissions=self.rules(workdir))
+        context = ctx(local(workdir))
+        hidden = await call(toolset, "grep", context, pattern="SECRET", output_mode="content")
+        shown = await call(toolset, "grep", context, pattern="work", output_mode="content")
+        assert "TOP SECRET" not in str(hidden) and "ordinary work" in str(shown)
+
+    async def test_a_command_naming_it_relatively_is_refused(self, workdir: Path) -> None:
+        toolset = create_console_toolset(
+            permissions=self.rules(workdir), require_execute_approval=False
+        )
+        out = await call(toolset, "execute", ctx(local(workdir)), command="cat private/secret.txt")
+        assert "Permission denied" in str(out) and "TOP SECRET" not in str(out)
+
+    async def test_other_files_are_untouched(self, workdir: Path) -> None:
+        toolset = create_console_toolset(permissions=self.rules(workdir))
+        out = await call(toolset, "read_file", ctx(local(workdir)), path="notes.txt")
+        assert "ordinary work" in str(out)

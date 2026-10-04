@@ -357,6 +357,11 @@ workspace the run has:
   read-protected content cannot leak through search results.
 - **`execute`** — see below.
 
+A path is checked both as the model wrote it and as the workspace resolves it against its
+working directory, and a deny on either refuses. A rule on `/workspace/private/**` therefore
+covers `private/notes.txt` and `./private/../private/notes.txt` as well as the absolute
+spelling, and path-looking tokens in a command resolve against the same directory.
+
 ### Shell execution and permission rules
 
 Execute rules pattern-match the **command string**, not file paths — a rule

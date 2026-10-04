@@ -6,7 +6,7 @@ import inspect
 from pathlib import Path
 
 import pytest
-from pydantic_ai import BinaryContent
+from pydantic_ai import BinaryContent, RunContext
 from pydantic_ai.exceptions import (
     ApprovalRequired,
     CallDeferred,
@@ -17,7 +17,7 @@ from pydantic_ai.exceptions import (
     UserError,
 )
 from pydantic_ai.messages import ModelResponse
-from pydantic_ai.workspaces import ReadOnlyWorkspace, Workspace
+from pydantic_ai.workspaces import ReadOnlyWorkspace, Workspace, WorkspaceUnavailableError
 
 from pydantic_ai_backends import (
     ConsoleToolset,
@@ -39,6 +39,18 @@ from tests.support import Raising, call, ctx, document, local
 
 PDF_DATA = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\n%%EOF\n"
 PNG_DATA = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+
+
+EVERY_TOOL = [
+    ("ls", {"path": "/"}),
+    ("read_file", {"path": "/f.txt"}),
+    ("write_file", {"path": "/f.txt", "content": "x"}),
+    ("edit_file", {"path": "/f.txt", "old_string": "a", "new_string": "b"}),
+    ("glob", {"pattern": "*.py"}),
+    ("grep", {"pattern": "todo"}),
+    ("execute", {"command": "echo hi"}),
+]
+"""Every console tool, with arguments it accepts."""
 
 
 class TestCreateConsoleToolset:
@@ -263,18 +275,7 @@ class TestExecute:
 class TestEveryToolDegradesOnAProviderError:
     """A provider's transport error must fail one tool call, not the agent's run."""
 
-    @pytest.mark.parametrize(
-        ("tool", "args"),
-        [
-            ("ls", {"path": "/"}),
-            ("read_file", {"path": "/f.txt"}),
-            ("write_file", {"path": "/f.txt", "content": "x"}),
-            ("edit_file", {"path": "/f.txt", "old_string": "a", "new_string": "b"}),
-            ("glob", {"pattern": "*.py"}),
-            ("grep", {"pattern": "todo"}),
-            ("execute", {"command": "echo hi"}),
-        ],
-    )
+    @pytest.mark.parametrize(("tool", "args"), EVERY_TOOL)
     async def test_it_is_reported_not_raised(self, tool: str, args: dict[str, object]) -> None:
         context = ctx(Workspace(Raising(RuntimeError("connection reset by peer"))))
         out = await call(create_console_toolset(), tool, context, **args)
@@ -294,10 +295,45 @@ class TestControlFlowExceptionsPassThrough:
             UserError("the library was misused"),
         ],
     )
-    async def test_it_reaches_the_framework(self, error: Exception) -> None:
+    @pytest.mark.parametrize(("tool", "args"), EVERY_TOOL)
+    async def test_it_reaches_the_framework(
+        self, error: Exception, tool: str, args: dict[str, object]
+    ) -> None:
+        """From every tool: `execute` once turned a policy's `ApprovalRequired`
+        into a failed command, so a wrapper asking a human to approve commands
+        was ignored."""
         context = ctx(Workspace(Raising(error)))
         with pytest.raises(type(error)):
-            await call(create_console_toolset(), "ls", context, path="/")
+            await call(
+                create_console_toolset(require_execute_approval=False), tool, context, **args
+            )
+
+
+class TestAnUnavailableWorkspaceIsNotAnEmptyOne:
+    """No workspace, or one whose environment is gone, must not read as empty."""
+
+    @pytest.mark.parametrize(("tool", "args"), EVERY_TOOL)
+    async def test_every_tool_reports_it(self, tool: str, args: dict[str, object]) -> None:
+        context = ctx(Workspace(Raising(WorkspaceUnavailableError("the sandbox is gone"))))
+        toolset = create_console_toolset(require_execute_approval=False)
+        out = await call(toolset, tool, context, **args)
+        assert "the sandbox is gone" in str(out)
+
+    async def test_without_a_workspace_ls_says_so(self) -> None:
+        from pydantic_ai.models.test import TestModel
+        from pydantic_ai.usage import RunUsage
+
+        context = RunContext(deps=None, model=TestModel(), usage=RunUsage())
+        out = await call(create_console_toolset(), "ls", context, path=".")
+        assert "No workspace is attached" in str(out)
+        assert "empty" not in str(out)
+
+    async def test_a_file_only_workspace_is_walked_the_same_way(self) -> None:
+        """`glob` and `grep` walk the files when the workspace runs no commands."""
+        toolset = create_console_toolset()
+        context = ctx(ReadOnlyWorkspace(Workspace(Raising(WorkspaceUnavailableError("gone")))))
+        for tool, args in (("glob", {"pattern": "*.py"}), ("grep", {"pattern": "x"})):
+            assert "gone" in str(await call(toolset, tool, context, **args))
 
 
 class TestReadsAreRememberedAcrossCalls:

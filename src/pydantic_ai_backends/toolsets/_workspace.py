@@ -2,9 +2,14 @@
 
 The tools speak in operations a model reasons about — read a numbered slice,
 edit a string, grep a tree — and a workspace offers the primitives under them:
-bytes, entries, a command. :class:`WorkspaceOps` is the translation, and the
-place that keeps the tools' failure contract: an error comes back as a result
-the model can read, never as an exception that ends the run.
+bytes, entries, a command. :class:`WorkspaceOps` is the translation.
+
+A path that is missing, a directory or not permitted is an answer about that
+path, and comes back as a result the model can act on. A workspace that cannot
+answer at all — none attached, its environment gone, a read that timed out —
+raises instead. Folding that into "empty" or "not found" would send the model on
+in an environment that is not there, the one thing a workspace refuses to do;
+the console tools report it as the call's error.
 """
 
 from __future__ import annotations
@@ -101,7 +106,21 @@ class WorkspaceOps:
         return self._workspace
 
     async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
-        """Run `command` through the workspace's shell, stderr after stdout."""
+        """Run `command` through the workspace's shell, stderr after stdout.
+
+        A workspace's own refusals — read-only, no commands, gone — come back as a
+        failed command the model can read. Anything else raises: a provider's
+        transport error, and the exceptions that steer a run, such as the
+        `ApprovalRequired` a policy wrapped around the workspace raises to have a
+        human approve the command.
+        """
+        if not isinstance(self._workspace.backend, SupportsCommands):
+            # Checked here because `Workspace.run` reports it as `UserError`, which
+            # the tools let through as misuse - and a model calling `execute` in a
+            # files-only workspace has not misused anything.
+            return ExecuteResponse(
+                output="Error: This workspace does not support command execution.", exit_code=1
+            )
         try:
             result = await self._workspace.run(command, shell=True, timeout=timeout)
         except WorkspaceTimeoutError as error:
@@ -113,9 +132,7 @@ class WorkspaceOps:
         except WorkspaceOutputLimitError as error:
             partial, _ = _bounded(error.stdout + error.stderr)
             return ExecuteResponse(output=partial, exit_code=1, truncated=True)
-        except Exception as error:
-            # Every workspace refusal — read-only, no commands, gone — and every
-            # provider failure: the model reads the reason and the run goes on.
+        except (OSError, WorkspaceError) as error:
             return ExecuteResponse(output=f"Error: {error}", exit_code=1)
         output, truncated = _bounded(result.stdout + result.stderr)
         return ExecuteResponse(output=output, exit_code=result.exit_code, truncated=truncated)
@@ -124,14 +141,14 @@ class WorkspaceOps:
         """Whether `path` is a regular file; a directory is not one."""
         try:
             return (await self._workspace.stat(path)).is_dir is False
-        except (OSError, WorkspaceError):
+        except OSError:
             return False
 
     async def ls_info(self, path: str) -> list[FileInfo]:
-        """One directory's entries, or `[]` when it cannot be listed."""
+        """One directory's entries, or `[]` when the path is not a listable directory."""
         try:
             entries = await self._workspace.list_dir(path)
-        except (OSError, WorkspaceError):
+        except OSError:
             return []
         listed = [
             FileInfo(name=entry.name, path=entry.path, is_dir=entry.is_dir, size=entry.size)
@@ -140,14 +157,14 @@ class WorkspaceOps:
         return sorted(listed, key=lambda entry: (not entry["is_dir"], entry["name"]))
 
     async def read_bytes(self, path: str) -> bytes:
-        """A whole file, or `b""` when it cannot be read.
+        """A whole file, or `b""` when the path is not a readable file.
 
         Empty rather than an error message, because a caller cannot tell a
         message from content: a probe staging a screenshot would show the text.
         """
         try:
             return await self._workspace.read_bytes(path)
-        except (OSError, WorkspaceError, ValueError):
+        except (OSError, ValueError):
             return b""
 
     async def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
@@ -268,7 +285,7 @@ class WorkspaceOps:
                 continue
             try:
                 text = (await self._workspace.read_bytes(file)).decode("utf-8")
-            except (OSError, WorkspaceError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError):
                 continue
             matches.extend(
                 GrepMatch(path=file, line_number=number, line=line)
@@ -288,14 +305,14 @@ class WorkspaceOps:
         return ExecuteResponse(output=result.stdout + result.stderr, exit_code=result.exit_code)
 
     async def _files_under(self, root: str) -> list[str]:
-        """Every file below `root`, found by listing directories; `[]` when unreadable."""
+        """Every file below `root`, found by listing directories; unlistable ones skipped."""
         files: list[str] = []
         pending = [root]
         while pending:
             directory = pending.pop()
             try:
                 entries = await self._workspace.list_dir(directory)
-            except (OSError, WorkspaceError):
+            except OSError:
                 continue
             for entry in entries:
                 if entry.is_dir:

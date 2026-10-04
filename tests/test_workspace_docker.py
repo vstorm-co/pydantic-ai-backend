@@ -35,6 +35,9 @@ from pydantic_ai_backends.workspaces._docker import (
     DockerWorkspaceBackend,
 )
 
+KEPT = f"{CONTAINER_PREFIX}{'b' * 16}"
+"""A name `DockerWorkspaceBackend` could have given a container it created."""
+
 
 class _Response:
     def __init__(self, status_code: int) -> None:
@@ -350,14 +353,14 @@ class TestDockerWorkspaceBackend:
     async def test_attaches_to_a_container_that_is_there(
         self, client: _Client, status: str
     ) -> None:
-        client.containers.known["kept"] = _Container(client.api, status=status)
+        client.containers.known[KEPT] = _Container(client.api, status=status)
         factory = _Factory()
         backend = DockerWorkspaceBackend(
-            sandbox_factory=factory, ref=WorkspaceRef(provider="docker", id="kept")
+            sandbox_factory=factory, ref=WorkspaceRef(provider="docker", id=KEPT)
         )
         await backend.run(["true"])
-        assert factory.built[0].name == "kept"
-        assert backend.ref == WorkspaceRef(provider="docker", id="kept")
+        assert factory.built[0].name == KEPT
+        assert backend.ref == WorkspaceRef(provider="docker", id=KEPT)
 
     @pytest.mark.parametrize(
         ("status", "message"), [(None, "no longer exists"), ("dead", "is dead")]
@@ -366,12 +369,27 @@ class TestDockerWorkspaceBackend:
         self, client: _Client, status: str | None, message: str
     ) -> None:
         if status is not None:
-            client.containers.known["kept"] = _Container(client.api, status=status)
+            client.containers.known[KEPT] = _Container(client.api, status=status)
         backend = DockerWorkspaceBackend(
-            sandbox_factory=_Factory(), ref=WorkspaceRef(provider="docker", id="kept")
+            sandbox_factory=_Factory(), ref=WorkspaceRef(provider="docker", id=KEPT)
         )
         with pytest.raises(WorkspaceUnavailableError, match=message):
             await backend.working_dir()
+
+    @pytest.mark.parametrize(
+        "name", ["postgres", f"{CONTAINER_PREFIX}../x", f"{CONTAINER_PREFIX}{'a' * 16}-more"]
+    )
+    async def test_a_ref_never_reaches_a_container_it_did_not_create(
+        self, client: _Client, name: str
+    ) -> None:
+        client.containers.known[name] = _Container(client.api)
+        factory = _Factory()
+        backend = DockerWorkspaceBackend(
+            sandbox_factory=factory, ref=WorkspaceRef(provider="docker", id=name)
+        )
+        with pytest.raises(WorkspaceUnavailableError, match="not created by a DockerWorkspace"):
+            await backend.run(["true"])
+        assert factory.built == []
 
     async def test_a_ref_from_another_provider_is_refused(self) -> None:
         with pytest.raises(ValueError, match="'docker' workspace ref"):
@@ -426,11 +444,22 @@ class TestDockerWorkspace:
 
     async def test_destroy_removes_the_container(self, client: _Client) -> None:
         kept = _Container(client.api)
-        client.containers.known["kept"] = kept
-        await DockerWorkspace().destroy(WorkspaceRef(provider="docker", id="kept"))
+        client.containers.known[KEPT] = kept
+        await DockerWorkspace().destroy(WorkspaceRef(provider="docker", id=KEPT))
         assert kept.removed
         # Gone already is fine.
-        await DockerWorkspace().destroy(WorkspaceRef(provider="docker", id="absent"))
+        await DockerWorkspace().destroy(
+            WorkspaceRef(provider="docker", id=f"{CONTAINER_PREFIX}{'0' * 16}")
+        )
+
+    async def test_destroy_never_removes_a_container_it_did_not_create(
+        self, client: _Client
+    ) -> None:
+        database = _Container(client.api)
+        client.containers.known["postgres"] = database
+        with pytest.raises(ValueError, match="not created by a DockerWorkspace"):
+            await DockerWorkspace().destroy(WorkspaceRef(provider="docker", id="postgres"))
+        assert not database.removed
 
     async def test_destroy_refuses_another_providers_ref(self) -> None:
         with pytest.raises(ValueError, match="'docker' workspace ref"):

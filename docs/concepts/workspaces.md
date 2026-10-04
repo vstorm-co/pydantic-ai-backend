@@ -47,6 +47,12 @@ Every capability here follows the same rules:
 - **Refs are per provider.** A capability attaches only to refs carrying its provider name.
   Give each service or cluster its own `provider` when an agent can reach several, so a ref
   from one is never offered to another.
+- **Refs are input.** A ref travels on the message history, so an application that accepts
+  history from its client accepts refs from it too. `DockerWorkspace` attaches only to a
+  container named the way it names the ones it creates, and `KubernetesWorkspace` only to its
+  own `pab-sandbox-` pods; `SandboxdWorkspace` and `DaytonaWorkspace` attach to any session or
+  sandbox their credentials reach. Check a ref against your own records before a run when
+  the history comes from somewhere you do not trust.
 
 ## Commands and their failures
 
@@ -98,7 +104,9 @@ the files instead.
 
 `ConsoleCapability` points `ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep` and
 `execute` at `ctx.workspace` — the same tools, text and permission rules in whichever
-environment the run was given. File operations go through the workspace's own methods, so a
+environment the run was given. A workspace that cannot answer — none attached, its
+environment gone — is reported as the call's error, never as an empty directory or a missing
+file. File operations go through the workspace's own methods, so a
 policy wrapped around it — `ReadOnlyWorkspace`, or a `WrapperWorkspace` of your own —
 applies to every one of them, and on a read-only workspace the write and execute tools are
 not offered at all.

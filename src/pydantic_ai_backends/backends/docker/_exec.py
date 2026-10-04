@@ -1,11 +1,9 @@
 """Running one command in a container, with the failure contract a workspace needs.
 
-`DockerSandbox.execute` keeps the protocol's promise of never raising, which is
-right for a tool call and wrong for a workspace: there a service outage must not
-look like a command that printed "Error:" and exited 1, stdout and stderr are two
-streams rather than one, and a command must stop when its caller stops waiting.
-
-So this runs the command through the low-level exec API instead:
+A workspace needs more from a command than its text: a container that is gone
+must not look like a command that printed "Error:" and exited 1, stdout and
+stderr are two streams rather than one, and a command must stop when its caller
+stops waiting. So this runs the command through the low-level exec API:
 
 - the streams are demultiplexed and decoded separately;
 - `env` is passed to the exec itself, layered over the container's own;

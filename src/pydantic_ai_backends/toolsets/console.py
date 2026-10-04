@@ -285,6 +285,7 @@ def create_console_toolset(  # noqa: C901
             ops = operations[ctx.workspace] = _guard.guarding(
                 WorkspaceOps(ctx.workspace),
                 permissions,
+                workspace=ctx.workspace,
                 ask_callback=ask_callback,
                 ask_fallback=ask_fallback,
             )

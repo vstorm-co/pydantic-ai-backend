@@ -9,6 +9,7 @@ place: which operations refuse outright, which quietly hide results, and how an
 from __future__ import annotations
 
 import os
+import posixpath
 import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -17,6 +18,8 @@ from pydantic_ai_backends.permissions.checker import PermissionAskError, Permiss
 from pydantic_ai_backends.types import EditResult, WriteResult
 
 if TYPE_CHECKING:
+    from pydantic_ai.workspaces import Workspace
+
     from pydantic_ai_backends.permissions.checker import AskCallback, AskFallback
     from pydantic_ai_backends.permissions.types import PermissionOperation, PermissionRuleset
     from pydantic_ai_backends.toolsets._workspace import FileOps
@@ -104,7 +107,7 @@ class PermissionGuard:
         """
         return self.is_denied("grep", path) or self.is_denied("read", path)
 
-    def execute_denial_reason(self, command: str) -> str | None:
+    def execute_denial_reason(self, command: str, *, root: Path | None = None) -> str | None:
         """Why `command` is refused, checking its rules and its path arguments.
 
         Beyond the command-pattern rules, path-looking tokens are resolved and
@@ -114,12 +117,16 @@ class PermissionGuard:
         This is defense in depth, not a boundary — a shell can reach a file in
         ways string inspection cannot see. For enforced isolation use a
         sandboxed workspace such as `DockerWorkspace`.
+
+        Args:
+            command: The command line.
+            root: Directory the command runs in, when it is not the guard's own.
         """
         reason = self.denial_reason("execute", command)
         if reason is not None:
             return reason
 
-        for target in sorted(self.command_path_targets(command)):
+        for target in sorted(self.command_path_targets(command, root=root)):
             for operation in GUARDED_COMMAND_OPERATIONS:
                 if self.is_denied(operation, target):
                     return (
@@ -128,7 +135,7 @@ class PermissionGuard:
                     )
         return None
 
-    def command_path_targets(self, command: str) -> set[str]:
+    def command_path_targets(self, command: str, *, root: Path | None = None) -> set[str]:
         """Filesystem paths a command plausibly references.
 
         Tokens (and the value half of `--flag=value`) are expanded and resolved
@@ -145,13 +152,14 @@ class PermissionGuard:
         candidates = {token for token in tokens if token}
         candidates |= {token.split("=", 1)[1] for token in tokens if "=" in token}
 
+        base = root if root is not None else self._root
         targets: set[str] = set()
         for candidate in candidates:
             if not candidate:
                 continue
             expanded = os.path.expanduser(candidate)
             path = Path(expanded)
-            absolute = path if path.is_absolute() else self._root / expanded
+            absolute = path if path.is_absolute() else base / expanded
             # Both forms, because a rule is written against the path a person
             # types and `resolve()` answers with the path the filesystem means.
             # On macOS `/etc` is a symlink to `/private/etc`, so a rule reading
@@ -193,10 +201,18 @@ class GuardedOps:
     boundary: a shell reaches files in ways string inspection cannot see, and real
     isolation is the workspace's job.
 
+    Paths are checked as the model wrote them and as the workspace resolves
+    them against its working directory, and a deny on either refuses. A rule
+    names a file one way — `/workspace/private/**` — and a model reaches it
+    another — `private/notes.txt` — and checking only the spelling the model
+    chose let it read exactly what the rule protects.
+
     Args:
         ops: What to wrap.
         ruleset: Rules to apply.
-        root: Directory commands run in, for resolving their path arguments.
+        workspace: The workspace `ops` reaches, whose working directory relative
+            paths and command arguments resolve against. Without one they
+            resolve against `/`.
         ask_callback: Async approval callback, passed to the checker.
         ask_fallback: What an unanswerable "ask" does.
     """
@@ -206,32 +222,54 @@ class GuardedOps:
         ops: FileOps,
         ruleset: PermissionRuleset,
         *,
-        root: Path | None = None,
+        workspace: Workspace | None = None,
         ask_callback: AskCallback | None = None,
         ask_fallback: AskFallback = "error",
     ) -> None:
         self._backend = ops
+        self._workspace = workspace
         self._guard = PermissionGuard(
-            ruleset,
-            root if root is not None else Path("/"),
-            ask_callback=ask_callback,
-            ask_fallback=ask_fallback,
+            ruleset, Path("/"), ask_callback=ask_callback, ask_fallback=ask_fallback
+        )
+
+    async def _base(self) -> str | None:
+        """The directory relative paths mean, or `None` without a workspace."""
+        return None if self._workspace is None else await self._workspace.working_dir()
+
+    @staticmethod
+    def _spellings(path: str, base: str | None) -> list[str]:
+        """`path` as written, then as the workspace resolves it when that differs."""
+        if base is None:
+            return [path]
+        resolved = posixpath.normpath(posixpath.join(base, path))
+        return [path] if resolved == path else [path, resolved]
+
+    async def _refusal(self, operation: PermissionOperation, path: str) -> str | None:
+        for spelling in self._spellings(path, await self._base()):
+            reason = self._guard.denial_reason(operation, spelling)
+            if reason is not None:
+                return reason
+        return None
+
+    def _denied(self, operation: PermissionOperation, path: str, base: str | None) -> bool:
+        return any(
+            self._guard.is_denied(operation, spelling) for spelling in self._spellings(path, base)
         )
 
     async def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
-        reason = self._guard.denial_reason("read", path)
+        reason = await self._refusal("read", path)
         if reason is not None:
             raise PermissionError(reason)
         return await self._backend.read(path, offset, limit)
 
     async def read_bytes(self, path: str) -> bytes:
-        reason = self._guard.denial_reason("read", path)
+        reason = await self._refusal("read", path)
         if reason is not None:
             raise PermissionError(reason)
         return await self._backend.read_bytes(path)
 
     async def write(self, path: str, content: str | bytes) -> WriteResult:
-        reason = self._guard.denial_reason("write", path)
+        reason = await self._refusal("write", path)
         if reason is not None:
             return WriteResult(error=reason)
         return await self._backend.write(path, content)
@@ -239,7 +277,7 @@ class GuardedOps:
     async def edit(
         self, path: str, old_string: str, new_string: str, replace_all: bool = False
     ) -> EditResult:
-        reason = self._guard.denial_reason("edit", path)
+        reason = await self._refusal("edit", path)
         if reason is not None:
             return EditResult(error=reason)
         return await self._backend.edit(path, old_string, new_string, replace_all)
@@ -249,11 +287,13 @@ class GuardedOps:
 
     async def ls_info(self, path: str) -> list[FileInfo]:
         entries = await self._backend.ls_info(path)
-        return [entry for entry in entries if not self._guard.is_denied("ls", entry["path"])]
+        base = await self._base()
+        return [entry for entry in entries if not self._denied("ls", entry["path"], base)]
 
     async def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
         entries = await self._backend.glob_info(pattern, path)
-        return [entry for entry in entries if not self._guard.is_denied("glob", entry["path"])]
+        base = await self._base()
+        return [entry for entry in entries if not self._denied("glob", entry["path"], base)]
 
     async def grep_raw(
         self,
@@ -266,10 +306,21 @@ class GuardedOps:
         # A string is the backend's own error or "no matches", not a result set.
         if isinstance(found, str):
             return found
-        return [match for match in found if not self._guard.hides_from_grep(match["path"])]
+        base = await self._base()
+        return [
+            match
+            for match in found
+            if not any(
+                self._guard.hides_from_grep(spelling)
+                for spelling in self._spellings(match["path"], base)
+            )
+        ]
 
     async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
-        reason = self._guard.execute_denial_reason(command)
+        base = await self._base()
+        reason = self._guard.execute_denial_reason(
+            command, root=None if base is None else Path(base)
+        )
         if reason is not None:
             raise PermissionError(reason)
         return await self._backend.execute(command, timeout)
@@ -279,7 +330,7 @@ def guarding(
     ops: FileOps,
     ruleset: PermissionRuleset | None,
     *,
-    root: Path | None = None,
+    workspace: Workspace | None = None,
     ask_callback: AskCallback | None = None,
     ask_fallback: AskFallback = "error",
 ) -> FileOps:
@@ -289,7 +340,7 @@ def guarding(
     return GuardedOps(
         ops,
         ruleset,
-        root=root,
+        workspace=workspace,
         ask_callback=ask_callback,
         ask_fallback=ask_fallback,
     )
