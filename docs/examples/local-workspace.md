@@ -6,6 +6,10 @@ A coding assistant that works on files in a directory on your machine.
 permissions, so use it for your own trusted work. For code you did not write, use an
 isolated workspace such as [`DockerWorkspace`](docker-sandbox.md).
 
+It does not confine paths either: an absolute path reaches anything your user can. The
+old `LocalBackend(allowed_directories=...)` refused paths outside its directories; with
+`LocalWorkspace`, deny what must stay out of reach in the ruleset.
+
 ```python
 import asyncio
 

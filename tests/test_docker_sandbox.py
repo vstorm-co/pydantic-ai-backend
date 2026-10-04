@@ -443,6 +443,26 @@ class TestDockerSandboxStop:
         assert container.removed == 1
         assert sandbox._container is None
 
+    def test_garbage_collection_leaves_a_named_container_running(self):
+        """A workspace drops its sandbox after every run while the container is still in use."""
+        sandbox = _sandbox(container_name="pydantic-ai-workspace-0123456789abcdef")
+        container = TestDockerSandboxLiveness._Container()
+        sandbox._container = container
+
+        sandbox.__del__()
+
+        assert container.stopped == 0
+        assert container.removed == 0
+
+    def test_garbage_collection_stops_an_anonymous_container(self):
+        sandbox = _sandbox()
+        container = TestDockerSandboxLiveness._Container()
+        sandbox._container = container
+
+        sandbox.__del__()
+
+        assert container.stopped == 1
+
     def test_stop_is_idempotent_and_never_raises(self):
         class Hostile(TestDockerSandboxLiveness._Container):
             def stop(self) -> None:

@@ -362,6 +362,10 @@ working directory, and a deny on either refuses. A rule on `/workspace/private/*
 covers `private/notes.txt` and `./private/../private/notes.txt` as well as the absolute
 spelling, and path-looking tokens in a command resolve against the same directory.
 
+Reads, writes and edits are also checked where the workspace's `realpath` says the path
+leads, so `settings.txt` linking to `.env` is refused by a deny on `**/.env`. That costs one
+more command on a shell workspace, and only when a ruleset is set.
+
 ### Shell execution and permission rules
 
 Execute rules pattern-match the **command string**, not file paths — a rule

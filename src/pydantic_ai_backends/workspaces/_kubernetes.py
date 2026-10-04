@@ -49,7 +49,8 @@ class KubernetesWorkspaceBackend(ContainerWorkspaceBackend):
         provider: str = KUBERNETES_PROVIDER,
     ) -> None:
         async def open_pod(sandbox_id: str | None) -> tuple[str, RunnerSandbox]:
-            sandbox = pod_factory(sandbox_id or uuid.uuid4().hex)
+            # In a thread: building one loads the kubeconfig from disk.
+            sandbox = await anyio.to_thread.run_sync(pod_factory, sandbox_id or uuid.uuid4().hex)
             if sandbox_id is None:
                 await anyio.to_thread.run_sync(sandbox.start)
             else:
@@ -147,4 +148,5 @@ class KubernetesWorkspace(AbstractCapability[object]):
         """
         if ref.provider != self.provider:
             raise ValueError(f"expected a {self.provider!r} workspace ref, got {ref.provider!r}")
-        await anyio.to_thread.run_sync(self._pod(ref.id).stop)
+        pod = await anyio.to_thread.run_sync(self._pod, ref.id)
+        await anyio.to_thread.run_sync(pod.stop)

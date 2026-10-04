@@ -590,9 +590,33 @@ class TestServiceInternals:
         assert wire.SessionInfo.model_validate(response.json()).alive is False
         assert harness.built[session_id].started == 1
 
-    def test_operations_do_revive_a_dead_sandbox(self, client: TestClient, harness: Harness):
-        """A client asking to run something wants a working sandbox."""
-        session_id, _ = _open_session(client, session_id="healme")
+    @pytest.mark.parametrize("files_outlive", ["workspace_root", "persist_containers"])
+    def test_operations_revive_a_dead_sandbox_whose_files_survive(
+        self, tmp_path: Path, files_outlive: str
+    ):
+        """A client asking to run something wants a working sandbox, files and all."""
+        config: dict[str, Any] = (
+            {"workspace_root": str(tmp_path)}
+            if files_outlive == "workspace_root"
+            else {"persist_containers": True}
+        )
+        harness = Harness(**config)
+        with harness.client() as client:
+            session_id, _ = _open_session(client, session_id="healme")
+            harness.built[session_id].alive = False
+
+            response = client.post(
+                f"/sessions/{session_id}/run",
+                json=_run("echo hi"),
+                headers=_service_headers(),
+            )
+
+            assert response.status_code == 200
+            assert harness.built[session_id].alive is True
+
+    def test_a_dead_sandbox_that_took_its_files_is_gone(self, client: TestClient, harness: Harness):
+        """Replaced, it would be empty, and the client would carry on as if it were not."""
+        session_id, _ = _open_session(client, session_id="lost")
         harness.built[session_id].alive = False
 
         response = client.post(
@@ -601,8 +625,8 @@ class TestServiceInternals:
             headers=_service_headers(),
         )
 
-        assert response.status_code == 200
-        assert harness.built[session_id].alive is True
+        assert response.status_code == 410
+        assert harness.built[session_id].started == 1
 
     def test_sandbox_lookup_404s_when_bookkeeping_is_gone(self):
         """A session known to auth but with no pending image cannot be built."""

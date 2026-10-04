@@ -312,3 +312,48 @@ class TestARuleBindsHoweverThePathIsSpelled:
         toolset = create_console_toolset(permissions=self.rules(workdir))
         out = await call(toolset, "read_file", ctx(local(workdir)), path="notes.txt")
         assert "ordinary work" in str(out)
+
+
+class TestARuleBindsWhereALinkLeads:
+    """A symlink named anything at all leads to the file a rule protects.
+
+    Checked as text, `settings.txt -> .env` read the credential a `**/.env` deny
+    refuses. `LocalBackend` resolved links before checking; the guard asks the
+    workspace's `realpath` for the same answer.
+    """
+
+    @pytest.fixture
+    def workdir(self, tmp_path: Path) -> Path:
+        root = tmp_path.resolve()
+        (root / ".env").write_text("OPENAI_API_KEY=sk-live-secret\n")
+        (root / "settings.txt").symlink_to(".env")
+        (root / "private").mkdir()
+        (root / "elsewhere").symlink_to("private", target_is_directory=True)
+        return root
+
+    async def test_reading_through_a_link_is_refused(self, workdir: Path) -> None:
+        toolset = create_console_toolset(permissions=ruleset())
+        out = await call(toolset, "read_file", ctx(local(workdir)), path="settings.txt")
+        assert "Permission denied" in str(out) and "sk-live-secret" not in str(out)
+
+    async def test_editing_through_a_link_is_refused(self, workdir: Path) -> None:
+        toolset = create_console_toolset(permissions=ruleset())
+        out = await call(
+            toolset,
+            "edit_file",
+            ctx(local(workdir)),
+            path="settings.txt",
+            old_string="sk-live-secret",
+            new_string="x",
+        )
+        assert "Permission denied" in str(out)
+        assert "sk-live-secret" in (workdir / ".env").read_text()
+
+    async def test_writing_through_a_linked_directory_is_refused(self, workdir: Path) -> None:
+        deny = [PermissionRule(pattern=f"{workdir}/private/**", action="deny")]
+        rules = PermissionRuleset(
+            default="allow", write=OperationPermissions(default="allow", rules=deny)
+        )
+        toolset = create_console_toolset(permissions=rules)
+        await call(toolset, "write_file", ctx(local(workdir)), path="elsewhere/x.txt", content="x")
+        assert not (workdir / "private" / "x.txt").exists()

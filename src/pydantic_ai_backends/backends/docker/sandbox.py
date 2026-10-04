@@ -469,14 +469,19 @@ class DockerSandbox:
         self._alive_checked_at = None
 
     def __del__(self) -> None:
-        """Best-effort cleanup on garbage collection.
+        """Best-effort cleanup of an anonymous container on garbage collection.
+
+        A named container is left running: it exists to outlive this object, and
+        a `DockerWorkspace` drops its sandbox after every run while the next run,
+        or another backend on the same ref, is still using the container.
+        Stopping it here killed their commands and every background process.
 
         `__del__` is unreliable for this — it may run during interpreter
         shutdown when modules are already torn down, or never run at all. Prefer
         the explicit :meth:`stop` lifecycle.
         """
         with contextlib.suppress(Exception):
-            if getattr(self, "_container", None) is not None:
+            if getattr(self, "_container", None) is not None and not self._container_name:
                 self.stop()
 
     # ── Commands ───────────────────────────────────────────────────────
@@ -490,13 +495,12 @@ class DockerSandbox:
         timeout: float | None = None,
         output_limit: int | None = None,
     ) -> CommandOutcome:
-        """Run `argv` under the workspace failure contract rather than this protocol's.
+        """Run `argv` under the workspace failure contract.
 
-        Unlike :meth:`execute` this raises when the container is unreachable,
-        keeps stdout and stderr apart, and stops the command's process group when
-        the caller times out or is cancelled. It is what a Pydantic AI workspace
-        and `sandboxd`'s `/run` are built on; an agent's tool path keeps using
-        :meth:`execute`.
+        Raises when the container is unreachable, keeps stdout and stderr apart,
+        and stops the command's process group when the caller times out or is
+        cancelled. It is what a Pydantic AI workspace and `sandboxd`'s `/run` are
+        built on.
 
         Args:
             argv: The program and its arguments, passed through literally.

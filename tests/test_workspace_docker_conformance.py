@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Awaitable, Callable, Iterator
 
+import anyio
 import pytest
 from pydantic_ai.workspaces import WorkspaceBackend, WorkspaceRef
 from pydantic_ai.workspaces.conformance import WorkspaceBackendSuite
@@ -58,3 +60,38 @@ class TestDockerWorkspaceConformance(WorkspaceBackendSuite):
             await CAPABILITY.destroy(backend.ref)
 
         return destroy
+
+
+class TestDockerWorkspaceLifetime:
+    """What the conformance suite does not exercise: one backend dropped while another works."""
+
+    @pytest.fixture
+    def anyio_backend(self) -> str:
+        return "asyncio"
+
+    @pytest.mark.anyio
+    async def test_dropping_a_backend_leaves_the_container_running(self) -> None:
+        first = CAPABILITY.backend()
+        started = await first.run(
+            "nohup sleep 300 >/dev/null 2>&1 & echo $! > /tmp/background.pid", shell=True
+        )
+        assert started.exit_code == 0
+        ref = first.ref
+        assert ref is not None
+        second = CAPABILITY.backend(ref)
+        try:
+            async with anyio.create_task_group() as group:
+
+                async def in_flight() -> None:
+                    result = await second.run(["sh", "-c", "sleep 2; echo done"])
+                    assert result.stdout == "done\n"
+
+                group.start_soon(in_flight)
+                await anyio.sleep(0.5)
+                del first
+                gc.collect()
+
+            background = await second.run(["sh", "-c", 'kill -0 "$(cat /tmp/background.pid)"'])
+            assert background.exit_code == 0
+        finally:
+            _remove_container(ref.id)

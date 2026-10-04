@@ -43,7 +43,9 @@ what replaces each removed name.
   `WorkspaceOutputLimitError`.
 - **`sandboxd` runs commands for a workspace: `POST /sessions/{id}/run`** takes
   an argv, `env` and a `run_id`, keeps stdout and stderr apart and answers `410`
-  for a vanished sandbox; `POST /sessions/{id}/runs/{run_id}/stop` stops a
+  for a vanished sandbox, including one that died between commands and whose
+  files died with it (no `workspace_root`, no persisted container) rather than
+  replacing it with an empty one; `POST /sessions/{id}/runs/{run_id}/stop` stops a
   command and its process group. A session open request with `attach` attaches
   without ever creating, answering `404` when there is nothing left to attach to.
 - **`CommandRunner`, `CommandOutcome` and `SandboxUnavailableError`**: what a
@@ -56,8 +58,10 @@ what replaces each removed name.
   a path as the model wrote it and as the workspace resolves it against its
   working directory, so a deny on `/workspace/private/**` also refuses
   `private/notes.txt`, and command arguments resolve against the same directory.
-  `LocalBackend` resolved paths against its root; this keeps that protection on
-  `LocalWorkspace` and gives it to every other workspace.
+  Reads, writes and edits are also checked where the workspace's `realpath`
+  says the path leads, so a symlink cannot stand in for a denied file.
+  `LocalBackend` resolved paths and links against its root; this keeps that
+  protection on `LocalWorkspace` and gives it to every other workspace.
 - **An unavailable workspace is reported, not read as empty.** With no
   workspace attached, or its environment gone, `ls`, `glob`, `grep` and an image
   read answer with that error instead of an empty directory or a missing file.
@@ -68,7 +72,11 @@ what replaces each removed name.
   `adapter.py` (`ensure_async` and the sync/async adapters). Tools reach the
   environment through `ctx.workspace`.
 - **`LocalBackend`**: use Pydantic AI's `LocalWorkspace`, which takes
-  `read_only=` for a directory the agent may only read.
+  `read_only=` for a directory the agent may only read. It does not confine
+  paths: an absolute path reaches anything the process can, where
+  `LocalBackend(allowed_directories=...)` refused everything outside its
+  directories. Deny what must stay out of reach with a permission ruleset, or
+  use a container workspace for a real boundary.
 - **`CompositeBackend` and `PrefixRouter`**: a run has one workspace. Compose
   policies around it with Pydantic AI's `WrapperWorkspace`.
 - **`BaseSandbox` and `AsyncBaseSandbox`**: file operations are derived by

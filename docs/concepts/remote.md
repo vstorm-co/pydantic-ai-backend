@@ -679,6 +679,11 @@ every process it started, for a client that gave up waiting. A sandbox from a
 custom `sandbox_builder` needs `run_command` and `stop_command`
 (`CommandRunner`) for these; without them `/run` answers `501`.
 
+A sandbox that died between two commands is replaced only when its files outlive
+it, on a `workspace_root` or in a persisted container. Without either, the
+replacement would be an empty container, so `/run` answers `410` and the client
+sees `WorkspaceUnavailableError` instead of carrying on in an empty directory.
+
 ## Capacity and reaping
 
 - `max_sessions` caps *resident* sandboxes; beyond it, opening a session either

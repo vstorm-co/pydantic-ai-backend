@@ -205,7 +205,9 @@ class GuardedOps:
     them against its working directory, and a deny on either refuses. A rule
     names a file one way — `/workspace/private/**` — and a model reaches it
     another — `private/notes.txt` — and checking only the spelling the model
-    chose let it read exactly what the rule protects.
+    chose let it read exactly what the rule protects. Reads, writes and edits
+    are also checked where the workspace's `realpath` says the path leads, so a
+    symlink cannot stand in for a denied file.
 
     Args:
         ops: What to wrap.
@@ -245,7 +247,17 @@ class GuardedOps:
         return [path] if resolved == path else [path, resolved]
 
     async def _refusal(self, operation: PermissionOperation, path: str) -> str | None:
-        for spelling in self._spellings(path, await self._base()):
+        """Why `operation` on `path` is refused, checking where the path really leads.
+
+        The workspace's `realpath` as well as the two text spellings: without it a
+        symlink named anything at all reads or writes the file a rule denies.
+        One more round trip on a shell workspace, paid only for the operations
+        that move content and only when a ruleset is in force.
+        """
+        spellings = self._spellings(path, await self._base())
+        if self._workspace is not None:
+            spellings.append(await self._workspace.realpath(spellings[-1]))
+        for spelling in spellings:
             reason = self._guard.denial_reason(operation, spelling)
             if reason is not None:
                 return reason

@@ -1350,14 +1350,30 @@ class _Service:
         is woken here, which is the only place it can be, since waking is what
         the next request means.
 
+        A dead sandbox is replaced only where its files outlive it: on a
+        `workspace_root`, or in a persisted container started again. Otherwise
+        the replacement would be empty, and a client continuing its work would
+        carry on in a fresh directory as if its files were there.
+
         Raises:
-            HTTPException: 404 when the session has since disappeared, and 429
-                when it is hibernated and every resident session is busy. The
-                second is backpressure rather than an error: the work is still
-                there, and the caller is being asked to come back.
+            HTTPException: 404 when the session has since disappeared, 410 when
+                its sandbox died and took its files with it, and 429 when it is
+                hibernated and every resident session is busy. The last is
+                backpressure rather than an error: the work is still there, and
+                the caller is being asked to come back.
         """
+        resident = self.manager.sessions.get(session_id)
+        if (
+            resident is not None
+            and not self._files_outlive_sandbox()
+            and not await alive_of(resident)
+        ):
+            raise HTTPException(
+                status_code=410,
+                detail=f"The sandbox of session {session_id} is gone, and its files with it",
+            )
         try:
-            if session_id not in self.manager.sessions:
+            if resident is None:
                 # Waking claims a slot, so somebody idle may have to give one up.
                 await self.make_room()
             sandbox = await self.manager.get_or_create(session_id)
@@ -1373,6 +1389,10 @@ class _Service:
         if record is not None:  # pragma: no branch - an authorized caller has one
             record.hibernated_at = None
         return sandbox
+
+    def _files_outlive_sandbox(self) -> bool:
+        """Whether a session's files survive its sandbox dying."""
+        return self.config.workspace_root is not None or self.config.persist_containers
 
     def peek(self, session_id: str) -> Any:
         """Existing sandbox for a session, without creating anything.

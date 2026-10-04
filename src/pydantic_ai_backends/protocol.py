@@ -23,12 +23,12 @@ class SandboxUnavailableError(RuntimeError):
 
 @runtime_checkable
 class CommandRunner(Protocol):
-    """Optional sandbox extension: commands under a workspace's failure contract.
+    """Commands under a workspace's failure contract.
 
-    `execute` folds every failure into its output so an agent's run survives it;
-    this raises instead, keeps stdout and stderr apart, and can be stopped from
-    elsewhere by the `run_id` its caller chose. Implemented by `DockerSandbox`,
-    and what both `sandboxd`'s `/run` and the Pydantic AI workspaces in
+    Raises rather than folding a failure into the output, keeps stdout and
+    stderr apart, and can be stopped from elsewhere by the `run_id` its caller
+    chose. Implemented by `DockerSandbox` and `KubernetesPodSandbox`, and what
+    both `sandboxd`'s `/run` and the Pydantic AI workspaces in
     :mod:`pydantic_ai_backends.workspaces` are built on.
     """
 
