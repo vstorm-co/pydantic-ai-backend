@@ -131,6 +131,18 @@ class TestContentHelpers:
             f"Error: Image 'test.png' too large ({len(PNG_DATA) / (1024 * 1024):.1f}MB, max 0.0MB)"
         )
 
+    async def test_an_empty_file_is_refused(self, tmp_path: Path) -> None:
+        """An empty file, read without an exception anywhere in the chain.
+
+        The missing-file case above reaches the same refusal through a caught
+        `FileNotFoundError`, and the Python 3.11 coverage tracer loses the line
+        after an await that unwound one — so this pins the line directly.
+        """
+        (tmp_path / "empty.png").write_bytes(b"")
+        assert await image_content(
+            WorkspaceOps(local(tmp_path)), "empty.png", DEFAULT_MAX_IMAGE_BYTES
+        ) == ("Error: Image file 'empty.png' not found or empty")
+
     async def test_each_helper_ignores_the_other_kind(self, tmp_path: Path) -> None:
         (tmp_path / "test.png").write_bytes(PNG_DATA)
         (tmp_path / "report.pdf").write_bytes(PDF_DATA)
