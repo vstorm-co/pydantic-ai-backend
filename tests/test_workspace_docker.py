@@ -491,3 +491,63 @@ class TestCommandContract:
     def test_a_finished_outcome_needs_an_exit_code(self) -> None:
         with pytest.raises(ValueError, match="exit code"):
             command_result(CommandOutcome(stdout="", stderr=""), timeout=None, limit=1)
+
+
+class TestAConfiguredContainer:
+    """A container named by whoever configures the workspace, for every run."""
+
+    async def test_is_created_under_its_name_on_first_use(self, client: _Client) -> None:
+        factory = _Factory()
+        backend = DockerWorkspaceBackend(sandbox_factory=factory, container_name="project-box")
+        await backend.run(["true"])
+        assert factory.built[0].name == "project-box"
+        assert backend.ref == WorkspaceRef(provider="docker", id="project-box")
+
+    async def test_a_ref_to_it_attaches_while_it_is_there(self, client: _Client) -> None:
+        client.containers.known["project-box"] = _Container(client.api, status="exited")
+        factory = _Factory()
+        backend = DockerWorkspaceBackend(
+            sandbox_factory=factory,
+            ref=WorkspaceRef(provider="docker", id="project-box"),
+            container_name="project-box",
+        )
+        await backend.run(["true"])
+        assert factory.built[0].name == "project-box"
+
+    async def test_a_ref_to_it_once_it_is_gone_is_unavailable(self, client: _Client) -> None:
+        backend = DockerWorkspaceBackend(
+            sandbox_factory=_Factory(),
+            ref=WorkspaceRef(provider="docker", id="project-box"),
+            container_name="project-box",
+        )
+        with pytest.raises(WorkspaceUnavailableError, match="no longer exists"):
+            await backend.working_dir()
+
+    async def test_no_ref_reaches_another_container(self, client: _Client) -> None:
+        client.containers.known["postgres"] = _Container(client.api)
+        backend = DockerWorkspaceBackend(
+            sandbox_factory=_Factory(),
+            ref=WorkspaceRef(provider="docker", id="postgres"),
+            container_name="project-box",
+        )
+        with pytest.raises(WorkspaceUnavailableError, match="not created by a DockerWorkspace"):
+            await backend.working_dir()
+
+    def test_the_capability_leaves_other_refs_alone(self) -> None:
+        capability = DockerWorkspace(container_name="project-box")
+        ctx: Any = None
+        assert capability.get_workspace(ctx, ref=WorkspaceRef(provider="docker", id="x")) is None
+        own = capability.get_workspace(ctx, ref=WorkspaceRef(provider="docker", id="project-box"))
+        assert isinstance(own, DockerWorkspaceBackend)
+
+    async def test_destroy_removes_it(self, client: _Client) -> None:
+        box = _Container(client.api)
+        client.containers.known["project-box"] = box
+        await DockerWorkspace(container_name="project-box").destroy(
+            WorkspaceRef(provider="docker", id="project-box")
+        )
+        assert box.removed
+
+    def test_volumes_reach_the_sandbox(self) -> None:
+        sandbox = DockerWorkspace(volumes={"/host/project": "/workspace"})._sandbox("name")
+        assert sandbox._volumes == {"/host/project": "/workspace"}

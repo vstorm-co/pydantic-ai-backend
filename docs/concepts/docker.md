@@ -118,15 +118,33 @@ with the conversation, and every turn reaches the same environment; a different 
 gets a container of its own. Call `destroy(ref)` when a conversation is deleted — nothing
 removes a container for you.
 
+### One container, named by you
+
+A tool that runs from a project directory - a CLI, an editor plugin - wants the same
+container every time it starts, with the project mounted inside, and has no history to
+carry a ref in. Name the container and mount the project:
+
+```python
+workspace = DockerWorkspace(
+    container_name="my-project-sandbox",
+    volumes={"/home/me/my-project": "/workspace"},
+)
+```
+
+The first run creates `my-project-sandbox`; every later one, in this process or the next,
+attaches to it, installed packages included. A ref naming it still has to find it there -
+one that outlived the container is `WorkspaceUnavailableError` - and a ref naming any other
+container is left to another capability. `destroy(ref)` removes it like any other.
+
 What `DockerWorkspace` does not do is manage a fleet: idle reaping, a ceiling on running
 containers, per-tenant capacity, hibernation. That is what [`sandboxd`](remote.md) is for,
 built on the same `DockerSandbox` and the same command path.
 
 ## Options
 
-`image`, `runtime`, `work_dir`, `network_mode`, `mem_limit`, `cpus` and `oci_runtime` are
-fields of `DockerWorkspace`. For a container option it does not expose — volumes, a tmpfs,
-a pids limit — build the backend yourself with a factory that returns the `DockerSandbox`
+`image`, `runtime`, `work_dir`, `network_mode`, `mem_limit`, `cpus`, `oci_runtime`, `env`,
+`volumes` and `container_name` are fields of `DockerWorkspace`. For a container option it
+does not expose — a tmpfs, a pids limit — build the backend yourself with a factory that returns the `DockerSandbox`
 you want:
 
 ```python
