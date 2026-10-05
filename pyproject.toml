@@ -35,6 +35,8 @@ console = [
 workspaces = [
     # Workspaces landed in 2.52.0: `pydantic_ai.workspaces` and `RunContext.workspace`.
     "pydantic-ai-slim>=2.52.0",
+    # `SandboxdWorkspace` talks to its service over HTTP, and the package imports it.
+    "httpx>=0.28.0",
 ]
 images = [
     "pillow>=10.0.0",

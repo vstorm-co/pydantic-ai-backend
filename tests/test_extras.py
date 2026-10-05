@@ -21,3 +21,10 @@ def test_the_console_extra_installs_what_reading_a_text_file_needs() -> None:
     with `docker` - so an install of `console` alone answered every read with
     "chardet is required"."""
     assert "chardet" in _extra("console")
+
+
+def test_the_workspaces_extra_installs_what_importing_a_workspace_needs():
+    """`SandboxdWorkspace` speaks HTTP and the package exports it, so importing
+    any workspace - `StateWorkspace` included - needs `httpx`, which came only
+    with `remote`."""
+    assert "httpx" in _extra("workspaces")
