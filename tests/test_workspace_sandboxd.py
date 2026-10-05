@@ -254,6 +254,91 @@ class TestSandboxdWorkspaceBackend:
             await service.capability().destroy(WorkspaceRef(provider="docker", id="x"))
 
 
+class TestNamedSessions:
+    """`session_name`: the configurer names the session, so any client finds it."""
+
+    async def test_the_first_operation_opens_it_under_the_name(self, service: Service) -> None:
+        backend = service.capability(session_name="conv-named-1").backend()
+        await backend.run(["sh", "-c", "printf one > note.txt"])
+        assert backend.ref == WorkspaceRef(provider="sandboxd", id="conv-named-1")
+        assert "conv-named-1" in service.built
+
+    async def test_another_client_with_the_name_works_in_the_same_session(
+        self, service: Service
+    ) -> None:
+        first = service.capability(session_name="conv-named-2").backend()
+        await first.run(["sh", "-c", "printf shared > note.txt"])
+        second = service.capability(session_name="conv-named-2").backend()
+        assert (await second.run(["cat", "note.txt"])).stdout == "shared"
+
+    async def test_kept_files_are_found_by_name_after_the_session_closed(
+        self, service: Service
+    ) -> None:
+        first = service.capability(session_name="conv-named-3").backend()
+        await first.run(["sh", "-c", "printf kept > note.txt"])
+        async with httpx.AsyncClient() as client:
+            response = await client.delete(
+                f"{service.url}/sessions/conv-named-3", headers={wire.TOKEN_HEADER: TOKEN}
+            )
+        assert response.status_code == 204
+        again = service.capability(session_name="conv-named-3").backend()
+        assert (await again.run(["cat", "note.txt"])).stdout == "kept"
+
+    async def test_a_ref_still_only_attaches(self, service: Service) -> None:
+        """A caller that knows the session existed hears that it is gone."""
+        capability = service.capability(session_name="conv-named-4")
+        opened = capability.backend()
+        await opened.working_dir()
+        assert opened.ref is not None
+        await capability.destroy(opened.ref)
+        with pytest.raises(WorkspaceUnavailableError, match="no longer exists"):
+            await capability.backend(opened.ref).working_dir()
+
+    def test_a_name_the_service_would_refuse_is_refused_here(self, service: Service) -> None:
+        with pytest.raises(ValueError, match="session_name"):
+            service.capability(session_name="../escape").backend()
+
+    def test_a_ref_naming_another_session_is_left_to_another_capability(
+        self, service: Service
+    ) -> None:
+        capability = service.capability(session_name="conv-named-5")
+        ctx: Any = None
+        assert capability.get_workspace(ctx, ref=WorkspaceRef(provider="sandboxd", id="x")) is None
+        named = WorkspaceRef(provider="sandboxd", id="conv-named-5")
+        assert isinstance(capability.get_workspace(ctx, ref=named), SandboxdWorkspaceBackend)
+
+    async def test_a_name_being_opened_elsewhere_is_waited_for(self) -> None:
+        asked: list[bool] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/sessions":
+                body = wire.CreateSessionRequest.model_validate_json(request.content)
+                assert body.session_id == "conv-busy" and body.reuse and not body.attach
+                asked.append(True)
+                if len(asked) == 1:
+                    return httpx.Response(409, text="Session is opening: conv-busy")
+            ran = wire.RunResponse(stdout="ok", stderr="", exit_code=0)
+            return _opened(request) or httpx.Response(200, content=ran.model_dump_json())
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend(
+                "http://x", token="t", client=client, session_name="conv-busy"
+            )
+            assert (await backend.run(["true"])).stdout == "ok"
+        assert len(asked) == 2
+
+    async def test_a_name_that_stays_busy_is_an_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(409, text="Session is opening: conv-busy")
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend(
+                "http://x", token="t", client=client, session_name="conv-busy", request_timeout=0.3
+            )
+            with pytest.raises(httpx.HTTPStatusError):
+                await backend.run(["true"])
+
+
 class TestSandboxdWorkspaceCapability:
     def test_a_foreign_ref_is_left_to_another_capability(self, service: Service) -> None:
         capability = service.capability(provider="sandboxd:eu")

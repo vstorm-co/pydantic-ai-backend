@@ -98,6 +98,11 @@ class DaytonaWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         env: Variables every command gets, under any a call passes.
         client: An `AsyncDaytona` to share, owned and closed by the caller;
             without one each operation opens and closes its own.
+        sandbox_name: A sandbox name chosen by whoever configures the workspace
+            rather than by Daytona: with no ref, the first operation creates the
+            sandbox under it, or attaches to the one that already has it. A ref
+            is still attach-only, so a caller that knows the sandbox existed
+            learns that it is gone instead of starting over in a new one.
     """
 
     def __init__(
@@ -108,9 +113,11 @@ class DaytonaWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         ref: WorkspaceRef | None = None,
         env: Mapping[str, str] | None = None,
         client: AsyncDaytona | None = None,
+        sandbox_name: str | None = None,
     ) -> None:
         if ref is not None and ref.provider != DAYTONA_PROVIDER:
             raise ValueError(f"expected a {DAYTONA_PROVIDER!r} workspace ref, got {ref.provider!r}")
+        self._sandbox_name = sandbox_name
         self._config = config
         self._create_params = create_params
         self._ref = ref
@@ -137,32 +144,43 @@ class DaytonaWorkspaceBackend(WorkspaceBackend, SupportsCommands):
 
     async def _sandbox(self, client: AsyncDaytona) -> AsyncSandbox:
         """The sandbox, created or attached under the lock, with a session open in it."""
-        daytona = load("daytona", purpose="DaytonaWorkspace")
         async with self._lock:
-            if self._ref is None:
+            if self._ref is not None:
+                sandbox = await _attach(client, self._ref.id)
+            elif self._sandbox_name is not None:
+                sandbox = await self._open_named(client, self._sandbox_name)
+            else:
                 # Shielded so a caller cancelled mid-create still leaves the ref
                 # of a sandbox Daytona has already made.
                 with anyio.CancelScope(shield=True):
                     sandbox = await client.create(self._create_params)
                     self._ref = WorkspaceRef(provider=DAYTONA_PROVIDER, id=sandbox.id)
-            else:
-                try:
-                    sandbox = await client.get(self._ref.id)
-                except daytona.DaytonaNotFoundError as error:
-                    raise WorkspaceUnavailableError(
-                        f"Daytona sandbox {self._ref.id!r} no longer exists"
-                    ) from error
-                state = _state(sandbox)
-                if state in GONE_STATES:
-                    raise WorkspaceUnavailableError(f"Daytona sandbox {self._ref.id!r} is {state}")
-                if state in RESUMABLE_STATES:
-                    await sandbox.start()
             if self._working_dir is None:
                 self._working_dir = await sandbox.get_work_dir()
             if not self._session_open:
                 await sandbox.process.create_session(self._session_id)
                 self._session_open = True
             return sandbox
+
+    async def _open_named(self, client: AsyncDaytona, name: str) -> AsyncSandbox:
+        """The sandbox called `name`: the existing one, or a new one created under it."""
+        daytona = load("daytona", purpose="DaytonaWorkspace")
+        with anyio.CancelScope(shield=True):
+            try:
+                sandbox = await _attach(client, name)
+            except WorkspaceUnavailableError as gone:
+                if not isinstance(gone.__cause__, daytona.DaytonaNotFoundError):
+                    raise
+                params = self._create_params or daytona.CreateSandboxFromSnapshotParams()
+                try:
+                    sandbox = await client.create(params.model_copy(update={"name": name}))
+                except daytona.DaytonaConflictError:
+                    # Another client created it between our lookup and our create.
+                    sandbox = await _attach(client, name)
+            # The name, not the id: it is what a later client knows to look for,
+            # and `get` takes either.
+            self._ref = WorkspaceRef(provider=DAYTONA_PROVIDER, id=name)
+        return sandbox
 
     async def working_dir(self) -> str:
         """The sandbox's working directory, as Daytona reports it."""
@@ -264,6 +282,27 @@ class DaytonaWorkspaceBackend(WorkspaceBackend, SupportsCommands):
             await client.delete(sandbox)
 
 
+async def _attach(client: AsyncDaytona, id_or_name: str) -> AsyncSandbox:
+    """The existing sandbox `id_or_name` names, started when it was stopped or archived.
+
+    Raises:
+        WorkspaceUnavailableError: It does not exist, or is gone for good.
+    """
+    daytona = load("daytona", purpose="DaytonaWorkspace")
+    try:
+        sandbox = await client.get(id_or_name)
+    except daytona.DaytonaNotFoundError as error:
+        raise WorkspaceUnavailableError(
+            f"Daytona sandbox {id_or_name!r} no longer exists"
+        ) from error
+    state = _state(sandbox)
+    if state in GONE_STATES:
+        raise WorkspaceUnavailableError(f"Daytona sandbox {id_or_name!r} is {state}")
+    if state in RESUMABLE_STATES:
+        await sandbox.start()
+    return sandbox
+
+
 @dataclass(kw_only=True)
 class DaytonaWorkspace(AbstractCapability[object]):
     """Supply a Daytona sandbox as the run's workspace.
@@ -300,6 +339,14 @@ class DaytonaWorkspace(AbstractCapability[object]):
     client: AsyncDaytona | None = field(default=None, repr=False, compare=False)
     """An `AsyncDaytona` to share across runs, owned and closed by the caller."""
 
+    sandbox_name: str | None = None
+    """One sandbox for every run, named by you: created on first use, attached after.
+
+    Without it each run without a ref gets a new sandbox and only the ref leads
+    back to it. With it a later process finds the same sandbox by name. A ref
+    naming another sandbox is left to another capability.
+    """
+
     def __post_init__(self) -> None:
         if self.defer_loading:
             raise UserError(
@@ -315,6 +362,7 @@ class DaytonaWorkspace(AbstractCapability[object]):
             ref=ref,
             env=self.env,
             client=self.client,
+            sandbox_name=self.sandbox_name,
         )
 
     def get_workspace(
@@ -323,6 +371,8 @@ class DaytonaWorkspace(AbstractCapability[object]):
         """This run's backend, or `None` for a ref another provider owns."""
         del ctx
         if ref is not None and ref.provider != DAYTONA_PROVIDER:
+            return None
+        if ref is not None and self.sandbox_name is not None and ref.id != self.sandbox_name:
             return None
         return self.backend(ref)
 

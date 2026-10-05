@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
@@ -45,6 +46,9 @@ reports its own timeout instead of the client giving up on a running command."""
 STOP_GRACE_SECONDS = 5.0
 """Longest a cancelled command's stop request may hold up the cancellation."""
 
+OPENING_RETRY_SECONDS = 0.2
+"""Pause before asking again for a named session another client is opening."""
+
 _GONE = frozenset({404, 410})
 """Statuses meaning the session or its sandbox no longer exists."""
 
@@ -84,6 +88,12 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         client: An `httpx.AsyncClient` to share. Owned by the caller, who
             closes it; without one each request uses a client of its own.
         request_timeout: Seconds for a request that runs no command.
+        session_name: A session id chosen by whoever configures the workspace
+            rather than by the service: with no ref, the first operation opens
+            the session under it, or attaches when it is open or its files are
+            kept. A ref is still attach-only, so a caller that knows the
+            session existed learns that it is gone instead of starting over in
+            an empty one.
     """
 
     def __init__(
@@ -98,9 +108,14 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         env: Mapping[str, str] | None = None,
         client: httpx.AsyncClient | None = None,
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        session_name: str | None = None,
     ) -> None:
         if ref is not None and ref.provider != provider:
             raise ValueError(f"expected a {provider!r} workspace ref, got {ref.provider!r}")
+        if session_name is not None and not re.fullmatch(wire.SESSION_ID_PATTERN, session_name):
+            raise ValueError(
+                f"session_name {session_name!r} is not a session id the service accepts"
+            )
         self._service_url = service_url.rstrip("/")
         self._token = token
         self._ref = ref
@@ -110,6 +125,7 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         self._env = dict(env) if env else None
         self._client = client
         self._request_timeout = request_timeout
+        self._session_name = session_name
         self._session: _Session | None = None
         self._working_dir: str | None = None
         self._lock = anyio.Lock()
@@ -145,15 +161,26 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
 
     async def _open(self) -> _Session:
         """Open or attach to the session, then learn the service's command ceiling."""
+        named = self._ref is None and self._session_name is not None
         request = wire.CreateSessionRequest(
-            session_id=None if self._ref is None else self._ref.id,
+            session_id=self._session_name if self._ref is None else self._ref.id,
             runtime=self._runtime,
             tenant=self._tenant,
+            reuse=named,
             attach=self._ref is not None,
         )
         response = await self._post(
             "/sessions", request, token=self._token, timeout=self._request_timeout
         )
+        # With `reuse` a 409 means another client is opening the same name right
+        # now - two first runs of one conversation, say. It is theirs a moment
+        # later, so ask again rather than fail one of them.
+        give_up = anyio.current_time() + self._request_timeout
+        while named and response.status_code == 409 and anyio.current_time() < give_up:
+            await anyio.sleep(OPENING_RETRY_SECONDS)
+            response = await self._post(
+                "/sessions", request, token=self._token, timeout=self._request_timeout
+            )
         if self._ref is not None and response.status_code == 404:
             raise WorkspaceUnavailableError(f"sandboxd session {self._ref.id!r} no longer exists")
         response.raise_for_status()
@@ -350,6 +377,15 @@ class SandboxdWorkspace(AbstractCapability[object]):
     client: httpx.AsyncClient | None = field(default=None, repr=False, compare=False)
     """An `httpx.AsyncClient` to share across runs, owned and closed by the caller."""
 
+    session_name: str | None = None
+    """One session for every run, named by you: opened on first use, attached after.
+
+    Without it each run without a ref gets a new session and only the ref leads
+    back to it. With it a later process finds the same session - or the files the
+    service kept after reaping it - by name. A ref naming another session is left
+    to another capability.
+    """
+
     def __post_init__(self) -> None:
         if self.defer_loading:
             raise UserError(
@@ -368,6 +404,7 @@ class SandboxdWorkspace(AbstractCapability[object]):
             tenant=self.tenant,
             env=self.env,
             client=self.client,
+            session_name=self.session_name,
         )
 
     def get_workspace(
@@ -376,6 +413,8 @@ class SandboxdWorkspace(AbstractCapability[object]):
         """This run's backend, or `None` for a ref another provider owns."""
         del ctx
         if ref is not None and ref.provider != self.provider:
+            return None
+        if ref is not None and self.session_name is not None and ref.id != self.session_name:
             return None
         return self.backend(ref)
 

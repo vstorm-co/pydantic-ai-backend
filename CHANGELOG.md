@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SandboxdWorkspace(session_name=...)` and `DaytonaWorkspace(sandbox_name=...)`.**
+  The workspace is named by whoever configures it rather than by the provider: a
+  run with no ref opens it under the name, or attaches when it exists, so an
+  application can key a session on its own record - a conversation, a user -
+  without storing a ref first. `DockerWorkspace(container_name=...)` did this for
+  Docker in 0.2.31. Two clients opening one name at once end up in one session.
+  A ref is still attach-only, so a run that knows the session existed hears it is
+  gone instead of starting over in an empty one, and a ref naming anything else
+  is left to another capability.
+
 ## [0.2.31] - 2026-10-05
 
 ### Added
