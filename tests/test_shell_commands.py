@@ -84,7 +84,8 @@ class TestGrep:
     def test_hidden_files_are_excluded_by_default(self):
         command = _shell.grep_command("todo")
 
-        assert "--exclude-dir='.[!.]*'" in command
+        assert "--exclude-dir='.[!./]*'" in command
+        assert "--exclude-dir='*/.[!.]*'" in command
         assert "--exclude=" not in command
 
     def test_hidden_files_can_be_included(self):
@@ -163,9 +164,10 @@ class TestGrepQuoting:
         assert shlex.split(command)[-3:] == ["-e", "-v", "/w"]
 
     def test_the_hidden_excludes_stay_quoted(self):
-        """Unquoted, the shell expands `.*` against the working directory."""
-        assert "--exclude-dir=.[!.]*" in shlex.split(_shell.grep_command("x", "/w"))
-        assert "'.[!.]*'" in _shell.grep_command("x", "/w")
+        """Unquoted, the shell expands them against the working directory."""
+        argv = shlex.split(_shell.grep_command("x", "/w"))
+        assert {"--exclude-dir=.[!./]*", "--exclude-dir=*/.[!.]*"} <= set(argv)
+        assert "'.[!./]*'" in _shell.grep_command("x", "/w")
 
 
 class TestHiddenExclusionKeepsTheStartingDirectory:
@@ -180,6 +182,18 @@ class TestHiddenExclusionKeepsTheStartingDirectory:
         matches = await WorkspaceOps(local(tmp_path)).grep_raw("needle")
         assert isinstance(matches, list)
         assert [m["path"].removeprefix("./") for m in matches] == ["visible.txt"]
+
+    async def test_subdirectories_are_searched_and_hidden_ones_skipped(self, tmp_path) -> None:
+        """BSD grep matched `.[!.]*` against `./src` and skipped every subdirectory."""
+        from pydantic_ai_backends.toolsets._workspace import WorkspaceOps
+        from tests.support import local
+
+        for path in ("src/app.py", "a.b/c.txt", ".git/HEAD", "src/.cache/x"):
+            (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / path).write_text("needle")
+        matches = await WorkspaceOps(local(tmp_path)).grep_raw("needle")
+        assert isinstance(matches, list)
+        assert sorted(m["path"].removeprefix("./") for m in matches) == ["a.b/c.txt", "src/app.py"]
 
 
 class TestHiddenMatch:

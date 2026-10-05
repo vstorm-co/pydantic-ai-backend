@@ -337,6 +337,27 @@ The service generates session ids, so they are unguessable; an application namin
 its own with `reuse` should derive them from a UUID it generated, never from a
 sequential id or user input, and keep them inside 64 characters.
 
+### A session named by you
+
+`SandboxdWorkspace(session_name=...)` is that from the client: a run with no
+ref opens the session under the name, or attaches when it is open or its files
+are kept, so the application can key the session on its own record - a
+conversation, a user - without storing a ref first:
+
+```python
+sandbox = SandboxdWorkspace(
+    service_url="http://sandboxd:8080",
+    token=token,
+    session_name=f"conv-{conversation_id}",
+)
+```
+
+Two runs opening the same name at once both end up in one session: the service
+answers the second with `409` while the first is still opening it, and the
+client asks again. A ref is still attach-only, so a run continuing a
+conversation whose session was purged gets `WorkspaceUnavailableError` rather
+than an empty directory - hand it the ref when you know the session existed.
+
 ## Making it fast on a small host
 
 Four settings, and on a 4 GB box each one is worth more than it sounds.

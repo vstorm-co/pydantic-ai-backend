@@ -37,6 +37,16 @@ attaches to it, starting it when Daytona stopped or archived it; one that is des
 gone fails with `WorkspaceUnavailableError`. `destroy(ref)` deletes it. Daytona's own
 auto-stop and auto-delete still apply.
 
+`sandbox_name` names the sandbox instead: a run with no ref creates it under that name, or
+attaches to the sandbox that already has it, so an application can key a sandbox on its
+own record without storing a ref first. Its ref carries the name. Two clients creating
+the same name at once end up in one sandbox. A ref is still attach-only, so a sandbox
+deleted meanwhile is `WorkspaceUnavailableError` rather than a new one.
+
+```python
+sandboxes = DaytonaWorkspace(config=config, sandbox_name=f"conv-{conversation_id}")
+```
+
 ## How a command runs
 
 As a synchronous session command, the one Daytona API that reports stdout and stderr apart

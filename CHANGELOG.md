@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SandboxdWorkspace(session_name=...)` and `DaytonaWorkspace(sandbox_name=...)`.**
+  The workspace is named by whoever configures it rather than by the provider: a
+  run with no ref opens it under the name, or attaches when it exists, so an
+  application can key a session on its own record - a conversation, a user -
+  without storing a ref first. `DockerWorkspace(container_name=...)` did this for
+  Docker in 0.2.31. Two clients opening one name at once end up in one session.
+  A ref is still attach-only, so a run that knows the session existed hears it is
+  gone instead of starting over in an empty one, and a ref naming anything else
+  is left to another capability.
+
+- **`ConfinedWorkspace`.** Pydantic AI's local workspace confines nothing, so moving from
+  `LocalBackend(root_dir=...)` to it let the file tools - which usually run without
+  approval - write anywhere the process can. `ConfinedWorkspace` wraps any workspace and
+  refuses a file operation whose real path, symlinks followed, leaves its working directory,
+  with `WorkspacePathError` (a `PermissionError`); the console's `glob` and `grep` check
+  their search root the same way. Commands are not confined: isolate those with a sandbox.
+
 ### Fixed
+
+- **`grep` on macOS searched only the top directory.** BSD grep matches `--exclude-dir`
+  against the path it walks, `./src`, and the hidden-directory pattern `.[!.]*` matched every
+  such path, so with `ignore_hidden` (the default) nothing below the search root was found.
+  Two patterns now cover GNU grep, which tests a directory's base name, and BSD grep.
 
 - **The `console` extra installs `chardet`.** `read_file` decodes every text file
   through encoding detection, and `chardet` came only with the `docker` and `server`
