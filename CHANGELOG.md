@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.30] - 2026-10-05
+
 **⚠️ Breaking: the library is now built on Pydantic AI workspaces.** Pydantic AI
 2.52 gave every tool one environment to work in, `ctx.workspace`, with its own
 file and command contract. This library had a second one — `BackendProtocol`
