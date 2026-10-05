@@ -39,6 +39,8 @@
 
 **Pydantic AI Backend** gives your [Pydantic AI](https://ai.pydantic.dev/) agent somewhere to work and the tools to work there. It supplies [Pydantic AI workspaces](https://pydantic.dev/docs/ai/core-concepts/workspace/) — a Docker container, a `sandboxd` session, a Kubernetes pod, a Daytona sandbox, a JSON document — and a console toolset that reads, writes, searches and runs code in whichever workspace the run has, under a fine-grained permission system.
 
+![pydantic-ai-backend by layer: the agent's tools call ctx.workspace, Pydantic AI's contract, and a workspace from this library or from Pydantic AI answers it](assets/architecture.png)
+
 ## Use Cases
 
 | What You Want to Build | How This Library Helps |
@@ -159,7 +161,7 @@ store = {"conv-42": StateBackend(files=row.files, directories=row.directories)}
 workspace = StateWorkspace(store=store)
 ```
 
-A `StateBackend` is a filesystem kept as a JSON document — `files`, and the `directories` made empty — so a host can keep a workspace in a database row and hand it back on the next turn. Binary content is held base64, so the document stays JSON even after an agent writes an image into it.
+A `StateBackend` is a filesystem kept as a JSON document — `files`, and the `directories` created — so a host can keep a workspace in a database row and hand it back on the next turn. Binary content is held base64, so the document stays JSON even after an agent writes an image into it.
 
 ### sandboxd: no docker.sock in your app
 

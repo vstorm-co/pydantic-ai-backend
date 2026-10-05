@@ -188,3 +188,34 @@ class TestReadTracking:
         out = await _call(backend, "read_file", path="/gone.txt")
 
         assert out.startswith("Error")
+
+
+class TestAFinishedWorkspaceIsReleased:
+    """A long-lived toolset must not keep every workspace it ever worked in."""
+
+    async def test_it_is_collectable_while_the_toolset_lives(self):
+        import gc
+        import weakref
+
+        toolset = create_console_toolset()
+        refs = []
+        for _ in range(3):
+            workspace = document({"/notes.md": "one\n"})
+            await _call(workspace, "read_file", toolset, path="/notes.md")
+            refs.append(weakref.ref(workspace))
+        del workspace
+        gc.collect()
+
+        assert [ref() for ref in refs] == [None, None, None]
+
+    async def test_what_was_read_still_guards_the_next_edit(self):
+        toolset = create_console_toolset()
+        workspace = document({"/notes.md": "one\n"})
+        await _call(workspace, "read_file", toolset, path="/notes.md")
+        await workspace.write_bytes("/notes.md", b"changed\n")
+
+        out = await _call(
+            workspace, "edit_file", toolset, path="/notes.md", old_string="changed", new_string="x"
+        )
+
+        assert "changed since you last read it" in out

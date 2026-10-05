@@ -628,6 +628,58 @@ class TestServiceInternals:
         assert response.status_code == 410
         assert harness.built[session_id].started == 1
 
+    async def test_a_removed_persisted_container_is_gone_not_recreated(self, monkeypatch):
+        """A name proves nothing: the files were in the container, so a new one is empty."""
+        from pydantic_ai_backends.backends.docker import sandbox as sandbox_mod
+        from pydantic_ai_backends.remote.server import _default_builder, _Pending, _Service
+        from tests.test_docker_sandbox import _StubClient
+
+        stub = _StubClient()
+        monkeypatch.setattr(sandbox_mod, "docker_client", lambda: stub)
+        monkeypatch.setattr(sandbox_mod, "resolve_image", lambda *args: "img")
+        config = SandboxdConfig(token="t", runtimes={"python": "img"}, persist_containers=True)
+        service = _Service(
+            config,
+            _default_builder(config),
+            reattach_sandbox=_default_builder(config, reattach_only=True),
+        )
+        service._pending["kept"] = _Pending(runtime=SandboxRuntime(image="img"), tenant=None)
+        first = await service.sandbox("kept")
+        first._container.status = "exited"  # the container is removed from under it
+        first._alive_checked_at = None
+
+        with pytest.raises(HTTPException) as excinfo:
+            await service.sandbox("kept")
+
+        assert excinfo.value.status_code == 410
+        assert len(stub.containers.runs) == 1
+
+    async def test_a_stopped_persisted_container_is_started_again(self, monkeypatch):
+        from pydantic_ai_backends.backends.docker import sandbox as sandbox_mod
+        from pydantic_ai_backends.remote.server import _default_builder, _Pending, _Service
+        from tests.test_docker_sandbox import _StubClient
+
+        stub = _StubClient()
+        monkeypatch.setattr(sandbox_mod, "docker_client", lambda: stub)
+        monkeypatch.setattr(sandbox_mod, "resolve_image", lambda *args: "img")
+        config = SandboxdConfig(token="t", runtimes={"python": "img"}, persist_containers=True)
+        service = _Service(
+            config,
+            _default_builder(config),
+            reattach_sandbox=_default_builder(config, reattach_only=True),
+        )
+        service._pending["kept"] = _Pending(runtime=SandboxRuntime(image="img"), tenant=None)
+        first = await service.sandbox("kept")
+        container = first._container
+        container.status = "exited"
+        first._alive_checked_at = None
+        stub.containers._existing["sandboxd-kept"] = container
+
+        healed = await service.sandbox("kept")
+
+        assert healed._container is container and container.started == 1
+        assert len(stub.containers.runs) == 1
+
     def test_sandbox_lookup_404s_when_bookkeeping_is_gone(self):
         """A session known to auth but with no pending image cannot be built."""
         from fastapi import HTTPException

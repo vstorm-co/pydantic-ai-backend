@@ -3,6 +3,8 @@
 **pydantic-ai-backend** gives [pydantic-ai](https://ai.pydantic.dev/) agents somewhere to
 work and the tools to work there. Two halves, joined by Pydantic AI's `ctx.workspace`:
 
+![pydantic-ai-backend by layer: the agent's tools call ctx.workspace, Pydantic AI's contract, and a workspace from this library or from Pydantic AI answers it](../assets/architecture.png)
+
 ## 1. Workspaces
 
 A workspace is the environment a run works in. A workspace capability supplies one, creates

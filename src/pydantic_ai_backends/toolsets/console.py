@@ -121,6 +121,15 @@ class _ConsoleToolsetTestAttrs(Protocol):
 
 _ToolFn = TypeVar("_ToolFn", bound=Callable[..., Awaitable[Any]])
 
+
+class _ReadView:
+    """What one console toolset has read in one workspace: the key `_tracking` uses.
+
+    Empty on purpose. A key that held the workspace, as the operations do, would
+    keep it alive through the weak mapping that is meant to let it go.
+    """
+
+
 _PASSES_THROUGH = (
     ModelRetry,
     ApprovalRequired,
@@ -267,7 +276,7 @@ def create_console_toolset(  # noqa: C901
             f"Valid names: {', '.join(sorted(OVERRIDE_KEYS))}."
         )
 
-    operations: weakref.WeakKeyDictionary[Workspace, FileOps] = weakref.WeakKeyDictionary()
+    views: weakref.WeakKeyDictionary[Workspace, _ReadView] = weakref.WeakKeyDictionary()
 
     def backend_for(ctx: RunContext[Any]) -> FileOps:
         """The run's workspace operations, with the ruleset applied to them.
@@ -275,21 +284,26 @@ def create_console_toolset(  # noqa: C901
         The one place every tool resolves what it operates on, which is why the
         guard goes here: applying per-path rules needs a path, and a path only
         exists per call.
-
-        One instance per workspace, not per call: the tools remember what the
-        agent has read on it, so an edit to a file changed since is refused, and
-        a fresh object each call would forget every read between two tool calls.
         """
-        ops = operations.get(ctx.workspace)
-        if ops is None:
-            ops = operations[ctx.workspace] = _guard.guarding(
-                WorkspaceOps(ctx.workspace),
-                permissions,
-                workspace=ctx.workspace,
-                ask_callback=ask_callback,
-                ask_fallback=ask_fallback,
-            )
-        return ops
+        return _guard.guarding(
+            WorkspaceOps(ctx.workspace),
+            permissions,
+            workspace=ctx.workspace,
+            ask_callback=ask_callback,
+            ask_fallback=ask_fallback,
+        )
+
+    def view_for(ctx: RunContext[Any]) -> _ReadView:
+        """What this toolset has read in the run's workspace, for as long as it lives.
+
+        Stable across tool calls, so an edit to a file changed since it was read
+        is refused, and holding nothing of the workspace, so a finished one can
+        be collected while a long-lived agent keeps this toolset.
+        """
+        view = views.get(ctx.workspace)
+        if view is None:
+            view = views[ctx.workspace] = _ReadView()
+        return view
 
     write_approval = _ruleset.requires_approval(permissions, "write", require_write_approval)
     execute_approval = _ruleset.requires_approval(permissions, "execute", require_execute_approval)
@@ -390,7 +404,7 @@ def create_console_toolset(  # noqa: C901
                 )
 
             raw = await backend.read_bytes(path)
-            _tracking.record_read(backend_for(ctx), path, raw)
+            _tracking.record_read(view_for(ctx), path, raw)
             return format_hashline_output(raw.decode("utf-8", errors="replace"), offset, limit)
 
     else:
@@ -412,7 +426,7 @@ def create_console_toolset(  # noqa: C901
             result = await backend.read(path, offset, limit)
             if result.startswith("Error"):
                 return _failures.steer(ctx, result)
-            await _tracking.record_path_read(backend, backend_for(ctx), path)
+            await _tracking.record_path_read(backend, view_for(ctx), path)
             return result
 
     @described("write_file", requires_approval=write_approval)
@@ -429,7 +443,7 @@ def create_console_toolset(  # noqa: C901
 
         # The agent knows this file's content now, so an immediate edit must not
         # be refused as stale.
-        _tracking.record_read(backend_for(ctx), path, content.encode("utf-8"))
+        _tracking.record_read(view_for(ctx), path, content.encode("utf-8"))
         return f"Wrote {len(content.splitlines())} lines to {result.path}"
 
     if edit_format == "hashline":
@@ -449,10 +463,9 @@ def create_console_toolset(  # noqa: C901
             """Edit a file by referencing lines with their content hashes."""
             from pydantic_ai_backends.hashline import apply_hashline_edit_with_summary
 
-            raw_backend = backend_for(ctx)
-            backend = raw_backend
+            backend = backend_for(ctx)
 
-            async with _tracking.edit_lock(raw_backend, path):
+            async with _tracking.edit_lock(view_for(ctx), path):
                 if not await backend.exists(path):
                     return _failures.steer(ctx, f"Error: File '{path}' not found")
 
@@ -486,16 +499,16 @@ def create_console_toolset(  # noqa: C901
             replace_all: bool = False,
         ) -> str:
             """Edit a file by performing exact string replacement."""
-            raw_backend = backend_for(ctx)
-            backend = raw_backend
+            backend = backend_for(ctx)
+            view = view_for(ctx)
 
             # Locked for the same reason `hashline_edit` is: every backend's
             # `edit` is a read, a replace and a write, so two edits to one path
             # in flight together lose one of them. The staleness check belongs
             # inside the lock too — checked outside, it is answered before the
             # other edit's write and passes on content that no longer exists.
-            async with _tracking.edit_lock(raw_backend, path):
-                stale = await _tracking.staleness_error(backend, raw_backend, path)
+            async with _tracking.edit_lock(view, path):
+                stale = await _tracking.staleness_error(backend, view, path)
                 if stale is not None:
                     return _failures.steer(ctx, stale)
 
@@ -505,7 +518,7 @@ def create_console_toolset(  # noqa: C901
 
                 # The agent's view is the post-edit content now, so a follow-up
                 # edit must not be flagged as stale.
-                await _tracking.record_path_read(backend, raw_backend, path)
+                await _tracking.record_path_read(backend, view, path)
                 return f"Edited {result.path}: replaced {result.occurrences} occurrence(s)"
 
     @described("glob")

@@ -134,7 +134,8 @@ class TestFilesystemRules:
         state.make_dir("/")
         state.make_dir("/new")
         state.make_dir("/new")
-        assert state.directories == {"/new"}
+        state.make_dir("/new/deeper")
+        assert state.directories == {"/new", "/new/deeper"}
         with pytest.raises(FileExistsError):
             state.make_dir("/file")
         with pytest.raises(NotADirectoryError):
@@ -151,6 +152,21 @@ class TestFilesystemRules:
         assert state.files == {} and state.directories == set()
         with pytest.raises(FileNotFoundError):
             state.remove("/tree")
+
+    def test_a_parent_make_dir_created_outlives_its_last_child(self) -> None:
+        state = StateBackend()
+        state.make_dir("/parent/child")
+        state.remove("/parent/child")
+        reloaded = _reload(state)
+        assert reloaded.is_dir("/parent") and reloaded.list_dir("/parent") == []
+
+    def test_a_parent_a_write_created_outlives_its_last_file(self) -> None:
+        state = StateBackend()
+        state.write_bytes("/src/pkg/mod.py", b"x")
+        state.remove("/src/pkg/mod.py")
+        reloaded = _reload(state)
+        assert reloaded.list_dir("/src") == [("pkg", True)]
+        assert reloaded.list_dir("/src/pkg") == []
 
     def test_removing_everything_from_the_root(self) -> None:
         state = StateBackend(directories=["/d"])

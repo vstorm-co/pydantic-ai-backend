@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic_ai.workspaces import ReadOnlyWorkspace
 
 from pydantic_ai_backends import ConsoleCapability, create_console_toolset
 from pydantic_ai_backends.permissions import (
@@ -348,6 +349,45 @@ class TestARuleBindsWhereALinkLeads:
         )
         assert "Permission denied" in str(out)
         assert "sk-live-secret" in (workdir / ".env").read_text()
+
+    async def test_grepping_a_read_only_workspace_skips_a_link(self, workdir: Path) -> None:
+        # A read-only workspace runs no `grep`; the search reads every file it
+        # lists, and a link reads as its target.
+        toolset = create_console_toolset(permissions=ruleset())
+        workspace = ReadOnlyWorkspace(local(workdir))
+        out = await call(toolset, "grep", ctx(workspace), pattern="sk-live", output_mode="content")
+        assert "sk-live-secret" not in str(out)
+
+    async def test_a_file_is_resolved_once_however_many_lines_match(self, workdir: Path) -> None:
+        (workdir / "notes.txt").write_text("todo one\ntodo two\n")
+        workspace = local(workdir)
+        resolved: list[str] = []
+        realpath = workspace.realpath
+
+        async def counting(path: str) -> str:
+            resolved.append(path)
+            return await realpath(path)
+
+        workspace.realpath = counting  # type: ignore[method-assign]
+        ops = guarding(WorkspaceOps(workspace), ruleset(), workspace=workspace)
+        found = await ops.grep_raw("todo", "notes.txt")
+
+        assert isinstance(found, list) and len(found) == 2
+        assert len(resolved) == 1
+
+    async def test_grepping_a_link_by_name_skips_it(self, workdir: Path) -> None:
+        # `grep -r` does not follow links it walks into, but it does read one it
+        # is handed.
+        toolset = create_console_toolset(permissions=ruleset())
+        out = await call(
+            toolset,
+            "grep",
+            ctx(local(workdir)),
+            pattern="sk-live",
+            path="settings.txt",
+            output_mode="content",
+        )
+        assert "sk-live-secret" not in str(out)
 
     async def test_writing_through_a_linked_directory_is_refused(self, workdir: Path) -> None:
         deny = [PermissionRule(pattern=f"{workdir}/private/**", action="deny")]

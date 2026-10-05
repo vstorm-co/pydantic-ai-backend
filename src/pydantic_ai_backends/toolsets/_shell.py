@@ -83,7 +83,9 @@ def grep_command(
     ran whatever followed it. `-e` for the same reason a pattern is quoted — a
     pattern starting with `-` is a pattern, not an option.
     """
-    options = ["-rn"]
+    # `-H` because GNU grep leaves the file name out when it is given a single
+    # file, and `parse_grep` then reads no match at all.
+    options = ["-rnH"]
     if ignore_hidden:
         # Directories only, and `.[!.]*` rather than `.*`. BSD grep matches both
         # excludes against the path as it walks it - `./notes.txt` - so `.*`

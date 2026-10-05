@@ -16,7 +16,7 @@ A chat-based analytics assistant that can:
 
 ## Architecture
 
-![Architecture diagram — backends, toolsets, and sandbox](../../assets/architecture.png)
+![pydantic-ai-backend by layer: the agent's tools call ctx.workspace, Pydantic AI's contract, and a workspace from this library or from Pydantic AI answers it](../../assets/architecture.png)
 
 ```
 Browser (HTML/JS + Chart.js)

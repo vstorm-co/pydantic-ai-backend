@@ -96,6 +96,18 @@ class TestGrep:
     def test_it_searches_the_cwd_when_given_no_path(self):
         assert _shell.grep_command("todo").endswith(" .")
 
+    def test_every_hit_names_its_file(self):
+        """GNU grep leaves the name out for a single file, which parses as no match."""
+        assert shlex.split(_shell.grep_command("todo", "a.py"))[1] == "-rnH"
+
+    async def test_a_single_file_is_searched(self, tmp_path) -> None:
+        from pydantic_ai_backends.toolsets._workspace import WorkspaceOps
+        from tests.support import local
+
+        (tmp_path / "a.py").write_text("todo: this\n")
+        matches = await WorkspaceOps(local(tmp_path)).grep_raw("todo", "a.py")
+        assert matches == [{"path": "a.py", "line_number": 1, "line": "todo: this"}]
+
     def test_matches_are_parsed(self):
         found = _shell.parse_grep(_ok("a.py:12:  todo this\nb.py:3:todo that\n"))
 

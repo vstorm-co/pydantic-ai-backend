@@ -13,7 +13,7 @@ from pydantic_ai_backends.types import FileData
 
 
 class StateBackend:
-    """A filesystem kept as a JSON document: files, and the directories made empty.
+    """A filesystem kept as a JSON document: files, and the directories created.
 
     What :class:`~pydantic_ai_backends.workspaces.StateWorkspace` serves as a
     Pydantic AI workspace, and what a host persists between runs — `files` and
@@ -25,10 +25,11 @@ class StateBackend:
     where a directory is expected `NotADirectoryError`.
 
     Paths are absolute POSIX paths; `.` and `..` are collapsed as text, since
-    there are no symlinks here for `..` to climb out of. A directory exists when
-    something is stored under it or when it was made explicitly, which is what
-    `directories` records — a document that had nowhere to keep an empty
-    directory could not report the one a tool just created.
+    there are no symlinks here for `..` to climb out of. `directories` records
+    every directory created, by `make_dir` or as the parent of a written file, so
+    one stays when the last thing in it is removed, as it would on disk. A
+    directory something is stored under exists too, which is how a document
+    written before `directories` existed keeps its tree.
 
     Text is stored as lines and anything that is not UTF-8 as base64, so the
     document is always JSON and `read_bytes` returns exactly what was written.
@@ -59,8 +60,9 @@ class StateBackend:
         Args:
             files: Files by path. A document a previous instance produced loads
                 unchanged, including one written before `encoding` existed.
-            directories: Directories made explicitly, by path. Only empty ones
-                need to be here; any directory holding a file exists anyway.
+            directories: Directories created, by path. Any directory holding a
+                file exists anyway, so a document from an earlier version, which
+                lists none, loads unchanged.
         """
         self._files: dict[str, FileData] = files if files is not None else {}
         self._directories: set[str] = {_normal(path) for path in directories or ()}
@@ -72,7 +74,7 @@ class StateBackend:
 
     @property
     def directories(self) -> set[str]:
-        """Directories made explicitly; persist it with `sorted()` beside `files`."""
+        """Directories created; persist it with `sorted()` beside `files`."""
         return self._directories
 
     def is_file(self, path: str) -> bool:
@@ -80,7 +82,7 @@ class StateBackend:
         return _normal(path) in self._files
 
     def is_dir(self, path: str) -> bool:
-        """Whether `path` is the root, a directory made explicitly, or holds anything."""
+        """Whether `path` is the root, a directory created, or holds anything."""
         path = _normal(path)
         if path == "/" or path in self._directories:
             return True
@@ -113,7 +115,7 @@ class StateBackend:
         raise FileNotFoundError(path)
 
     def write_bytes(self, path: str, data: bytes) -> None:
-        """Store a file, creating its parents.
+        """Store a file, creating and recording its parents.
 
         Raises:
             IsADirectoryError: `path` is a directory.
@@ -134,6 +136,7 @@ class StateBackend:
         if encoding is not None:
             entry["encoding"] = encoding
         self._files[path] = entry
+        self._record_parents(path)
 
     def size(self, path: str) -> int:
         """The length of the file at `path` in bytes, as `read_bytes` would return it."""
@@ -174,6 +177,7 @@ class StateBackend:
         self._check_parents(path)
         if path != "/":
             self._directories.add(path)
+            self._record_parents(path)
 
     def remove(self, path: str) -> None:
         """Remove a file, or a directory and everything under it.
@@ -190,6 +194,13 @@ class StateBackend:
         for stored in [p for p in self._files if p.startswith(prefix)]:
             del self._files[stored]
         self._directories = {d for d in self._directories if d != path and not d.startswith(prefix)}
+
+    def _record_parents(self, path: str) -> None:
+        """Record the directories above `path`, which a write or `make_dir` created."""
+        parent = posixpath.dirname(path)
+        while parent != "/":
+            self._directories.add(parent)
+            parent = posixpath.dirname(parent)
 
     def _check_parents(self, path: str) -> None:
         """Refuse a path that runs through a file, the way a filesystem does."""

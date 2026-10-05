@@ -205,9 +205,9 @@ class GuardedOps:
     them against its working directory, and a deny on either refuses. A rule
     names a file one way — `/workspace/private/**` — and a model reaches it
     another — `private/notes.txt` — and checking only the spelling the model
-    chose let it read exactly what the rule protects. Reads, writes and edits
-    are also checked where the workspace's `realpath` says the path leads, so a
-    symlink cannot stand in for a denied file.
+    chose let it read exactly what the rule protects. Reads, writes, edits and
+    grep matches are also checked where the workspace's `realpath` says the path
+    leads, so a symlink cannot stand in for a denied file.
 
     Args:
         ops: What to wrap.
@@ -319,7 +319,7 @@ class GuardedOps:
         if isinstance(found, str):
             return found
         base = await self._base()
-        return [
+        shown = [
             match
             for match in found
             if not any(
@@ -327,6 +327,19 @@ class GuardedOps:
                 for spelling in self._spellings(match["path"], base)
             )
         ]
+        if self._workspace is None:
+            return shown
+        # A match carries the line, so a link must not stand in for a denied file
+        # here either: GNU grep reads a link it is handed, and a workspace without
+        # commands is searched by reading every file it lists. One `realpath` per
+        # file that matched, not per match.
+        hidden: dict[str, bool] = {}
+        for match in shown:
+            path = match["path"]
+            if path not in hidden:
+                real = await self._workspace.realpath(self._spellings(path, base)[-1])
+                hidden[path] = self._guard.hides_from_grep(real)
+        return [match for match in shown if not hidden[match["path"]]]
 
     async def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
         base = await self._base()

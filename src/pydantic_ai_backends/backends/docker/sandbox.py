@@ -12,6 +12,7 @@ from pydantic_ai_backends._limits import MAX_RUN_OUTPUT_BYTES
 from pydantic_ai_backends.backends.docker._client import docker_client
 from pydantic_ai_backends.backends.docker._image import resolve_image
 from pydantic_ai_backends.backends.docker._stats import parse_usage
+from pydantic_ai_backends.protocol import SandboxUnavailableError
 from pydantic_ai_backends.types import RuntimeConfig, SandboxUsage
 
 if TYPE_CHECKING:
@@ -140,6 +141,7 @@ class DockerSandbox:
         pids_limit: int | None = DEFAULT_PIDS_LIMIT,
         tmpfs: dict[str, str] | None = None,
         oci_runtime: str | None = None,
+        reattach_only: bool = False,
     ):
         """Initialize the sandbox without starting its container.
 
@@ -212,10 +214,20 @@ class DockerSandbox:
                 `/etc/docker/daemon.json`; naming an unregistered one makes the
                 daemon refuse to start the container. See the installation docs
                 for the host side, including `crun` as a faster drop-in default.
+            reattach_only: Start the container named `container_name` and never
+                create one. For a caller whose files live only in that container:
+                a replacement would be empty, so a missing or dead container
+                raises `SandboxUnavailableError` from `start()` instead.
+
+        Raises:
+            ValueError: If `reattach_only` is set without `container_name`.
         """
+        if reattach_only and container_name is None:
+            raise ValueError("reattach_only needs a container_name to reattach to")
         self._id = session_id or sandbox_id or str(uuid.uuid4())
 
         self._container_name = container_name
+        self._reattach_only = reattach_only
         self._auto_remove = False if container_name else auto_remove
         self._container: Container | None = None
         self._idle_timeout = idle_timeout
@@ -297,6 +309,8 @@ class DockerSandbox:
         if existing is not None:
             self._container = existing
             return
+        if self._reattach_only:
+            raise SandboxUnavailableError(f"container {self._container_name} is gone")
 
         image = resolve_image(client, self._runtime, self._image)
         self._container = client.containers.run(image, **self._run_kwargs())

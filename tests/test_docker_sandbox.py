@@ -5,6 +5,8 @@ import types
 
 import pytest
 
+from pydantic_ai_backends.protocol import SandboxUnavailableError
+
 
 class _FakeContainer:
     """Minimal stand-in for a container `containers.run` returned."""
@@ -782,6 +784,43 @@ class TestReattach:
         sandbox = _sandbox()
 
         assert sandbox._reattach(stub_docker) is None
+
+
+class TestReattachOnly:
+    """A container holding the only copy of a session's files is never recreated."""
+
+    def test_a_missing_container_is_unavailable(self, stub_docker):
+        sandbox = _sandbox(container_name="gone", reattach_only=True)
+
+        with pytest.raises(SandboxUnavailableError, match="gone"):
+            sandbox.start()
+        assert stub_docker.containers.runs == []
+
+    def test_a_dead_container_is_unavailable(self, monkeypatch):
+        from pydantic_ai_backends.backends.docker import sandbox as sandbox_mod
+
+        client = _StubClient({"pinned": _StubContainer(status="dead")})
+        monkeypatch.setattr(sandbox_mod, "docker_client", lambda: client)
+
+        with pytest.raises(SandboxUnavailableError):
+            _sandbox(container_name="pinned", reattach_only=True).start()
+        assert client.containers.runs == []
+
+    def test_a_stopped_container_is_started(self, monkeypatch):
+        from pydantic_ai_backends.backends.docker import sandbox as sandbox_mod
+
+        existing = _StubContainer(status="exited")
+        client = _StubClient({"pinned": existing})
+        monkeypatch.setattr(sandbox_mod, "docker_client", lambda: client)
+
+        sandbox = _sandbox(container_name="pinned", reattach_only=True)
+        sandbox.start()
+
+        assert sandbox._container is existing and existing.started == 1
+
+    def test_it_needs_a_name(self):
+        with pytest.raises(ValueError, match="container_name"):
+            _sandbox(reattach_only=True)
 
 
 class TestOciRuntimePassthrough:

@@ -94,7 +94,7 @@ workspace = StateWorkspace()  # an in-process store
 ```
 
 A `StateBackend` is a filesystem kept as a JSON document — `files` and the `directories`
-made empty — so a host can keep a workspace in a database row. `StateWorkspace` serves such
+created — so a host can keep a workspace in a database row. `StateWorkspace` serves such
 documents by id from `store`, a mapping the application owns: fill it with documents loaded
 for the run, and save `files` and `sorted(directories)` afterwards. There is nothing to run a
 command in, so `execute` answers with the workspace's refusal, and `glob` and `grep` walk

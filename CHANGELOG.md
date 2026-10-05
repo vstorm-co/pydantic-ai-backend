@@ -45,7 +45,8 @@ what replaces each removed name.
   an argv, `env` and a `run_id`, keeps stdout and stderr apart and answers `410`
   for a vanished sandbox, including one that died between commands and whose
   files died with it (no `workspace_root`, no persisted container) rather than
-  replacing it with an empty one; `POST /sessions/{id}/runs/{run_id}/stop` stops a
+  replacing it with an empty one. A persisted container is started again but
+  never recreated, so one that was removed is a `410` too; `POST /sessions/{id}/runs/{run_id}/stop` stops a
   command and its process group. A session open request with `attach` attaches
   without ever creating, answering `404` when there is nothing left to attach to.
 - **`CommandRunner`, `CommandOutcome` and `SandboxUnavailableError`**: what a
@@ -58,8 +59,9 @@ what replaces each removed name.
   a path as the model wrote it and as the workspace resolves it against its
   working directory, so a deny on `/workspace/private/**` also refuses
   `private/notes.txt`, and command arguments resolve against the same directory.
-  Reads, writes and edits are also checked where the workspace's `realpath`
-  says the path leads, so a symlink cannot stand in for a denied file.
+  Reads, writes, edits and `grep` matches are also checked where the
+  workspace's `realpath` says the path leads, so a symlink cannot stand in for a
+  denied file.
   `LocalBackend` resolved paths and links against its root; this keeps that
   protection on `LocalWorkspace` and gives it to every other workspace.
 - **An unavailable workspace is reported, not read as empty.** With no
@@ -111,10 +113,11 @@ what replaces each removed name.
 ### Changed
 
 - **`StateBackend` is a document store, not a backend.** It keeps `files` and
-  the `directories` made empty — both JSON — and follows a filesystem's rules,
+  the `directories` created — both JSON — and follows a filesystem's rules,
   raising `FileNotFoundError`, `IsADirectoryError` and `NotADirectoryError`.
   `StateWorkspace` serves documents from a store the application owns. A
-  document written by an earlier version loads unchanged.
+  directory a write or `make_dir` created stays when the last thing in it is
+  removed. A document written by an earlier version loads unchanged.
 
 ### Fixed
 
@@ -125,8 +128,11 @@ what replaces each removed name.
 - **`glob` and `grep` reported "no matches" when the sandbox was unreachable.**
   Transport failures now surface as errors.
 - **File-read tracking was lost between tool calls** when the tools ran in a
-  workspace: the guarded operations are cached per workspace instead of rebuilt
-  on every call.
+  workspace. What a toolset has read is now kept per workspace, and released
+  with it, so a long-lived agent does not keep every workspace it worked in.
+- **`grep` on a single file found nothing with GNU grep**, which leaves the file
+  name out for one file; the line then did not parse as a match. `-H` makes it
+  print the name.
 
 ## [0.2.29] - 2026-08-22
 

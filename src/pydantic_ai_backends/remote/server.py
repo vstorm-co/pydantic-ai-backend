@@ -833,6 +833,8 @@ class _Pending:
 
     runtime: SandboxRuntime
     tenant: str | None
+    started: bool = False
+    """Whether a sandbox has been built for the session, so the next one heals it."""
 
 
 @dataclass(slots=True)
@@ -843,8 +845,12 @@ class _Outcome:
     detail: str = ""
 
 
-def _default_builder(config: SandboxdConfig) -> SandboxBuilder:
-    """Build the Docker-backed sandbox factory described by `config`."""
+def _default_builder(config: SandboxdConfig, *, reattach_only: bool = False) -> SandboxBuilder:
+    """Build the Docker-backed sandbox factory described by `config`.
+
+    With `reattach_only` the sandboxes it builds start the session's persisted
+    container and never create one, to heal a session whose files live only there.
+    """
 
     def build(session_id: str, runtime: SandboxRuntime) -> Any:
         from pydantic_ai_backends.backends.docker.sandbox import DockerSandbox
@@ -868,6 +874,7 @@ def _default_builder(config: SandboxdConfig) -> SandboxBuilder:
             container_name=_container_name(config, session_id),
             idle_timeout=config.idle_timeout,
             tmpfs={"/tmp": f"size={config.tmpfs_size}"} if config.tmpfs_size else None,
+            reattach_only=reattach_only,
             **config.limits_for(runtime),
         )
 
@@ -1142,9 +1149,15 @@ class _Service:
         build_sandbox: SandboxBuilder,
         prewarm: Callable[[], None] | None = None,
         docker_client: Callable[[], Any] | None = None,
+        reattach_sandbox: SandboxBuilder | None = None,
     ) -> None:
         self.config = config
         self._build_sandbox = build_sandbox
+        # Heals a session whose files live only in its persisted container: a
+        # name alone does not prove the container is still there, and a
+        # replacement built from scratch would be empty. `None` for an injected
+        # builder, which knows nothing of containers.
+        self._reattach_sandbox = reattach_sandbox
         self._prewarm = prewarm
         self._docker_client = docker_client
         self._sessions: dict[str, _Session] = {}
@@ -1202,7 +1215,16 @@ class _Service:
         self._inflight.pop(session_id, None)
 
     def _new_sandbox(self, session_id: str) -> Any:
-        return self._build_sandbox(session_id, self._pending[session_id].runtime)
+        pending = self._pending[session_id]
+        if (
+            pending.started
+            and self._reattach_sandbox is not None
+            and self.config.persist_containers
+            and self.config.workspace_root is None
+        ):
+            return self._reattach_sandbox(session_id, pending.runtime)
+        pending.started = True
+        return self._build_sandbox(session_id, pending.runtime)
 
     def startup(self) -> None:
         """Create the worker pool and begin reaping idle sessions and workspaces."""
@@ -1353,11 +1375,14 @@ class _Service:
         A dead sandbox is replaced only where its files outlive it: on a
         `workspace_root`, or in a persisted container started again. Otherwise
         the replacement would be empty, and a client continuing its work would
-        carry on in a fresh directory as if its files were there.
+        carry on in a fresh directory as if its files were there. That includes
+        a persisted container somebody removed: it is started again if it
+        exists and never recreated.
 
         Raises:
             HTTPException: 404 when the session has since disappeared, 410 when
-                its sandbox died and took its files with it, and 429 when it is
+                its sandbox died and took its files with it — including a
+                persisted container that was removed — and 429 when it is
                 hibernated and every resident session is busy. The last is
                 backpressure rather than an error: the work is still there, and
                 the caller is being asked to come back.
@@ -1379,6 +1404,11 @@ class _Service:
             sandbox = await self.manager.get_or_create(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"No such session: {session_id}") from exc
+        except SandboxUnavailableError as exc:
+            raise HTTPException(
+                status_code=410,
+                detail=f"The sandbox of session {session_id} is gone, and its files with it: {exc}",
+            ) from exc
         except SessionLimitExceeded as exc:
             raise HTTPException(
                 status_code=429,
@@ -2342,6 +2372,7 @@ def create_app(
         sandbox_builder or _default_builder(config),
         prewarm=None if sandbox_builder else _default_prewarm(config),
         docker_client=None if sandbox_builder else _default_docker_client,
+        reattach_sandbox=None if sandbox_builder else _default_builder(config, reattach_only=True),
     )
 
     @asynccontextmanager
