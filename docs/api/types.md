@@ -1,5 +1,24 @@
 # Types API
 
+## StateBackend
+
+::: pydantic_ai_backends.backends.state.StateBackend
+    options:
+      show_root_heading: true
+      members:
+        - __init__
+        - files
+        - directories
+        - is_file
+        - is_dir
+        - exists
+        - read_bytes
+        - write_bytes
+        - size
+        - list_dir
+        - make_dir
+        - remove
+
 ## FileInfo
 
 ::: pydantic_ai_backends.types.FileInfo
@@ -15,7 +34,7 @@ file_info: FileInfo = {
     "path": "/workspace/app.py",
     "is_dir": False,
     "size": 1234,
-    "modified_at": "2026-08-16T12:00:00+00:00",  # absent when the backend cannot report one
+    "modified_at": "2026-08-16T12:00:00+00:00",  # absent when the workspace cannot report one
 }
 ```
 
@@ -45,14 +64,7 @@ image_data: FileData = {
 ```
 
 A dictionary of these is always a JSON document, which is what lets a host
-persist a `StateBackend` and restore it:
-
-```python
-import json
-
-stored = json.dumps(backend.files, ensure_ascii=False)
-restored = StateBackend(files=json.loads(stored))
-```
+persist a [`StateBackend`](#statebackend) and restore it.
 
 ## WriteResult
 

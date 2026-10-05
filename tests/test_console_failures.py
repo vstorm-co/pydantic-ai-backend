@@ -2,35 +2,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic_ai import ModelRetry, RunContext
-from pydantic_ai.models.test import TestModel
-from pydantic_ai.usage import RunUsage
+from pydantic_ai.workspaces import Workspace
 
-from pydantic_ai_backends import LocalBackend, StateBackend, create_console_toolset
-from pydantic_ai_backends.backends._guard import PERMISSION_DENIED_PREFIX, PermissionGuard
+from pydantic_ai_backends import create_console_toolset
 from pydantic_ai_backends.permissions import create_ruleset
 from pydantic_ai_backends.toolsets._failures import is_refusal, steer
+from pydantic_ai_backends.toolsets._guard import PERMISSION_DENIED_PREFIX, PermissionGuard
+from tests.support import Raising, ctx, document, local
 
 
-@dataclass
-class _Deps:
-    backend: Any
-
-
-def _ctx(backend: Any, *, retry: int = 0, max_retries: int = 1) -> RunContext[Any]:
+def _ctx(workspace: Workspace, *, retry: int = 0, max_retries: int = 1) -> RunContext[Any]:
     """A context with retry budget left, unless the test says otherwise."""
-    return RunContext(
-        deps=_Deps(backend=backend),
-        model=TestModel(),
-        usage=RunUsage(),
-        retry=retry,
-        max_retries=max_retries,
-    )
+    return ctx(workspace, retry=retry, max_retries=max_retries)
 
 
 async def _call(toolset: Any, tool: str, ctx: RunContext[Any], **args: Any) -> Any:
@@ -41,8 +29,7 @@ class TestAMistakeSteersTheModel:
     """A call the model could have got right comes back as `ModelRetry`."""
 
     async def test_an_old_string_matching_twice_is_a_retry(self):
-        backend = StateBackend()
-        backend.write("/f.py", "x = 1\nx = 1\n")
+        backend = document({"/f.py": "x = 1\nx = 1\n"})
         toolset = create_console_toolset()
         ctx = _ctx(backend)
         await _call(toolset, "read_file", ctx, path="/f.py")
@@ -55,8 +42,7 @@ class TestAMistakeSteersTheModel:
         assert "found 2 times" in str(exc.value)
 
     async def test_an_old_string_that_is_absent_is_a_retry(self):
-        backend = StateBackend()
-        backend.write("/f.py", "x = 1\n")
+        backend = document({"/f.py": "x = 1\n"})
         toolset = create_console_toolset()
         ctx = _ctx(backend)
         await _call(toolset, "read_file", ctx, path="/f.py")
@@ -67,12 +53,11 @@ class TestAMistakeSteersTheModel:
             )
 
     async def test_editing_a_file_that_changed_since_the_read_is_a_retry(self):
-        backend = StateBackend()
-        backend.write("/f.py", "x = 1\n")
+        backend = document({"/f.py": "x = 1\n"})
         toolset = create_console_toolset()
         ctx = _ctx(backend)
         await _call(toolset, "read_file", ctx, path="/f.py")
-        backend.write("/f.py", "x = 99\n")
+        await backend.write_bytes("/f.py", b"x = 99\n")
 
         with pytest.raises(ModelRetry) as exc:
             await _call(
@@ -85,13 +70,12 @@ class TestAMistakeSteersTheModel:
         toolset = create_console_toolset()
 
         with pytest.raises(ModelRetry) as exc:
-            await _call(toolset, "read_file", _ctx(StateBackend()), path="/nope.txt")
+            await _call(toolset, "read_file", _ctx(document()), path="/nope.txt")
 
         assert "not found" in str(exc.value)
 
     async def test_a_hashline_edit_against_a_stale_hash_is_a_retry(self):
-        backend = StateBackend()
-        backend.write("/f.py", "x = 1\n")
+        backend = document({"/f.py": "x = 1\n"})
         toolset = create_console_toolset(edit_format="hashline")
 
         with pytest.raises(ModelRetry):
@@ -109,7 +93,7 @@ class TestAMistakeSteersTheModel:
         toolset = create_console_toolset(edit_format="hashline")
 
         with pytest.raises(ModelRetry) as exc:
-            await _call(toolset, "read_file", _ctx(StateBackend()), path="/nope.txt")
+            await _call(toolset, "read_file", _ctx(document()), path="/nope.txt")
 
         assert "glob" in str(exc.value)
 
@@ -118,8 +102,7 @@ class TestTheLastAttemptNeverKillsTheRun:
     """`ModelRetry` past a tool's budget ends the whole run, so the floor is a string."""
 
     async def test_the_message_is_returned_rather_than_raised(self):
-        backend = StateBackend()
-        backend.write("/f.py", "x = 1\nx = 1\n")
+        backend = document({"/f.py": "x = 1\nx = 1\n"})
         toolset = create_console_toolset()
         ctx = _ctx(backend, retry=1, max_retries=1)
         await _call(toolset, "read_file", ctx, path="/f.py")
@@ -135,9 +118,7 @@ class TestTheLastAttemptNeverKillsTheRun:
         """`max_retries=0` is every failure as a returned string, as ever."""
         toolset = create_console_toolset(max_retries=0)
 
-        out = await _call(
-            toolset, "read_file", _ctx(StateBackend(), max_retries=0), path="/nope.txt"
-        )
+        out = await _call(toolset, "read_file", _ctx(document(), max_retries=0), path="/nope.txt")
 
         assert isinstance(out, str)
         assert out.startswith("Error:")
@@ -148,7 +129,7 @@ class TestARefusalIsNotAMistake:
 
     async def test_a_denied_write_is_returned_not_retried(self, tmp_path: Path):
         """`.env` is denied by the default secrets rules."""
-        backend = LocalBackend(root_dir=tmp_path)
+        backend = local(tmp_path)
         toolset = create_console_toolset(permissions=create_ruleset(allow_write=True))
 
         out = await _call(toolset, "write_file", _ctx(backend), path=".env", content="TOKEN=x")
@@ -175,31 +156,24 @@ class TestAResultIsNotAMistake:
     async def test_a_command_that_exits_non_zero_is_a_result(self, tmp_path: Path):
         toolset = create_console_toolset()
 
-        out = await _call(
-            toolset, "execute", _ctx(LocalBackend(root_dir=tmp_path)), command="exit 3"
-        )
+        out = await _call(toolset, "execute", _ctx(local(tmp_path)), command="exit 3")
 
         assert "exit code 3" in out
 
     async def test_finding_nothing_is_an_answer(self, tmp_path: Path):
         toolset = create_console_toolset()
 
-        out = await _call(
-            toolset, "grep", _ctx(LocalBackend(root_dir=tmp_path)), pattern="nothing-here"
-        )
+        out = await _call(toolset, "grep", _ctx(local(tmp_path)), pattern="nothing-here")
 
         assert "No matches" in out
 
     async def test_a_transport_failure_is_reported_not_retried(self):
         """A dropped socket is not something different arguments would fix."""
 
-        class Hostile(StateBackend):
-            def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
-                raise OSError("connection reset by peer")
-
+        hostile = Workspace(Raising(RuntimeError("connection reset by peer")))
         toolset = create_console_toolset()
 
-        out = await _call(toolset, "read_file", _ctx(Hostile()), path="/f.txt")
+        out = await _call(toolset, "read_file", _ctx(hostile), path="/f.txt")
 
         assert "connection reset by peer" in out
 
@@ -207,9 +181,7 @@ class TestAResultIsNotAMistake:
 class TestSteer:
     def test_it_raises_while_a_retry_remains(self):
         with pytest.raises(ModelRetry):
-            steer(_ctx(StateBackend()), "Error: try something else")
+            steer(_ctx(document()), "Error: try something else")
 
     def test_it_returns_on_the_last_attempt(self):
-        assert steer(_ctx(StateBackend(), retry=1), "Error: out of budget") == (
-            "Error: out of budget"
-        )
+        assert steer(_ctx(document(), retry=1), "Error: out of budget") == ("Error: out of budget")

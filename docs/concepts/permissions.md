@@ -5,20 +5,16 @@ The permission system provides fine-grained access control for file operations a
 ## Quick Start
 
 ```python
-from pydantic_ai_backends import LocalBackend
+from pydantic_ai import Agent
+
+from pydantic_ai_backends import ConsoleCapability, DockerWorkspace
 from pydantic_ai_backends.permissions import DEFAULT_RULESET
 
-# Use the default safe ruleset
-backend = LocalBackend(
-    root_dir="/workspace",
-    permissions=DEFAULT_RULESET,
+agent = Agent(
+    "anthropic:claude-opus-5-5",
+    capabilities=[DockerWorkspace(), ConsoleCapability(permissions=DEFAULT_RULESET)],
 )
-
-# Reads are allowed (except secrets)
-content = backend.read("app.py")  # Works
-
-# Writes require approval (in sync context, denied by default)
-result = backend.write("output.txt", "data")  # Denied without callback
+# Reads are allowed (except secrets); writes and commands ask first.
 ```
 
 ## Permission Actions
@@ -43,9 +39,10 @@ Safe defaults for development environments:
 - **Glob/Grep/Ls**: Allowed
 
 ```python
+from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_backends.permissions import DEFAULT_RULESET
 
-backend = LocalBackend(root_dir="/workspace", permissions=DEFAULT_RULESET)
+capability = ConsoleCapability(permissions=DEFAULT_RULESET)
 ```
 
 ### PERMISSIVE_RULESET
@@ -58,9 +55,10 @@ For trusted environments where most operations should succeed:
 - **Glob/Grep/Ls**: Allowed
 
 ```python
+from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_backends.permissions import PERMISSIVE_RULESET
 
-backend = LocalBackend(root_dir="/workspace", permissions=PERMISSIVE_RULESET)
+capability = ConsoleCapability(permissions=PERMISSIVE_RULESET)
 ```
 
 ### READONLY_RULESET
@@ -72,9 +70,10 @@ For read-only access:
 - **Glob/Grep/Ls**: Allowed
 
 ```python
+from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_backends.permissions import READONLY_RULESET
 
-backend = LocalBackend(root_dir="/workspace", permissions=READONLY_RULESET)
+capability = ConsoleCapability(permissions=READONLY_RULESET)
 ```
 
 ### STRICT_RULESET
@@ -85,9 +84,10 @@ Everything requires explicit approval:
 - **Secrets**: Denied
 
 ```python
+from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_backends.permissions import STRICT_RULESET
 
-backend = LocalBackend(root_dir="/workspace", permissions=STRICT_RULESET)
+capability = ConsoleCapability(permissions=STRICT_RULESET)
 ```
 
 ## Custom Rulesets
@@ -221,11 +221,7 @@ async def cli_approval(
     return response.lower() == "y"
 
 
-backend = LocalBackend(
-    root_dir="/workspace",
-    permissions=DEFAULT_RULESET,
-    ask_callback=cli_approval,
-)
+capability = ConsoleCapability(permissions=DEFAULT_RULESET, ask_callback=cli_approval)
 ```
 
 ### Web App Approval
@@ -272,8 +268,7 @@ async def auto_approve_with_logging(operation: str, target: str, reason: str) ->
     return True
 
 
-backend = LocalBackend(
-    root_dir="/workspace",
+capability = ConsoleCapability(
     permissions=STRICT_RULESET,  # Everything asks
     ask_callback=auto_approve_with_logging,
 )
@@ -308,23 +303,15 @@ There are two fallback modes:
 from pydantic_ai_backends.permissions import AskFallback
 
 # Deny operations that need approval (safe for automated pipelines)
-backend = LocalBackend(
-    root_dir="/workspace",
-    permissions=DEFAULT_RULESET,
-    ask_fallback="deny",
-)
+capability = ConsoleCapability(permissions=DEFAULT_RULESET, ask_fallback="deny")
 
 # Raise PermissionError - useful for detecting missing callback setup
-backend = LocalBackend(
-    root_dir="/workspace",
-    permissions=DEFAULT_RULESET,
-    ask_fallback="error",
-)
+capability = ConsoleCapability(permissions=DEFAULT_RULESET, ask_fallback="error")
 ```
 
 ### Using PermissionChecker Directly
 
-For programmatic use outside of backends, use `PermissionChecker` with explicit callback and fallback:
+For programmatic use outside the console tools, use `PermissionChecker` with explicit callback and fallback:
 
 ```python
 from pydantic_ai_backends.permissions import PermissionChecker, DEFAULT_RULESET
@@ -354,37 +341,30 @@ if action == "ask":
     print("This operation would need approval")
 ```
 
-## Integration with LocalBackend
+## How the console tools apply the rules
 
-Permissions are checked after `allowed_directories`:
+The ruleset is enforced by the console tools themselves, on every call, in whatever
+workspace the run has:
 
-```python
-backend = LocalBackend(
-    root_dir="/workspace",
-    allowed_directories=["/workspace", "/data"],  # Checked first
-    permissions=DEFAULT_RULESET,  # Checked second
-)
-
-# Path must pass BOTH checks:
-# 1. Is the path within allowed_directories?
-# 2. Does the permission ruleset allow this operation?
-```
-
-### How each operation applies the rules
-
-- **`read` / `read_bytes`** — full "read" semantics: `deny` blocks, `ask`
-  follows the callback / `ask_fallback`. `read_bytes` returns `b""` on a
-  denied path (its documented "empty bytes on failure" contract).
-- **`write` / `edit`** — full "write" / "edit" semantics.
-- **`ls_info` / `glob_info`** — hide entries (and whole listings) with an
-  explicit `deny` rule for the "ls" / "glob" operation. Because a listing
-  can't prompt for approval, `ask` is treated as visible here — only `deny`
-  hides.
-- **`grep_raw`** — an explicit "grep" `deny` on the search path errors the
-  search; individual files denied for "grep" **or for "read"** never
-  contribute matches, so read-protected content can't leak through search
-  results.
+- **`read_file`** (including image and document reads) — full "read" semantics:
+  `deny` refuses, `ask` follows the callback / `ask_fallback`.
+- **`write_file` / `edit_file` / `hashline_edit`** — full "write" / "edit" semantics;
+  a refusal comes back as the tool's answer, never as a retry prompt.
+- **`ls` / `glob`** — hide entries with an explicit `deny` rule for the "ls" / "glob"
+  operation. A listing cannot prompt for approval, so `ask` is treated as visible —
+  only `deny` hides. A read deny alone does not hide a name.
+- **`grep`** — files denied for "grep" **or for "read"** never contribute matches, so
+  read-protected content cannot leak through search results.
 - **`execute`** — see below.
+
+A path is checked both as the model wrote it and as the workspace resolves it against its
+working directory, and a deny on either refuses. A rule on `/workspace/private/**` therefore
+covers `private/notes.txt` and `./private/../private/notes.txt` as well as the absolute
+spelling, and path-looking tokens in a command resolve against the same directory.
+
+Reads, writes and edits are also checked where the workspace's `realpath` says the path
+leads, so `settings.txt` linking to `.env` is refused by a deny on `**/.env`. That costs one
+more command on a shell workspace, and only when a ruleset is set.
 
 ### Shell execution and permission rules
 
@@ -392,14 +372,14 @@ Execute rules pattern-match the **command string**, not file paths — a rule
 like `PermissionRule(pattern="rm *", action="deny")` blocks `rm` commands,
 but a read deny on `**/restricted/**` says nothing about `cat restricted/x`.
 
-As defense-in-depth, `LocalBackend` also resolves path-looking tokens in the
-command and denies it when one hits a "read" or "write" deny rule, so the
-straightforward bypass (`cat restricted/secret.txt`) is caught.
+As defense-in-depth, the tools also resolve path-looking tokens in the command and
+refuse it when one hits a "read" or "write" deny rule, so the straightforward
+bypass (`cat restricted/secret.txt`) is caught.
 
 **This guard is a speed bump, not a security boundary.** A shell can always
 reach a file in ways command-string inspection cannot see (subshells,
 `python -c`, encodings, …). If you need enforced path isolation *and* shell
-access, run commands in a sandboxed backend such as `DockerSandbox` (mount
+access, run commands in an isolated workspace such as `DockerWorkspace` (mount
 only what the agent may touch), or set the execute default to `"deny"` or
 `"ask"`:
 
@@ -491,6 +471,6 @@ SYSTEM_PATTERNS = [
 
 ## Next Steps
 
-- [Backends](backends.md) - Backend configuration
+- [Workspaces](workspaces.md) - Where the tools work
 - [Console Toolset](console-toolset.md) - Tool configuration
 - [API Reference](../api/permissions.md) - Complete API

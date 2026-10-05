@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.workspaces import WorkspaceRef
 
 from pydantic_ai_backends import StateBackend, create_console_toolset
-
-
-@dataclass
-class _Deps:
-    backend: StateBackend
+from pydantic_ai_backends.workspaces import StateWorkspace
 
 
 def _wrong_twice_then_stop(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -44,15 +39,16 @@ async def test_a_second_ambiguous_edit_is_answered_not_fatal():
     exercises it: `max_retries` reaches the tool from the toolset, and the
     exception is raised by pydantic-ai rather than by anything here.
     """
-    backend = StateBackend()
-    backend.write("/f.py", "x = 1\nx = 1\n")
+    state = StateBackend()
+    state.write_bytes("/f.py", b"x = 1\nx = 1\n")
+    workspace = StateWorkspace(store={"doc": state})
     agent = Agent(
         FunctionModel(_wrong_twice_then_stop),
-        deps_type=_Deps,
+        capabilities=[workspace],
         toolsets=[create_console_toolset()],
     )
 
-    result = await agent.run("Change x to 2.", deps=_Deps(backend=backend))
+    result = await agent.run("Change x to 2.", workspace=WorkspaceRef(provider="state", id="doc"))
 
     assert result.output == "I could not make that edit uniquely."
 

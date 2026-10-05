@@ -1,64 +1,50 @@
 # CLI Agent Example
 
-Build an interactive CLI coding assistant using `LocalBackend` and the console toolset.
+Build an interactive CLI coding assistant: the console tools in Pydantic AI's `LocalWorkspace`.
 
 ## Quick Start
 
 ```bash
 cd examples/local_cli
 pip install pydantic-ai-backend[console]
-export OPENAI_API_KEY=your-key
+export ANTHROPIC_API_KEY=your-key
 python cli_agent.py
 
 # Include hidden files (e.g., .env) when searching
-python cli_agent.py --include-hidden
-```
-
-## Basic Implementation
+python cli_agent.py --include-hidd## Basic Implementation
 
 ```python
 import asyncio
-from dataclasses import dataclass
+
 from pydantic_ai import Agent
-from pydantic_ai_backends import LocalBackend, create_console_toolset, get_console_system_prompt
+from pydantic_ai.capabilities import LocalWorkspace
+from pydantic_ai.messages import ModelMessage
 
+from pydantic_ai_backends import create_console_toolset
 
-@dataclass
-class Deps:
-    backend: LocalBackend
-
-
-# Create backend and toolset
-backend = LocalBackend(root_dir=".", enable_execute=True)
-toolset = create_console_toolset()
-
-# Create agent
 agent = Agent(
-    "openai:gpt-4o-mini",
-    system_prompt=f"""You are a helpful coding assistant.
-{get_console_system_prompt()}
-""",
-    deps_type=Deps,
+    "anthropic:claude-opus-5-5",
+    instructions="You are a helpful coding assistant.",
+    capabilities=[LocalWorkspace(".")],
+    toolsets=[create_console_toolset(require_execute_approval=False)],
 )
-agent = agent.with_toolset(toolset)
 
 
-async def main():
-    deps = Deps(backend=backend)
-
-    print("CLI Agent ready! Type 'quit' to exit.")
-
-    while True:
-        user_input = input("You: ").strip()
-
-        if user_input.lower() in ("quit", "exit"):
-            break
-
-        result = await agent.run(user_input, deps=deps)
-        print(f"\nAgent: {result.output}\n")
+async def main() -> None:
+    history: list[ModelMessage] = []
+    while (user_input := input("You: ").strip()) not in ("quit", "exit"):
+        result = await agent.run(user_input, message_history=history)
+        history = result.all_messages()
+        print(f"Agent: {result.output}\n")
 
 
 asyncio.run(main())
+```
+
+`LocalWorkspace` runs commands as you and isolates nothing; for code you did not write, use
+an isolated workspace such as `DockerWorkspace`.
+
+))
 ```
 
 ## Features
@@ -124,7 +110,7 @@ python cli_agent.py --model anthropic:claude-3-haiku
 python cli_agent.py --no-execute
 
 # Restrict file access
-python cli_agent.py --restrict
+python cli_agent.py --read-only
 
 # Include hidden files in searches
 python cli_agent.py --include-hidden
@@ -139,5 +125,5 @@ See [`examples/local_cli/cli_agent.py`](https://github.com/vstorm-co/pydantic-ai
 
 - Command line argument parsing
 - Interactive and single-task modes
-- Security options (--restrict, --no-execute)
+- Safety options (--read-only, --no-execute)
 - Help command

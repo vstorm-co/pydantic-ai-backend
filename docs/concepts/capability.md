@@ -1,8 +1,10 @@
 # ConsoleCapability
 
-`ConsoleCapability` is the recommended way to add filesystem tools to a Pydantic AI agent.
-It's a [pydantic-ai capability](https://ai.pydantic.dev/capabilities/) that bundles console
-tools, instructions, and permission enforcement.
+`ConsoleCapability` is the recommended way to give a Pydantic AI agent file and shell
+tools. It is a [pydantic-ai capability](https://ai.pydantic.dev/capabilities/) that bundles
+the console tools, their instructions and permission enforcement, and the tools work in
+the run's [workspace](workspaces.md) — `ctx.workspace`, supplied by a workspace capability
+on the same agent.
 
 ## Why Capability over Toolset?
 
@@ -23,10 +25,17 @@ model never sees operations it is not allowed to perform.
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_backends import ConsoleCapability
+from pydantic_ai_backends import ConsoleCapability, DockerWorkspace
 
-agent = Agent("openai:gpt-4.1", capabilities=[ConsoleCapability()])
+agent = Agent(
+    "anthropic:claude-opus-5-5",
+    capabilities=[DockerWorkspace(image="python:3.12-slim"), ConsoleCapability()],
+)
 ```
+
+Any workspace works: Pydantic AI's own `LocalWorkspace(".")` for trusted local work, the
+ones in this library, or a harness sandbox such as `E2BSandbox`. A run without one gets
+an error from every tool rather than a crash.
 
 ## With Permissions
 
@@ -57,17 +66,17 @@ agent = Agent(
    `create_console_toolset`, so a denied operation's tools are never registered.
 
 2. **`prepare_tools`** — hides them again from each request's tool definitions.
-   With `READONLY_RULESET`, the model never sees `write_file`, `edit_file`,
-   `execute`, or any of the background shell tools.
+   With `READONLY_RULESET`, the model never sees `write_file`, `edit_file` or
+   `execute`.
 
 3. **`before_tool_execute`** — checks per-path permissions before each tool call.
    If a specific path is denied (e.g., `.env` files), the call is blocked even if
    the operation is generally allowed.
 
-A denied `execute` removes **every** shell tool — `execute`, `run_in_background`,
-`read_output`, `kill_shell` and `list_shells` — because they are one operation
-reached different ways. Leaving the background ones behind meant a read-only
-agent could still run arbitrary commands.
+A workspace that is read-only — `ReadOnlyWorkspace`, or `LocalWorkspace(read_only=True)` —
+hides `write_file`, `edit_file` and `execute` the same way, whatever the ruleset says: the
+workspace would refuse them anyway, and a model offered a tool that can only fail wastes
+turns finding that out.
 
 ### Answering an "ask"
 
@@ -93,13 +102,13 @@ these fields:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `backend` | `BackendProtocol \| AsyncBackendProtocol \| None` | `None` | Backend the tools operate on. When `None`, each call reads `ctx.deps.backend`. See [Where the Backend Comes From](#where-the-backend-comes-from). |
 | `include_execute` | `bool` | `True` | Whether to register the `execute` shell tool. |
-| `include_background` | `bool` | `True` | Whether to register the background-shell tools (`run_in_background`, `read_output`, `kill_shell`, `list_shells`). |
 | `edit_format` | `"str_replace" \| "hashline"` | `"str_replace"` | File-editing format. `"hashline"` registers `hashline_edit` instead of `edit_file` and changes the injected instructions. See [Hashline Edit Format](console-toolset.md#hashline-edit-format). |
 | `permissions` | `PermissionRuleset \| None` | `None` | Ruleset controlling which operations are allowed, asked, or denied. When `None`, all tools are exposed and no permission checks run. |
 | `ask_callback` | `AskCallback \| None` | `None` | Async `(operation, target, reason) -> bool` answering an operation that resolves to `"ask"`. |
 | `ask_fallback` | `"deny" \| "error"` | `"error"` | What an unanswerable `"ask"` does when there is no callback. |
+| `image_support` / `document_support` | `bool` | `False` | Return images and PDFs from `read_file` as `BinaryContent` a multimodal model can see. |
+| `descriptions`, `profile` | | | Tool text overrides and how much guidance it carries. See [What the Model Reads](console-toolset.md#what-the-model-reads). |
 
 ```python
 from pydantic_ai_backends import ConsoleCapability
@@ -127,61 +136,17 @@ It also injects tool-usage instructions through `get_instructions()`, calling
 with the configured `edit_format` — so you do not need to add the console system
 prompt to your agent manually.
 
-## Where the Backend Comes From
+## Where the Tools Work
 
-Two ways, and the choice is about who owns the deps type.
+In `ctx.workspace`, always. The workspace is chosen per run — from `workspace=`, from the
+ref on the message history, or from the agent's workspace capabilities — so one agent
+serves a different container per conversation without being rebuilt. See
+[Choosing a run's workspace](https://pydantic.dev/docs/ai/core-concepts/workspace/#choosing-a-runs-workspace).
 
-### From the agent's deps (default)
-
-With no `backend`, the console tools read `ctx.deps.backend` at runtime, so your
-dependencies object must satisfy the
-[`ConsoleDeps`](console-toolset.md#consoledeps-protocol) protocol (any class
-exposing a `backend` attribute). One agent then serves a different backend per
-run — a different
-[`DockerSandbox`][pydantic_ai_backends.backends.docker.sandbox.DockerSandbox]
-per user, say — without rebuilding the agent.
-
-```python
-from dataclasses import dataclass
-from pydantic_ai import Agent
-from pydantic_ai_backends import ConsoleCapability, LocalBackend
-
-
-@dataclass
-class Deps:
-    backend: LocalBackend
-
-
-agent = Agent("openai:gpt-4.1", deps_type=Deps, capabilities=[ConsoleCapability()])
-
-result = agent.run_sync(
-    "List the Python files",
-    deps=Deps(backend=LocalBackend(root_dir="/workspace")),
-)
-```
-
-### A capability-owned backend
-
-Pass `backend=` and the capability carries it, leaving your deps type alone. Use
-this when the deps type is not yours to change — a platform assembling agents
-from configuration will have its own — or when this agent is meant to hold one
-particular sandbox.
-
-```python
-from pydantic_ai import Agent
-from pydantic_ai_backends import ConsoleCapability
-from pydantic_ai_backends.remote import RemoteSandbox
-
-sandbox = RemoteSandbox("http://sandboxd:8080", token=token, session_id=session_id)
-sandbox.start()
-
-# Deps can be anything, including None — the tools never look at them.
-agent = Agent("openai:gpt-4.1", capabilities=[ConsoleCapability(backend=sandbox)])
-```
-
-The same applies to
-[`create_console_toolset(backend=...)`][pydantic_ai_backends.create_console_toolset]
-if you are using the toolset directly.
+**On a read-only workspace** (`ReadOnlyWorkspace`, `LocalWorkspace(..., read_only=True)`)
+`write_file`, the edit tool and `execute` are not offered to the model at all. **On a
+workspace without commands** (`StateWorkspace`) `glob` and `grep` walk the files instead of
+running `find` and `grep`, and `execute` answers with the workspace's refusal.
 
 ## Relationship to Other Features
 
@@ -191,8 +156,5 @@ if you are using the toolset directly.
 - **Edit format** — `edit_format` is forwarded to the underlying toolset and
   controls which edit tool is registered and which instructions are injected.
   See [Hashline Edit Format](console-toolset.md#hashline-edit-format).
-- **Image support** — `image_support` is a `create_console_toolset` option, not
-  a `ConsoleCapability` field. If you need multimodal image reading, build the
-  toolset directly with
-  [`create_console_toolset(image_support=True)`][pydantic_ai_backends.create_console_toolset]
-  instead of using the capability.
+- **Workspaces** — the environment comes from a workspace capability; see
+  [Workspaces](workspaces.md).

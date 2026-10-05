@@ -1,6 +1,9 @@
 # Console Toolset
 
-The console toolset provides ready-to-use pydantic-ai tools for file operations and shell execution.
+The console toolset provides ready-to-use pydantic-ai tools for file operations and shell
+execution, working in the run's [workspace](workspaces.md). `ConsoleCapability` builds it
+for you; use the toolset directly when you want it without the capability's permission
+hooks.
 
 !!! info "Requires pydantic-ai"
     ```bash
@@ -10,27 +13,21 @@ The console toolset provides ready-to-use pydantic-ai tools for file operations 
 ## Quick Start
 
 ```python
-from dataclasses import dataclass
 from pydantic_ai import Agent
-from pydantic_ai_backends import LocalBackend, create_console_toolset
+from pydantic_ai.capabilities import LocalWorkspace
 
+from pydantic_ai_backends import create_console_toolset
 
-@dataclass
-class Deps:
-    backend: LocalBackend
-
-
-# Create toolset
-toolset = create_console_toolset()
-
-# Create agent with tools
-agent = Agent("openai:gpt-4o", deps_type=Deps)
-agent = agent.with_toolset(toolset)
-
-# Run
-backend = LocalBackend(root_dir="/workspace")
-result = agent.run_sync("List all Python files", deps=Deps(backend=backend))
+agent = Agent(
+    "anthropic:claude-opus-5-5",
+    capabilities=[LocalWorkspace("/workspace")],
+    toolsets=[create_console_toolset()],
+)
+result = agent.run_sync("List all Python files")
 ```
+
+`LocalWorkspace` runs commands on your machine, as you; for model-written code use an
+isolated workspace such as [`DockerWorkspace`](docker.md).
 
 ## Available Tools
 
@@ -148,8 +145,7 @@ toolset = create_console_toolset(
 ```
 
 Valid keys are the tool names: `ls`, `read_file`, `write_file`, `edit_file`,
-`hashline_edit`, `glob`, `grep`, `execute`, `run_in_background`, `read_output`,
-`kill_shell`, `list_shells`. An unknown key raises `UserError` rather than being
+`hashline_edit`, `glob`, `grep`, `execute`. An unknown key raises `UserError` rather than being
 ignored — a misspelled override that silently reaches nothing is one nobody
 discovers.
 
@@ -168,7 +164,7 @@ prompt and the model gets another attempt at the call:
 
 **Everything else is returned as text**, because it is the answer rather than a
 malformed call: a non-zero exit from `execute`, a `grep` that found nothing, a
-backend with no shell, a dropped connection — and a **permission refusal**, which
+workspace with no shell, a dropped connection — and a **permission refusal**, which
 is deliberate. A retry prompt on a refusal invites the model to look for a way
 around the rule.
 
@@ -208,20 +204,13 @@ toolset = create_console_toolset(permissions=custom)
 
 When `permissions` is provided, it overrides the legacy `require_write_approval` and `require_execute_approval` flags.
 
-An operation whose default is `"deny"` has its tools removed outright. For
-`execute` that means **all five** shell tools — `execute`, `run_in_background`,
-`read_output`, `kill_shell` and `list_shells` — since they are the same operation
-reached different ways.
+An operation whose default is `"deny"` has its tools removed outright.
 
-Note what this does and does not do. The ruleset decides which tools *exist* and
-which need approval; it does not filter individual paths. Per-path enforcement is
-the backend's job, so pass the ruleset to the backend as well when you want it:
-
-```python
-ruleset = READONLY_RULESET
-toolset = create_console_toolset(permissions=ruleset)
-backend = LocalBackend(root_dir="/workspace", permissions=ruleset)
-```
+The ruleset's per-path `rules` apply to every call as well: a read or edit of a
+denied path is refused, `grep` drops matches from files the agent may not read, and
+an `execute` naming a denied path is refused. That last one is defence in depth, not a
+boundary — a shell reaches files in ways string inspection cannot see, and isolation is
+the workspace's job.
 
 See [Permissions](permissions.md) for full documentation.
 
@@ -266,30 +255,19 @@ Images exceeding the limit return an error message like: `Error: Image 'photo.pn
 ### Example: Visual Analysis Agent
 
 ```python
-from dataclasses import dataclass
 from pydantic_ai import Agent
-from pydantic_ai_backends import LocalBackend, create_console_toolset
+from pydantic_ai.capabilities import LocalWorkspace
 
-
-@dataclass
-class Deps:
-    backend: LocalBackend
-
-
-# Enable image support for multimodal model
-toolset = create_console_toolset(image_support=True)
+from pydantic_ai_backends import create_console_toolset
 
 agent = Agent(
-    "openai:gpt-4o",  # Multimodal model
+    "anthropic:claude-opus-5-5",  # a multimodal model
     system_prompt="You can read and analyze images using read_file.",
-    deps_type=Deps,
+    capabilities=[LocalWorkspace("/workspace")],
+    toolsets=[create_console_toolset(image_support=True)],
 )
-agent = agent.with_toolset(toolset)
 
-result = agent.run_sync(
-    "Read screenshot.png and describe what you see",
-    deps=Deps(backend=LocalBackend(root_dir="/workspace")),
-)
+result = agent.run_sync("Read screenshot.png and describe what you see")
 ```
 
 !!! tip "When to enable image support"
@@ -336,31 +314,6 @@ re-read before editing.
 The matching system prompt for this mode is returned by
 [`get_console_system_prompt(edit_format="hashline")`][pydantic_ai_backends.get_console_system_prompt].
 
-## ConsoleDeps Protocol
-
-Your dependencies class must have a `backend` property:
-
-```python
-from pydantic_ai_backends import BackendProtocol
-
-
-class ConsoleDeps(Protocol):
-    @property
-    def backend(self) -> BackendProtocol: ...
-```
-
-Any class with a `backend` attribute works:
-
-```python
-from dataclasses import dataclass
-
-
-@dataclass
-class MyDeps:
-    backend: LocalBackend
-    user_id: str  # Additional fields are fine
-```
-
 ## System Prompt
 
 Include the console system prompt for better tool usage:
@@ -374,9 +327,10 @@ system_prompt = f"""You are a helpful coding assistant.
 """
 
 agent = Agent(
-    "openai:gpt-4o",
+    "anthropic:claude-opus-5-5",
     system_prompt=system_prompt,
-    deps_type=Deps,
+    capabilities=[LocalWorkspace(".")],
+    toolsets=[create_console_toolset()],
 )
 ```
 
@@ -448,26 +402,40 @@ async def execute(ctx, command: str, timeout: int | None = 120) -> str:
     """Execute a shell command."""
 ```
 
-## With Different Backends
+## In Different Workspaces
 
-The toolset works with any backend:
+The toolset works in whatever workspace the run has:
 
-=== "LocalBackend"
+=== "This machine"
 
     ```python
-    backend = LocalBackend(root_dir="/workspace")
+    from pydantic_ai.capabilities import LocalWorkspace
+
+    workspace = LocalWorkspace("/workspace")
     ```
 
-=== "StateBackend"
+=== "A JSON document"
 
     ```python
-    backend = StateBackend()
+    from pydantic_ai_backends import StateWorkspace
+
+    workspace = StateWorkspace()  # files only: no `execute`
     ```
 
-=== "DockerSandbox"
+=== "A container"
 
     ```python
-    backend = DockerSandbox(image="python:3.12-slim")
+    from pydantic_ai_backends import DockerWorkspace
+
+    workspace = DockerWorkspace(image="python:3.12-slim")
+    ```
+
+=== "A sandboxd session"
+
+    ```python
+    from pydantic_ai_backends import SandboxdWorkspace
+
+    workspace = SandboxdWorkspace(service_url="http://sandboxd:8080", token="...")
     ```
 
 ## Next Steps

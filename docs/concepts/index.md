@@ -1,124 +1,77 @@
 # Core Concepts
 
-**pydantic-ai-backend** adds file operations and code execution to your [pydantic-ai](https://ai.pydantic.dev/) agents. Three main components work together:
+**pydantic-ai-backend** gives [pydantic-ai](https://ai.pydantic.dev/) agents somewhere to
+work and the tools to work there. Two halves, joined by Pydantic AI's `ctx.workspace`:
 
-## 1. Console Toolset
+![pydantic-ai-backend by layer: the agent's tools call ctx.workspace, Pydantic AI's contract, and a workspace from this library or from Pydantic AI answers it](../assets/architecture.png)
 
-The console toolset gives your pydantic-ai agent file and execution capabilities:
+## 1. Workspaces
+
+A workspace is the environment a run works in. A workspace capability supplies one, creates
+it on first use, and records it as the run's ref so the next run comes back to it:
 
 ```python
-from dataclasses import dataclass
-from pydantic_ai import Agent
-from pydantic_ai_backends import LocalBackend, create_console_toolset
-
-
-@dataclass
-class Deps:
-    backend: LocalBackend
-
-
-# Create toolset with file + execution tools
-toolset = create_console_toolset()
-
-# Add to your pydantic-ai agent
-agent = Agent("openai:gpt-4o", deps_type=Deps)
-agent = agent.with_toolset(toolset)
-
-# Run - agent can now read, write, search, and execute!
-result = agent.run_sync(
-    "Create a Python script that calculates pi and run it",
-    deps=Deps(backend=LocalBackend(root_dir=".")),
+from pydantic_ai_backends import (
+    DaytonaWorkspace,
+    DockerWorkspace,
+    KubernetesWorkspace,
+    SandboxdWorkspace,
+    StateWorkspace,
 )
+
+DockerWorkspace(runtime="python-datascience")  # a container on this host
+SandboxdWorkspace(service_url="http://sandboxd:8080", token="...")  # behind a service
+KubernetesWorkspace(image="python:3.12-slim", namespace="agents")  # a pod
+DaytonaWorkspace()  # a Daytona sandbox
+StateWorkspace()  # a JSON document, files only
 ```
 
-Tools provided: `ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `execute`
+[Learn more about Workspaces →](workspaces.md)
 
-[Learn more about Console Toolset →](console-toolset.md)
+## 2. Console tools
 
-## 2. Backends
-
-Backends provide file storage. The same toolset works with any backend:
-
-```python
-from pydantic_ai_backends import LocalBackend, StateBackend, DockerSandbox
-
-# Local filesystem (for CLI tools)
-backend = LocalBackend(root_dir="/workspace")
-
-# In-memory (for testing)
-backend = StateBackend()
-
-# Docker (for safe execution)
-backend = DockerSandbox(runtime="python-datascience")
-```
-
-[Learn more about Backends →](backends.md)
-
-## 3. Docker Sandbox
-
-For production and multi-user scenarios, `DockerSandbox` provides isolated execution:
+`ConsoleCapability` gives the model `ls`, `read_file`, `write_file`, `edit_file`, `glob`,
+`grep` and `execute`, working in whichever workspace the run has:
 
 ```python
-from dataclasses import dataclass
 from pydantic_ai import Agent
-from pydantic_ai_backends import DockerSandbox, create_console_toolset
 
+from pydantic_ai_backends import ConsoleCapability, DockerWorkspace
 
-@dataclass
-class Deps:
-    backend: DockerSandbox
-
-
-# Safe sandbox with data science packages
-sandbox = DockerSandbox(runtime="python-datascience")
-
-try:
-    toolset = create_console_toolset()
-    agent = Agent("openai:gpt-4o", deps_type=Deps)
-    agent = agent.with_toolset(toolset)
-
-    # Agent can run arbitrary code safely in Docker
-    result = agent.run_sync(
-        "Analyze the iris dataset with pandas and show statistics",
-        deps=Deps(backend=sandbox),
-    )
-    print(result.output)
-finally:
-    sandbox.stop()
+agent = Agent(
+    "anthropic:claude-opus-5-5",
+    capabilities=[DockerWorkspace(runtime="python-datascience"), ConsoleCapability()],
+)
+result = agent.run_sync("Create a Python script that calculates pi and run it")
 ```
 
-[Learn more about Docker →](docker.md)
+[Learn more about the Capability →](capability.md) ·
+[What the tools say and do →](console-toolset.md)
 
-## 4. Permissions
+## 3. Permissions
 
-Fine-grained access control for file operations and shell commands:
+Fine-grained access control for file operations and shell commands, enforced by the tools
+on every call:
 
 ```python
-from pydantic_ai_backends import LocalBackend
+from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_backends.permissions import DEFAULT_RULESET, READONLY_RULESET
 
-# Safe defaults - allow reads, ask for writes/executes
-backend = LocalBackend(root_dir="/workspace", permissions=DEFAULT_RULESET)
-
-# Read-only mode - deny all writes and executes
-backend = LocalBackend(root_dir="/workspace", permissions=READONLY_RULESET)
+ConsoleCapability(permissions=DEFAULT_RULESET)  # reads allowed, writes and commands ask
+ConsoleCapability(permissions=READONLY_RULESET)  # nothing may change or run
 ```
 
 Available presets: `DEFAULT_RULESET`, `PERMISSIVE_RULESET`, `READONLY_RULESET`, `STRICT_RULESET`
 
 [Learn more about Permissions →](permissions.md)
 
-## Architecture
+## Choosing a Workspace
 
-![Architecture](../assets/architecture.png)
-
-## Choosing a Backend
-
-| Use Case | Backend | Example |
-|----------|---------|---------|
-| CLI tools, local dev | `LocalBackend` | Personal coding assistant |
-| Unit tests | `StateBackend` | Testing agent behavior |
-| Safe code execution | `DockerSandbox` | Code interpreter |
-| Multi-user web apps | `SessionManager` | SaaS product |
-| App itself runs in a container | [`RemoteSandbox`](remote.md) | Self-hosted SaaS, no docker-in-docker |
-| Mixed (project + temp) | `CompositeBackend` | Complex workflows |
+| Use Case | Workspace |
+|----------|-----------|
+| CLI tools, your own trusted work | Pydantic AI's `LocalWorkspace` |
+| Tests, or files kept in your database | `StateWorkspace` |
+| Model-written code on one host | `DockerWorkspace` |
+| An app that runs in a container, many users | [`SandboxdWorkspace`](remote.md) |
+| Sandboxes scheduled by a cluster | [`KubernetesWorkspace`](kubernetes.md) |
+| Hosted sandboxes | [`DaytonaWorkspace`](daytona.md), or the harness's E2B, Modal, Sprites |

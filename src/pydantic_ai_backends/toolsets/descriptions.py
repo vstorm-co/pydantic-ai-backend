@@ -304,7 +304,7 @@ GREP_TEXT = ToolText(
     summary="Search the contents of files for a regular expression.",
     usage=(
         "Use this rather than a shell `grep` or `rg` through `execute`: it works on "
-        "every backend, including those with no shell. Full regex syntax is "
+        "every workspace, including one with no shell. Full regex syntax is "
         'supported, e.g. `"log.*Error"`. Narrow the search with `path` for a subtree '
         "and `glob_pattern` for a file type, and choose how much comes back with "
         "`output_mode`."
@@ -334,7 +334,7 @@ EXECUTE_TEXT = ToolText(
         "suite, a package manager. For anything the other tools already do, use them: "
         "`read_file` rather than `cat`, `write_file` rather than a redirect, "
         "`edit_file` rather than `sed`, `glob` rather than `find`, `grep` rather than "
-        "shell `grep`. They work on every backend and report what happened in a form "
+        "shell `grep`. They work on every workspace and report what happened in a form "
         "you can act on.\n\n"
         "Quote paths containing spaces. Chain steps that depend on each other into "
         "one command with `&&`, and run independent ones as separate calls in the "
@@ -368,49 +368,6 @@ EXECUTE_TEXT = ToolText(
     ),
 )
 
-RUN_IN_BACKGROUND_TEXT = ToolText(
-    summary="Start a long-running command and return immediately.",
-    usage=(
-        "For a process that does not exit on its own — a dev server, a watcher, a log "
-        "tail. `execute` blocks until its command finishes and kills it at the "
-        "timeout, so a server started that way is reaped before it is useful. Follow "
-        "this one with `read_output`, probe it from a separate `execute` call, and "
-        "stop it with `kill_shell` when you are done."
-    ),
-    args={"command": "Shell command to start detached, e.g. a dev server."},
-    returns="The shell's id and process id, and the calls that follow it.",
-)
-
-READ_OUTPUT_TEXT = ToolText(
-    summary="Read what a background shell has printed since your last read.",
-    usage=("Call it again to follow a slow startup: each call returns only what is new."),
-    args={"shell_id": "The id `run_in_background` returned."},
-    returns=(
-        "The shell id, whether it is still running or the code it exited with, and "
-        "its new stdout and stderr — `(no new output)` when there was none."
-    ),
-)
-
-KILL_SHELL_TEXT = ToolText(
-    summary="Stop a background shell.",
-    usage=(
-        "Stop one as soon as you no longer need it: a shell left running holds its "
-        "port and its process for whatever comes next here."
-    ),
-    args={"shell_id": "The id `run_in_background` returned."},
-    returns="Confirmation, or a note that the shell had already finished.",
-)
-
-LIST_SHELLS_TEXT = ToolText(
-    summary="List the background shells started in this session.",
-    usage="Use it to find a shell whose id you no longer have.",
-    returns=(
-        "One line per shell: its id, whether it is running or the code it exited "
-        "with, and the command it was started from."
-    ),
-)
-
-
 TOOL_TEXT: Mapping[str, ToolText] = {
     "ls": LS_TEXT,
     "read_file": READ_FILE_TEXT,
@@ -421,10 +378,6 @@ TOOL_TEXT: Mapping[str, ToolText] = {
     "glob": GLOB_TEXT,
     "grep": GREP_TEXT,
     "execute": EXECUTE_TEXT,
-    "run_in_background": RUN_IN_BACKGROUND_TEXT,
-    "read_output": READ_OUTPUT_TEXT,
-    "kill_shell": KILL_SHELL_TEXT,
-    "list_shells": LIST_SHELLS_TEXT,
 }
 """Every text the console toolset can register, keyed by its id.
 
@@ -452,7 +405,3 @@ HASHLINE_EDIT_DESCRIPTION = HASHLINE_EDIT_TEXT.render()
 GLOB_DESCRIPTION = GLOB_TEXT.render()
 GREP_DESCRIPTION = GREP_TEXT.render()
 EXECUTE_DESCRIPTION = EXECUTE_TEXT.render()
-RUN_IN_BACKGROUND_DESCRIPTION = RUN_IN_BACKGROUND_TEXT.render()
-READ_OUTPUT_DESCRIPTION = READ_OUTPUT_TEXT.render()
-KILL_SHELL_DESCRIPTION = KILL_SHELL_TEXT.render()
-LIST_SHELLS_DESCRIPTION = LIST_SHELLS_TEXT.render()

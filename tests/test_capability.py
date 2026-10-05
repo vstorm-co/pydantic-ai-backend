@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RunUsage
+from pydantic_ai.workspaces import ReadOnlyWorkspace
 
-from pydantic_ai_backends import LocalBackend, StateBackend
 from pydantic_ai_backends.capability import TOOL_OPERATIONS, ConsoleCapability
 from pydantic_ai_backends.permissions.checker import PermissionDeniedError
 from pydantic_ai_backends.permissions.presets import (
@@ -20,6 +18,7 @@ from pydantic_ai_backends.permissions.presets import (
     READONLY_RULESET,
 )
 from pydantic_ai_backends.toolsets.console import EXECUTE_TOOLS, create_console_toolset
+from tests.support import call, ctx, document
 
 
 def _make_ctx():
@@ -300,23 +299,22 @@ class TestHashlineEditDenial:
         assert "read_file" in tool_names
 
 
-class TestCapabilityOwnedBackend:
-    """A capability can carry its own backend, for hosts owning their deps type."""
+class TestTheToolsWorkInTheRunsWorkspace:
+    async def test_a_tool_reads_the_workspace(self):
+        capability = ConsoleCapability()
+        context = ctx(document({"/owned.txt": "held by the workspace"}))
 
-    def _ctx(self, deps: object) -> RunContext[object]:
-        return RunContext(deps=deps, model=TestModel(), usage=RunUsage())
+        result = await call(capability.get_toolset(), "read_file", context, path="owned.txt")
 
-    async def test_tools_use_the_capability_backend_not_the_deps(self, tmp_path: Path):
-        backend = LocalBackend(root_dir=str(tmp_path))
-        backend.write("owned.txt", "held by the capability")
-        capability = ConsoleCapability(backend=backend)
-        toolset = capability.get_toolset()
-        assert toolset is not None
+        assert "held by the workspace" in result
 
-        # Deps with no `backend` attribute at all: the host owns this type.
-        result = await toolset.tools["read_file"].function(self._ctx(object()), "owned.txt")
+    async def test_a_read_only_workspace_is_not_offered_the_mutating_tools(self):
+        capability = ConsoleCapability()
+        defs = [ToolDefinition(name=name) for name in sorted(capability.get_toolset().tools)]
 
-        assert "held by the capability" in result
+        kept = await capability.prepare_tools(ctx(ReadOnlyWorkspace(document())), defs)
+
+        assert {d.name for d in kept} == {"ls", "read_file", "glob", "grep"}
 
     def test_hashline_format_reaches_the_toolset(self):
         """The instructions promised hashline_edit; the tools must offer it."""
@@ -335,21 +333,19 @@ class TestCapabilityOwnedBackend:
 
 
 class TestDeniedExecuteRemovesEveryShellTool:
-    """A denied `execute` used to leave the background shells behind.
+    """Every tool that runs a command goes when `execute` is denied.
 
-    `_denied_tools` listed only `execute`, and `TOOL_OPERATIONS` had no entry for
-    the background tools at all — so `prepare_tools` kept them and
-    `before_tool_execute` waved them through unchecked. The result was an agent
-    on `READONLY_RULESET`, whose docstring reads "nothing may change or run",
-    holding `run_in_background`, which runs an arbitrary shell command.
+    A ruleset on `READONLY_RULESET`, whose docstring reads "nothing may change or
+    run", once kept a background-shell tool registered and unchecked, because
+    neither `_denied_tools` nor `TOOL_OPERATIONS` named it.
     """
 
-    def test_the_toolset_drops_all_five(self):
+    def test_the_toolset_drops_them_all(self):
         toolset = create_console_toolset(permissions=READONLY_RULESET)
 
         assert not EXECUTE_TOOLS & set(toolset.tools)
 
-    async def test_the_capability_drops_all_five(self):
+    async def test_the_capability_drops_them_all(self):
         cap = ConsoleCapability(permissions=READONLY_RULESET)
         defs = [ToolDefinition(name=name) for name in sorted(EXECUTE_TOOLS)]
 
@@ -373,8 +369,8 @@ class TestDeniedExecuteRemovesEveryShellTool:
     def test_every_registered_tool_maps_to_an_operation(self):
         """An unmapped name is kept *and* unchecked, so the map must be total.
 
-        This is the assertion that would have caught the finding: the background
-        tools were registered by the toolset and absent from `TOOL_OPERATIONS`.
+        This is the assertion that would have caught the background-shell finding:
+        tools registered by the toolset and absent from `TOOL_OPERATIONS`.
         """
         registered = set(create_console_toolset(edit_format="hashline").tools)
         registered |= set(create_console_toolset(edit_format="str_replace").tools)
@@ -415,12 +411,6 @@ class TestCapabilityApproval:
                 args={"path": "/a.txt"},
             )
 
-    def test_background_tools_can_be_left_out(self):
-        cap = ConsoleCapability(include_background=False)
-
-        assert "run_in_background" not in cap.get_toolset().tools
-        assert "execute" in cap.get_toolset().tools
-
 
 class TestToolsetOptionsReachTheToolset:
     """Options `create_console_toolset` accepts, that the capability hid.
@@ -439,11 +429,9 @@ class TestToolsetOptionsReachTheToolset:
             b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
             b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
         )
-        backend = StateBackend()
-        backend.write("/chart.png", png)
-
-        plain = ConsoleCapability(backend=backend)
-        seeing = ConsoleCapability(backend=backend, image_support=True)
+        del png
+        plain = ConsoleCapability()
+        seeing = ConsoleCapability(image_support=True)
 
         assert plain.image_support is False
         assert seeing.get_toolset() is not None
@@ -455,7 +443,6 @@ class TestToolsetOptionsReachTheToolset:
     def test_descriptions_reach_the_model(self):
         """A host cataloguing these tools needs one description, not two."""
         capability = ConsoleCapability(
-            backend=StateBackend(),
             descriptions={"execute": "Run a shell command in the workspace."},
         )
 
@@ -468,14 +455,13 @@ class TestToolsetOptionsReachTheToolset:
 
     def test_document_support_is_separate_from_images(self):
         """A model that sees images does not necessarily read PDFs."""
-        capability = ConsoleCapability(backend=StateBackend(), document_support=True)
+        capability = ConsoleCapability(document_support=True)
 
         assert capability.document_support is True
         assert capability.image_support is False
 
     def test_the_byte_ceilings_are_configurable(self):
         capability = ConsoleCapability(
-            backend=StateBackend(),
             image_support=True,
             max_image_bytes=1024,
             document_support=True,

@@ -1,16 +1,15 @@
-"""Multi-user web server with isolated Docker sandboxes.
+"""Multi-user web server with an isolated Docker container per session.
 
-This example shows how to build a production web service where each user
-gets their own isolated Docker container for code execution.
+Each session is a Pydantic AI workspace: a container created on first use and
+reached again by its ref. The file and command endpoints use the same workspace
+the agent works in, so a user and their agent see the same files.
 
-Requires: pip install pydantic-ai-backend[docker] fastapi uvicorn pydantic-ai jinja2
+Requires: pip install "pydantic-ai-backend[console,docker]" fastapi uvicorn jinja2
 """
 
-import asyncio
-import contextlib
+import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -18,47 +17,31 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from pydantic_ai import Agent
+from pydantic_ai.messages import ModelMessage
+from pydantic_ai.workspaces import Workspace, WorkspaceRef, WorkspaceTimeoutError
 
-from pydantic_ai_backends import (
-    DockerSandbox,
-    SessionManager,
-    create_console_toolset,
-    get_console_system_prompt,
-)
+from pydantic_ai_backends import ConsoleCapability, DockerWorkspace
+from pydantic_ai_backends.permissions import PERMISSIVE_RULESET
 
 # ============================================================================
-# Session Manager (handles multiple users)
+# Sessions: one container each, remembered by its ref
 # ============================================================================
 
-session_manager: SessionManager | None = None
+containers = DockerWorkspace(image="python:3.12-slim", network_mode="none")
+sessions: dict[str, WorkspaceRef | None] = {}
+histories: dict[str, list[ModelMessage]] = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Initialize and cleanup session manager."""
-    global session_manager
-
-    session_manager = SessionManager(
-        image="python:3.12-slim",
-        workspace_root="/tmp/workspaces",  # Persistent storage
-        auto_remove=True,
-    )
-
     yield
-
-    # Cleanup all sessions on shutdown
-    if session_manager:
-        for session_id in list(session_manager._sandboxes.keys()):
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(session_manager.end_session, session_id)
+    # Containers outlive runs by design; this demo removes them on shutdown.
+    for ref in sessions.values():
+        if ref is not None:
+            await containers.destroy(ref)
 
 
-app = FastAPI(
-    title="Multi-User Code Sandbox API",
-    lifespan=lifespan,
-)
-
-# Templates
+app = FastAPI(title="Multi-User Code Sandbox API", lifespan=lifespan)
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
 
@@ -101,44 +84,27 @@ class ChatResponse(BaseModel):
     response: str
 
 
-# ============================================================================
-# Agent Setup
-# ============================================================================
+agent = Agent(
+    "anthropic:claude-opus-5-5",
+    instructions=(
+        "You are a helpful coding assistant in an isolated sandbox. "
+        "You can freely create, read and execute files; they persist within this session."
+    ),
+    # Each session is its own network-less container, so commands need no approval.
+    capabilities=[containers, ConsoleCapability(permissions=PERMISSIVE_RULESET)],
+)
 
 
-@dataclass
-class UserDeps:
-    """Dependencies for a user's agent session."""
-
-    backend: DockerSandbox
-    user_id: str
-
-
-def create_user_agent() -> Agent[UserDeps, str]:
-    """Create an agent for a user session."""
-    toolset = create_console_toolset(
-        include_execute=True,
-        require_write_approval=False,
-        require_execute_approval=False,
-    )
-
-    agent: Agent[UserDeps, str] = Agent(
-        "openai:gpt-4o-mini",
-        system_prompt=f"""You are a helpful coding assistant in an isolated sandbox environment.
-
-{get_console_system_prompt()}
-
-The user has their own isolated workspace. You can freely create, read, and execute files.
-All changes persist within their session but are isolated from other users.
-""",
-        deps_type=UserDeps,
-    )
-
-    return agent.with_toolset(toolset)
+def _workspace(session_id: str) -> Workspace:
+    """The session's container, created on its first operation."""
+    if session_id not in sessions:
+        raise HTTPException(404, f"No such session: {session_id}")
+    return Workspace(containers.backend(sessions[session_id]))
 
 
-# Shared agent instance
-user_agent = create_user_agent()
+def _remember(session_id: str, workspace: Workspace) -> None:
+    if workspace.ref is not None:
+        sessions[session_id] = workspace.ref
 
 
 # ============================================================================
@@ -147,121 +113,85 @@ user_agent = create_user_agent()
 
 
 @app.post("/sessions", response_model=CreateSessionResponse)
-async def create_session(user_id: str | None = None) -> CreateSessionResponse:
-    """Create a new isolated session for a user."""
-    if not session_manager:
-        raise HTTPException(503, "Session manager not initialized")
-
-    session_id = await asyncio.to_thread(
-        session_manager.create_session,
-        user_id=user_id,
-    )
-
+async def create_session() -> CreateSessionResponse:
+    """Create a session; its container starts on first use."""
+    session_id = uuid.uuid4().hex
+    sessions[session_id] = None
+    histories[session_id] = []
     return CreateSessionResponse(
-        session_id=session_id,
-        message="Session created. Your workspace is isolated and ready.",
+        session_id=session_id, message="Session created. Your workspace is isolated."
     )
 
 
 @app.delete("/sessions/{session_id}")
 async def end_session(session_id: str) -> dict[str, str]:
-    """End a user session and cleanup resources."""
-    if not session_manager:
-        raise HTTPException(503, "Session manager not initialized")
-
-    try:
-        await asyncio.to_thread(session_manager.end_session, session_id)
-        return {"message": "Session ended successfully"}
-    except ValueError as e:
-        raise HTTPException(404, str(e)) from None
+    """End a session and remove its container."""
+    if session_id not in sessions:
+        raise HTTPException(404, f"No such session: {session_id}")
+    ref = sessions.pop(session_id)
+    histories.pop(session_id, None)
+    if ref is not None:
+        await containers.destroy(ref)
+    return {"message": "Session ended successfully"}
 
 
 @app.get("/sessions/{session_id}/files")
-async def list_files(session_id: str, path: str = ".") -> dict[str, list[dict]]:
-    """List files in the user's workspace."""
-    if not session_manager:
-        raise HTTPException(503, "Session manager not initialized")
-
-    try:
-        sandbox = session_manager.get_session(session_id)
-    except ValueError as e:
-        raise HTTPException(404, str(e)) from None
-
-    files = sandbox.ls_info(path)
-    return {"files": files}
+async def list_files(session_id: str, path: str = ".") -> dict[str, list[dict[str, object]]]:
+    """List files in the session's workspace."""
+    workspace = _workspace(session_id)
+    entries = await workspace.list_dir(path)
+    _remember(session_id, workspace)
+    return {
+        "files": [
+            {"name": e.name, "path": e.path, "is_dir": e.is_dir, "size": e.size} for e in entries
+        ]
+    }
 
 
 @app.get("/sessions/{session_id}/files/{path:path}")
 async def read_file(session_id: str, path: str) -> dict[str, str]:
-    """Read a file from the user's workspace."""
-    if not session_manager:
-        raise HTTPException(503, "Session manager not initialized")
-
+    """Read a file from the session's workspace."""
+    workspace = _workspace(session_id)
     try:
-        sandbox = session_manager.get_session(session_id)
-    except ValueError as e:
-        raise HTTPException(404, str(e)) from None
-
-    content = sandbox.read(path)
+        content = await workspace.read_text(path)
+    except FileNotFoundError:
+        raise HTTPException(404, f"File not found: {path}") from None
+    _remember(session_id, workspace)
     return {"content": content}
 
 
 @app.post("/sessions/{session_id}/files")
 async def write_file(session_id: str, request: WriteFileRequest) -> dict[str, str]:
-    """Write a file to the user's workspace."""
-    if not session_manager:
-        raise HTTPException(503, "Session manager not initialized")
-
-    try:
-        sandbox = session_manager.get_session(session_id)
-    except ValueError as e:
-        raise HTTPException(404, str(e)) from None
-
-    result = sandbox.write(request.path, request.content)
-    if result.error:
-        raise HTTPException(400, result.error)
-
-    return {"message": f"File written: {result.path}"}
+    """Write a file to the session's workspace."""
+    workspace = _workspace(session_id)
+    await workspace.write_text(request.path, request.content)
+    _remember(session_id, workspace)
+    return {"message": f"File written: {request.path}"}
 
 
 @app.post("/sessions/{session_id}/execute", response_model=ExecuteResponse)
 async def execute_command(session_id: str, request: ExecuteRequest) -> ExecuteResponse:
-    """Execute a command in the user's sandbox."""
-    if not session_manager:
-        raise HTTPException(503, "Session manager not initialized")
-
+    """Run a shell command in the session's container."""
+    workspace = _workspace(session_id)
     try:
-        sandbox = session_manager.get_session(session_id)
-    except ValueError as e:
-        raise HTTPException(404, str(e)) from None
-
-    result = sandbox.execute(request.command, timeout=request.timeout)
-    return ExecuteResponse(
-        output=result.output,
-        exit_code=result.exit_code,
-    )
+        result = await workspace.run(request.command, shell=True, timeout=request.timeout)
+    except WorkspaceTimeoutError as error:
+        return ExecuteResponse(output=error.stdout + error.stderr, exit_code=None)
+    finally:
+        _remember(session_id, workspace)
+    return ExecuteResponse(output=result.stdout + result.stderr, exit_code=result.exit_code)
 
 
 @app.post("/sessions/{session_id}/chat", response_model=ChatResponse)
 async def chat(session_id: str, request: ChatRequest) -> ChatResponse:
-    """Chat with an AI agent that has access to the user's sandbox."""
-    if not session_manager:
-        raise HTTPException(503, "Session manager not initialized")
-
-    try:
-        sandbox = session_manager.get_session(session_id)
-    except ValueError as e:
-        raise HTTPException(404, str(e)) from None
-
-    deps = UserDeps(backend=sandbox, user_id=session_id)
-    result = await user_agent.run(request.message, deps=deps)
-
+    """Chat with an agent working in the session's container."""
+    workspace = _workspace(session_id)
+    result = await agent.run(
+        request.message, message_history=histories[session_id], workspace=workspace
+    )
+    histories[session_id] = result.all_messages()
+    _remember(session_id, result.workspace)
     return ChatResponse(response=result.output)
-
-
-# ============================================================================
-# Health Check
-# ============================================================================
 
 
 @app.get("/health")
@@ -269,10 +199,6 @@ async def health() -> dict[str, str]:
     """Health check endpoint."""
     return {"status": "healthy"}
 
-
-# ============================================================================
-# Main
-# ============================================================================
 
 if __name__ == "__main__":
     import uvicorn

@@ -5,100 +5,89 @@ Complete API documentation for pydantic-ai-backend.
 ## Quick Example
 
 ```python
-from dataclasses import dataclass
 from pydantic_ai import Agent
-from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+from pydantic_ai_backends import ConsoleCapability, DockerWorkspace
 
-@dataclass
-class Deps:
-    backend: LocalBackend
+agent = Agent(
+    "anthropic:claude-opus-5-5",
+    capabilities=[DockerWorkspace(runtime="python-minimal"), ConsoleCapability()],
+)
 
-
-backend = LocalBackend(root_dir=".")
-toolset = create_console_toolset()
-agent = Agent("openai:gpt-4o", deps_type=Deps).with_toolset(toolset)
-
-result = agent.run_sync("Create hello.py and run it", deps=Deps(backend=backend))
+result = agent.run_sync("Create hello.py and run it")
 ```
 
 ## Modules
 
 | Module | Description |
 |--------|-------------|
-| [Backends](backends.md) | LocalBackend, StateBackend, CompositeBackend |
-| [Docker](docker.md) | DockerSandbox, SessionManager, RuntimeConfig |
-| [Daytona](daytona.md) | DaytonaSandbox cloud sandbox |
-| [Remote](remote.md) | RemoteSandbox client, sandboxd service, wire protocol |
-| [Toolsets](toolsets.md) | Console toolset for pydantic-ai |
-| [Types](types.md) | Type definitions |
+| [Capability](capability.md) | `ConsoleCapability`: the console tools as one capability |
+| [Workspaces](workspaces.md) | Docker, sandboxd, Kubernetes, Daytona and state-document workspaces |
+| [Permissions](permissions.md) | Rulesets, presets and the permission checker |
+| [Docker](docker.md) | `DockerSandbox`, `SessionManager`, built-in runtimes |
+| [Kubernetes](kubernetes.md) | `KubernetesPodSandbox` |
+| [sandboxd](remote.md) | The sandbox service, its configuration, wire protocol and archive |
+| [Toolsets](toolsets.md) | `create_console_toolset` and the tool text |
+| [Types](types.md) | Type definitions, `StateBackend` |
 
 ## Import Reference
 
 ```python
-# Toolset for pydantic-ai agents (requires [console] extra)
+# Console tools (requires the [console] extra)
 from pydantic_ai_backends import (
+    ConsoleCapability,
     create_console_toolset,
     get_console_system_prompt,
-    ConsoleDeps,
 )
 
-# Backends
+# Workspaces (requires the [workspaces] extra, plus the provider's own)
 from pydantic_ai_backends import (
-    LocalBackend,
-    StateBackend,
-    CompositeBackend,
+    DaytonaWorkspace,
+    DockerWorkspace,
+    KubernetesWorkspace,
+    SandboxdWorkspace,
+    StateWorkspace,
 )
 
-# Docker (requires [docker] extra)
+# Sandboxes the workspaces run on
 from pydantic_ai_backends import (
-    DockerSandbox,
-    SessionManager,
-    RuntimeConfig,
     BUILTIN_RUNTIMES,
+    DockerSandbox,
+    KubernetesPodSandbox,
+    RuntimeConfig,
+    SessionManager,
 )
+
+# A filesystem kept as a JSON document
+from pydantic_ai_backends import StateBackend
 
 # Types
 from pydantic_ai_backends import (
-    FileInfo,
-    WriteResult,
+    CommandOutcome,
     EditResult,
     ExecuteResponse,
+    FileInfo,
     GrepMatch,
-)
-
-# Protocols
-from pydantic_ai_backends import (
-    BackendProtocol,
-    SandboxProtocol,
+    WriteResult,
 )
 ```
 
 ## Protocols
 
-### BackendProtocol
+### CommandRunner
 
-All backends implement this interface.
+What a sandbox implements for the container workspaces and `sandboxd` to run commands
+in it under the workspace contract.
 
-::: pydantic_ai_backends.protocol.BackendProtocol
+::: pydantic_ai_backends.protocol.CommandRunner
     options:
       show_root_heading: true
       members:
-        - ls_info
-        - read_bytes
-        - read
-        - write
-        - edit
-        - glob_info
-        - grep_raw
+        - run_command
+        - stop_command
 
-### SandboxProtocol
+### SandboxUnavailableError
 
-Extends [`BackendProtocol`][pydantic_ai_backends.protocol.BackendProtocol] with command execution.
-
-::: pydantic_ai_backends.protocol.SandboxProtocol
+::: pydantic_ai_backends.protocol.SandboxUnavailableError
     options:
       show_root_heading: true
-      members:
-        - execute
-        - id

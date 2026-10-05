@@ -1,17 +1,19 @@
 """Console capability for pydantic-ai agents.
 
-Provides `ConsoleCapability` that bundles console toolset + instructions +
-permission enforcement via the pydantic-ai capabilities API.
+Provides `ConsoleCapability`, which bundles the console toolset, its
+instructions and permission enforcement, all working in the run's Pydantic AI
+workspace.
 
 Example:
     ```python
     from pydantic_ai import Agent
-    from pydantic_ai_backends import ConsoleCapability
+
+    from pydantic_ai_backends import ConsoleCapability, DockerWorkspace
     from pydantic_ai_backends.permissions import READONLY_RULESET
 
     agent = Agent(
-        "openai:gpt-4.1",
-        capabilities=[ConsoleCapability(permissions=READONLY_RULESET)],
+        "anthropic:claude-opus-5-5",
+        capabilities=[DockerWorkspace(), ConsoleCapability(permissions=READONLY_RULESET)],
     )
     ```
 """
@@ -37,7 +39,6 @@ from pydantic_ai_backends.permissions.types import (
     PermissionOperation,
     PermissionRuleset,
 )
-from pydantic_ai_backends.protocol import AsyncBackendProtocol, BackendProtocol
 from pydantic_ai_backends.toolsets.console import (
     DEFAULT_MAX_DOCUMENT_BYTES,
     DEFAULT_MAX_IMAGE_BYTES,
@@ -56,15 +57,6 @@ TOOL_OPERATIONS: dict[str, PermissionOperation] = {
     "glob": "glob",
     "grep": "grep",
     "execute": "execute",
-    # The background shells are the "execute" operation reached a different way.
-    # Left out of this map they were governed by nothing at all: an unmapped name
-    # is both kept by `prepare_tools` and waved through `before_tool_execute`, so
-    # a ruleset denying execution still handed the model `run_in_background`.
-    # `tests/test_capability.py` asserts this map covers every registered tool.
-    "run_in_background": "execute",
-    "read_output": "execute",
-    "kill_shell": "execute",
-    "list_shells": "execute",
 }
 """Console tool name -> the permission operation that governs it."""
 
@@ -74,6 +66,9 @@ PATH_OPERATIONS: set[PermissionOperation] = {"read", "write", "edit"}
 COMMAND_OPERATIONS: set[PermissionOperation] = {"execute"}
 """Operations checked per command, taken from the call's `command` argument."""
 
+MUTATING_TOOLS = frozenset({"write_file", "edit_file", "hashline_edit", "execute"})
+"""Tools a read-only workspace refuses, so they are not offered on one."""
+
 # glob, grep and ls appear in neither set on purpose: a denied one is hidden
 # outright by prepare_tools(), which saves checking every pattern against the
 # ruleset on every call.
@@ -81,10 +76,14 @@ COMMAND_OPERATIONS: set[PermissionOperation] = {"execute"}
 
 @dataclass
 class ConsoleCapability(AbstractCapability[Any]):
-    """Capability providing filesystem tools with permission enforcement.
+    """Filesystem and shell tools in the run's workspace, with permission enforcement.
 
     Bundles the console toolset (ls, read_file, write_file, edit_file, glob,
-    grep, execute) with dynamic instructions and per-tool permission control.
+    grep, execute) with instructions and per-tool permission control. The tools
+    work in `ctx.workspace`, so the agent needs a workspace capability beside
+    this one — `DockerWorkspace`, `SandboxdWorkspace`, `StateWorkspace`,
+    Pydantic AI's `LocalWorkspace`, or a harness sandbox such as `E2BSandbox`.
+    On a read-only workspace the write and execute tools are not offered.
 
     When a permission ruleset is provided:
     - Tools for denied operations are dropped from the toolset entirely, and
@@ -96,42 +95,23 @@ class ConsoleCapability(AbstractCapability[Any]):
     Example:
         ```python
         from pydantic_ai import Agent
-        from pydantic_ai_backends import ConsoleCapability, DockerSandbox
+
+        from pydantic_ai_backends import ConsoleCapability, SandboxdWorkspace
         from pydantic_ai_backends.permissions import READONLY_RULESET
 
-        # Read-only agent — write/edit/execute tools are hidden
-        agent = Agent(
-            "openai:gpt-4.1",
-            capabilities=[ConsoleCapability(permissions=READONLY_RULESET)],
-        )
+        sandbox = SandboxdWorkspace(service_url="http://sandboxd:8080", token="...")
+        agent = Agent("anthropic:claude-opus-5-5", capabilities=[sandbox, ConsoleCapability()])
 
-        # A sandbox the capability owns, for an agent whose deps type is not ours
-        agent = Agent(
-            "openai:gpt-4.1",
-            capabilities=[ConsoleCapability(backend=DockerSandbox(runtime="python-web"))],
+        # Read-only agent — write/edit/execute tools are hidden
+        reader = Agent(
+            "anthropic:claude-opus-5-5",
+            capabilities=[sandbox, ConsoleCapability(permissions=READONLY_RULESET)],
         )
         ```
     """
 
-    backend: BackendProtocol | AsyncBackendProtocol | None = None
-    """Backend the tools operate on.
-
-    When omitted, each call reads `ctx.deps.backend`, which requires the agent's
-    deps to satisfy `ConsoleDeps`. Set it when the host owns its deps type and
-    cannot add a `backend` field — the capability then carries the backend
-    itself, which is also what lets one agent hold a sandbox of its own.
-    """
-
     include_execute: bool = True
     """Whether to include the execute tool."""
-
-    include_background: bool = True
-    """Whether to include the background-shell tools.
-
-    Separate from `include_execute` because a backend may support commands
-    without supporting long-lived ones — and because an agent that should not
-    start a process it cannot see finish wants these off while keeping `execute`.
-    """
 
     edit_format: EditFormat = "str_replace"
     """Edit format: 'str_replace' or 'hashline'."""
@@ -201,9 +181,7 @@ class ConsoleCapability(AbstractCapability[Any]):
     def __post_init__(self) -> None:
         """Create the underlying console toolset and permission checker."""
         self._toolset = create_console_toolset(
-            backend=self.backend,
             include_execute=self.include_execute,
-            include_background=self.include_background,
             edit_format=self.edit_format,
             image_support=self.image_support,
             max_image_bytes=self.max_image_bytes,
@@ -247,7 +225,9 @@ class ConsoleCapability(AbstractCapability[Any]):
         ctx: RunContext[Any],
         tool_defs: list[ToolDefinition],
     ) -> list[ToolDefinition]:
-        """Hide tools for denied operations."""
+        """Hide tools for denied operations, and mutating ones on a read-only workspace."""
+        if ctx.workspace.read_only:
+            tool_defs = [td for td in tool_defs if td.name not in MUTATING_TOOLS]
         if self._checker is None:
             return tool_defs
 

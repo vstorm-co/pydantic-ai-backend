@@ -1022,12 +1022,6 @@
             <div class="stack" style="gap:var(--space-3)">
               <div class="cluster">
                 <div class="crumbs" id="crumbs"></div>
-                <div class="spacer"></div>
-                <span class="eyebrow">Source</span>
-                <select id="files-source" class="select" style="inline-size:auto">
-                  <option value="live">Live sandbox</option>
-                  <option value="stored">Stored workspace</option>
-                </select>
               </div>
               <p class="panel-note" id="files-note" style="margin:0"></p>
               <div class="files__split">
@@ -1172,7 +1166,7 @@
     wsBack: $("ws-back"), wsKill: $("ws-kill"),
     term: $("term"), termCwd: $("term-cwd"), termClear: $("term-clear"),
     execForm: $("exec-form"), execInput: $("exec-input"), execSubmit: $("exec-submit"),
-    crumbs: $("crumbs"), fileList: $("file-list"), filesSource: $("files-source"), filesNote: $("files-note"),
+    crumbs: $("crumbs"), fileList: $("file-list"), filesNote: $("files-note"),
     viewer: $("viewer"), viewerName: $("viewer-name"), viewerBody: $("viewer-body"),
     viewerClose: $("viewer-close"),
     events: $("events"), eventCount: $("event-count"),
@@ -1198,7 +1192,6 @@
   let policy = null;
   let workDir = WORK_DIR_FALLBACK;
   let cwd = WORK_DIR_FALLBACK;
-  let filesSource = "live";
   let commandHistory = [];
   let historyAt = -1;
   let lastSeq = 0;
@@ -1245,6 +1238,14 @@
     node.textContent = message;
     el.toasts.append(node);
     setTimeout(() => node.remove(), TOAST_MS);
+  }
+
+  // `getRandomValues` rather than `randomUUID`: the dashboard is usually served
+  // over plain HTTP on a private network, which is not a secure context, and
+  // `randomUUID` exists only in one.
+  function runId() {
+    return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
+      byte.toString(16).padStart(2, "0")).join("");
   }
 
   async function api(path, options) {
@@ -1478,8 +1479,6 @@
     lastSeq = 0;
     eventTotal = 0;
     cwd = workDir;
-    filesSource = "live";
-    el.filesSource.value = "live";
     termReset();
     el.events.innerHTML = '<p class="panel-note">No activity yet.</p>';
     el.fileList.textContent = "";
@@ -1524,15 +1523,20 @@
     const pending = termWrite('<p class="terminal__meta terminal__meta--pending">running…</p>');
 
     try {
-      const result = await api("/sessions/" + encodeURIComponent(selected) + "/exec", {
+      const result = await api("/sessions/" + encodeURIComponent(selected) + "/run", {
         method: "POST",
-        body: { command },
+        body: { argv: ["/bin/sh", "-c", command], run_id: runId() },
       });
+      const output = result.stdout + result.stderr;
+      const outcome = result.timed_out
+        ? "timed out"
+        : result.output_limited
+          ? "output limit reached"
+          : "exit " + result.exit_code;
       const modifier = result.exit_code === 0 ? "ok" : "bad";
       pending.innerHTML =
-        (result.output ? "<div>" + esc(result.output.replace(/\n$/, "")) + "</div>" : "") +
-        '<p class="terminal__meta terminal__meta--' + modifier + '">exit ' + result.exit_code +
-        (result.truncated ? " · output truncated" : "") + "</p>";
+        (output ? "<div>" + esc(output.replace(/\n$/, "")) + "</div>" : "") +
+        '<p class="terminal__meta terminal__meta--' + modifier + '">' + outcome + "</p>";
     } catch (error) {
       pending.innerHTML =
         '<p class="terminal__meta terminal__meta--bad">' + esc(error.message) + "</p>";
@@ -1570,25 +1574,15 @@
     return cut <= 0 ? "/" : trimmed.slice(0, cut);
   }
 
-  const filesRoot = () => (filesSource === "stored" ? workDir : "/");
-
-  el.filesSource.addEventListener("change", () => {
-    filesSource = el.filesSource.value;
-    cwd = filesRoot();
-    loadDir(cwd);
-  });
+  const filesRoot = () => workDir;
 
   function filesEndpoint(operation) {
-    const id = encodeURIComponent(selected);
-    return filesSource === "stored"
-      ? "/workspaces/" + id + "/" + operation
-      : "/sessions/" + id + "/" + operation;
+    return "/workspaces/" + encodeURIComponent(selected) + "/" + operation;
   }
 
   function renderCrumbs(path) {
     const root = filesRoot();
-    // In stored mode the archive cannot see above the work directory, so the
-    // trail starts there rather than at the filesystem root.
+    // The archive cannot see above the work directory, so the trail starts there.
     const relative = path.startsWith(root) ? path.slice(root.length) : "";
     const parts = relative.split("/").filter(Boolean);
     let built = root;
@@ -1606,25 +1600,15 @@
     }
   }
 
-  function sourceNote(row) {
-    if (filesSource === "stored") {
-      return "Reading the stored workspace off the host volume — no container is started, " +
-        "so this works for a session that has already been reaped. Only " + workDir + " is kept.";
-    }
-    if (row && row.alive) {
-      return "Reading the running sandbox, so the whole filesystem is visible.";
-    }
-    const why = row && row.state === "hibernated"
-      ? "This session is asleep: it gave up its sandbox to free a slot, and reading it live wakes it. "
-      : "This session is stopped: reading it live restarts its container. ";
-    return why + "Switch to the stored workspace to browse without starting anything.";
-  }
+  const SOURCE_NOTE =
+    "Reading the stored workspace off the host volume — no container is started, " +
+    "so this works for a session that has already been reaped. Only the work directory is kept.";
 
   async function loadDir(path) {
     if (!selected) return;
     cwd = path;
     renderCrumbs(path);
-    el.filesNote.textContent = sourceNote(currentSession());
+    el.filesNote.textContent = SOURCE_NOTE;
     el.viewer.classList.add("is-hidden");
     el.fileList.innerHTML = '<p class="file-row"><span class="file-row__note">loading…</span></p>';
 
@@ -1637,9 +1621,9 @@
       return;
     }
 
-    // A live listing returns absolute container paths; the archive returns paths
-    // relative to the work directory. Navigation works on absolute ones.
-    const absolute = (row) => (filesSource === "stored" ? joinPath(workDir, row.path) : row.path);
+    // The archive returns paths relative to the work directory; navigation
+    // works on absolute ones.
+    const absolute = (row) => joinPath(workDir, row.path);
 
     const chunks = [];
     if (path !== filesRoot()) {

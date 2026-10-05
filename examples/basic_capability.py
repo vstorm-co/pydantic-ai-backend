@@ -1,31 +1,21 @@
-"""Basic ConsoleCapability usage — filesystem tools with one line."""
+"""Basic ConsoleCapability usage: file and shell tools in a container."""
 
 import asyncio
-from dataclasses import dataclass
 
 from pydantic_ai import Agent
 
-from pydantic_ai_backends import ConsoleCapability, LocalBackend
-
-
-@dataclass
-class Deps:
-    backend: LocalBackend
+from pydantic_ai_backends import ConsoleCapability, DockerWorkspace
 
 
 async def main() -> None:
-    agent = Agent(
-        "openai:gpt-4.1",
-        deps_type=Deps,
-        capabilities=[ConsoleCapability()],
-    )
+    workspace = DockerWorkspace(image="python:3.12-slim")
+    agent = Agent("anthropic:claude-opus-5-5", capabilities=[workspace, ConsoleCapability()])
 
-    backend = LocalBackend(root_dir="/tmp/demo")
-    result = await agent.run(
-        "Create a hello.py file that prints 'Hello World', then run it.",
-        deps=Deps(backend=backend),
-    )
+    result = await agent.run("Create a hello.py file that prints 'Hello World', then run it.")
     print(result.output)
+
+    # The container outlives the run; remove it when you are done with it.
+    await workspace.destroy(result.workspace.ref)
 
 
 if __name__ == "__main__":
