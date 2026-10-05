@@ -111,6 +111,29 @@ policy wrapped around it — `ReadOnlyWorkspace`, or a `WrapperWorkspace` of you
 applies to every one of them, and on a read-only workspace the write and execute tools are
 not offered at all.
 
+## Keeping the file tools in one directory
+
+Pydantic AI's `LocalWorkspace` points a run at a directory but confines nothing: an absolute
+path, a `..` or a symlink reaches any file the process can. `ConfinedWorkspace` wraps a
+workspace and refuses a file operation whose path - resolved against the working directory,
+then through every symlink - leads outside it, with `WorkspacePathError` (a
+`PermissionError`). The console's `glob` and `grep` check their search root the same way.
+A refused call reaches the model as the tool's error, not as the end of the run.
+
+```python
+from pydantic_ai.workspaces import LocalWorkspaceBackend, Workspace
+
+from pydantic_ai_backends.workspaces import ConfinedWorkspace
+
+project = ConfinedWorkspace(Workspace(LocalWorkspaceBackend("./project")))
+result = await agent.run(prompt, workspace=project)
+```
+
+**Commands are not confined.** A shell reaches whatever its user can, and inspecting a
+command line is not a boundary; `ConfinedWorkspace` keeps the file tools - which usually run
+without approval - where they were pointed, as `LocalBackend(root_dir=...)` did before 0.2.30.
+To isolate commands, give the run a sandbox such as `DockerWorkspace`.
+
 ## What was checked
 
 `DockerWorkspace` and `SandboxdWorkspace` pass Pydantic AI's own `WorkspaceBackendSuite`

@@ -13,10 +13,14 @@ attaches to the same environment, and never deletes it: `destroy(ref)` does.
 | `DaytonaWorkspace` | A Daytona sandbox | `daytona` |
 | `StateWorkspace` | A JSON document, files only | — |
 
+`ConfinedWorkspace` wraps any of them, or Pydantic AI's local workspace, to keep
+file operations inside its working directory.
+
 Compose one with tools that use the workspace: this library's
 `ConsoleCapability`, or the harness's `Coder`, `Shell` and `FileSystem`.
 """
 
+from pydantic_ai_backends._confined import ConfinedWorkspace, WorkspacePathError
 from pydantic_ai_backends.workspaces._daytona import DaytonaWorkspace, DaytonaWorkspaceBackend
 from pydantic_ai_backends.workspaces._docker import DockerWorkspace, DockerWorkspaceBackend
 from pydantic_ai_backends.workspaces._kubernetes import (
@@ -27,6 +31,7 @@ from pydantic_ai_backends.workspaces._sandboxd import SandboxdWorkspace, Sandbox
 from pydantic_ai_backends.workspaces._state import StateWorkspace, StateWorkspaceBackend
 
 __all__ = [
+    "ConfinedWorkspace",
     "DaytonaWorkspace",
     "DaytonaWorkspaceBackend",
     "DockerWorkspace",
@@ -37,4 +42,5 @@ __all__ = [
     "SandboxdWorkspaceBackend",
     "StateWorkspace",
     "StateWorkspaceBackend",
+    "WorkspacePathError",
 ]
