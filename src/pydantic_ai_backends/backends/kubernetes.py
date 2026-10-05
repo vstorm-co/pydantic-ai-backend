@@ -1,100 +1,79 @@
-"""KubernetesPodSandbox — runs the agent's shell tools inside a K8s pod.
+"""A Kubernetes pod the workspaces and `sandboxd` run commands in.
 
-Implements the `BaseSandbox` ABC with **synchronous** methods
-(matching `DockerSandbox` and `DaytonaSandbox`) and is intended to be
-a drop-in for any user of `pydantic_ai_backends.SessionManager`.
+Commands reach the pod through the API's `pods/exec` subresource, so the image
+needs `/bin/sh` and nothing else of ours, and the caller needs `pods/exec` RBAC.
+stdout and stderr arrive on their own channels and the exit status on a third;
+the deadline is kept here, and a caller that times out or is cancelled stops the
+command's process group with a second exec, as on Docker.
 
-Two ways to use it:
-
-1. **In-cluster, with an in-pod HTTP exec server** (recommended for
-   long-running tool calls — `npm install`, headless browser, MCP
-   servers). This is the `mode="http"` path. The pod image must
-   expose an HTTP endpoint at `/exec`, `/read`, etc. (see
-   ``examples/kubernetes-sandbox.md`` for a reference image).
-2. **Anywhere, using the K8s API ``pods/exec`` subresource**. This is
-   the ``mode="api"`` path. Fine for short commands; can stall on
-   long output streams. Needs ``pods/exec`` RBAC on the caller.
-
-Either way, ``KubernetesPodSandbox.start()`` waits for the pod to be
-``Ready`` and returns; ``stop()`` deletes the pod.
+Not checked against a live cluster in this repository's CI: the unit tests drive
+a fake API, and `tests/test_workspace_kubernetes_conformance.py` runs Pydantic
+AI's conformance suite only when a cluster is reachable (`-m kubernetes`).
 """
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import copy
+import functools
 import os
-import secrets
+import threading
 import time
 import uuid
-from typing import Any, Literal
+from collections.abc import Mapping, Sequence
+from typing import Any
 
-from pydantic_ai_backends._editing import Replacement, replace_in_content
-from pydantic_ai_backends._limits import MAX_EXECUTE_OUTPUT_BYTES
-from pydantic_ai_backends.backends.base import BaseSandbox
-from pydantic_ai_backends.types import EditResult, ExecuteResponse, FileInfo, WriteResult
+import anyio
+import anyio.to_thread
 
-DEFAULT_EXEC_TIMEOUT = 30 * 60  # Matches DaytonaSandbox.
+from pydantic_ai_backends._limits import MAX_RUN_OUTPUT_BYTES
+from pydantic_ai_backends.backends._runner import (
+    SIGNAL_EXIT_BASE,
+    STOPPER,
+    Sink,
+    pid_file,
+    wrapped_argv,
+)
+from pydantic_ai_backends.protocol import SandboxUnavailableError
+from pydantic_ai_backends.types import CommandOutcome
+
 DEFAULT_STARTUP_TIMEOUT = 60
-DEFAULT_PORT = 8080
+"""Seconds to wait for a new pod to become Ready."""
+
+DEFAULT_WORK_DIR = "/workspace"
+"""Directory commands start in; an `emptyDir` in the default pod."""
+
+STOP_GRACE_SECONDS = 5.0
+"""Longest a stop may take, its TERM-then-KILL included, under cancellation."""
+
+POLL_SECONDS = 0.2
+"""How long one read of an exec's channels waits, which bounds how late a stop is seen."""
+
+_CD_THEN_EXEC = 'cd "$1" && shift && exec "$@"'
+"""`pods/exec` takes no working directory, so the command moves there itself."""
 
 
-class KubernetesPodSandbox(BaseSandbox):
-    """Sandbox backed by a Kubernetes pod.
+class KubernetesPodSandbox:
+    """One pod: its lifecycle, and commands run in it under the workspace contract.
 
     Args:
-        image: container image to run.
-        namespace: K8s namespace to create the pod in.
-        sandbox_id: identifier; used as a deterministic pod name suffix,
-            sanitized to DNS-1123. Auto-generated if not provided.
-        session_id: alias for ``sandbox_id`` (accepted for parity with
-            ``DockerSandbox``). Ignored if ``sandbox_id`` is set.
-        mode: ``"http"`` (default) talks to an in-pod exec server on
-            ``port``; ``"api"`` uses the K8s ``pods/exec`` subresource.
-            ``mode="api"`` shells out as ``timeout <n> sh -c <command>``,
-            so the image must provide ``/bin/sh`` **and** a ``timeout``
-            binary (GNU coreutils or the BusyBox applet). Stock images
-            such as ``python:*``, ``node:*``, ``debian``, ``ubuntu`` and
-            ``alpine`` all ship it; minimal/``distroless`` images without
-            a shell do not and will surface ``timeout: not found``.
-        port: port the in-pod exec server listens on (mode="http" only).
-        exec_token: shared secret sent in the ``X-Sandbox-Token`` header
-            (mode="http" only). Auto-generated if not provided; written
-            into the pod env as ``SANDBOX_EXEC_TOKEN``.
-        pod_template: optional dict — full pod spec body. If set, used
-            verbatim (with ``image`` / env / labels filled in). Otherwise
-            a sensible default is built (single container, non-root,
-            readOnlyRootFilesystem, 768Mi/1CPU limit).
-        kube_config_path: path to a kubeconfig. If unset, falls back to
-            in-cluster config, then ``~/.kube/config``.
-        in_cluster: force in-cluster vs out-of-cluster auth.
-        startup_timeout: seconds to wait for ``Ready`` in ``start()``.
-        idle_timeout: passed through to ``SessionManager`` for parity.
-        labels: extra labels merged into the pod metadata.
-        env: extra environment variables for the container.
-        delete_on_stop: whether ``stop()`` deletes the pod. Default True.
-        service_account_name: ``serviceAccountName`` for the pod
-            (defaults to ``default``; recommend a dedicated, no-privilege SA).
-
-    Lifecycle:
-        - ``__init__`` validates args and builds the in-memory client. It
-          does **not** create the pod — call ``start()`` (or let
-          ``SessionManager.get_or_create()`` call it) to actually create.
-        - ``start()`` creates the pod and blocks until Ready.
-        - ``execute()``, ``edit()``, ``read()``, ``write()``, ``glob_info``,
-          ``grep_raw``, ``ls_info``: synchronous, talk to the pod (HTTP
-          or pods/exec) and return.
-        - ``stop()`` deletes the pod (if ``delete_on_stop=True``);
-          idempotent; never raises.
-
-    Errors:
-        - Constructor raises ``ImportError`` if the ``kubernetes`` SDK
-          is not installed (``pip install pydantic-ai-backend[kubernetes]``).
-        - ``start()`` raises ``RuntimeError`` if the pod doesn't reach
-          ``Ready`` in ``startup_timeout``.
-        - ``execute()`` never raises; runtime errors are surfaced as
-          ``ExecuteResponse(output="Error: ...", exit_code=1)``.
+        image: Container image. Needs `/bin/sh`.
+        namespace: Namespace the pod lives in.
+        sandbox_id: Identifier; the pod is named `pab-sandbox-<id>`, sanitised to
+            DNS-1123. Generated when omitted.
+        work_dir: Directory commands start in.
+        pod_template: A full pod spec used instead of the default, with the
+            name, image, labels and env filled in. It must keep its first
+            container running, since commands are exec'd into it.
+        kube_config_path: A kubeconfig; in-cluster config, then `~/.kube/config`
+            when omitted.
+        in_cluster: Force in-cluster or out-of-cluster auth.
+        startup_timeout: Seconds to wait for `Ready` in :meth:`start`.
+        idle_timeout: Idle seconds after which `SessionManager` may reap it.
+        labels: Extra pod labels.
+        env: Extra container environment.
+        service_account_name: The pod's service account; a dedicated one with
+            no permissions is the right choice.
     """
 
     def __init__(
@@ -103,10 +82,7 @@ class KubernetesPodSandbox(BaseSandbox):
         *,
         namespace: str = "default",
         sandbox_id: str | None = None,
-        session_id: str | None = None,  # alias, parity with DockerSandbox
-        mode: Literal["http", "api"] = "http",
-        port: int = DEFAULT_PORT,
-        exec_token: str | None = None,
+        work_dir: str = DEFAULT_WORK_DIR,
         pod_template: dict[str, Any] | None = None,
         kube_config_path: str | None = None,
         in_cluster: bool | None = None,
@@ -114,53 +90,23 @@ class KubernetesPodSandbox(BaseSandbox):
         idle_timeout: int = 3_600,
         labels: dict[str, str] | None = None,
         env: dict[str, str] | None = None,
-        delete_on_stop: bool = True,
         service_account_name: str = "default",
     ) -> None:
-        try:
-            from kubernetes import client as k8s_client
-            from kubernetes import config as k8s_config
-            from kubernetes.client import ApiClient as _ApiClient  # noqa: F401
-            from kubernetes.client.rest import ApiException as _ApiException  # noqa: F401
-        except ImportError as exc:  # pragma: no cover
-            raise ImportError(
-                "kubernetes SDK is required. Install with: "
-                "pip install pydantic-ai-backend[kubernetes]"
-            ) from exc
-
-        self._k8s_client = k8s_client
-        self._k8s_config = k8s_config
-
-        if mode == "http":
-            try:
-                import httpx as _httpx
-            except ImportError as exc:  # pragma: no cover
-                raise ImportError(
-                    "httpx is required for mode='http'. Install with: "
-                    "pip install pydantic-ai-backend[kubernetes]"
-                ) from exc
-            self._httpx = _httpx
+        from kubernetes import client as k8s_client
+        from kubernetes import config as k8s_config
 
         self._image = image
         self._namespace = namespace
-        self._mode = mode
-        self._port = port
-        self._exec_token = exec_token or secrets.token_urlsafe(32)
+        self._id = sandbox_id or uuid.uuid4().hex
+        self._pod_name = _sanitize_pod_name(self._id)
+        self._work_dir = work_dir
         self._pod_template = pod_template
         self._startup_timeout = startup_timeout
         self._idle_timeout = idle_timeout
-        self._extra_labels = labels or {}
-        self._extra_env = env or {}
-        self._delete_on_stop = delete_on_stop
+        self._labels = labels or {}
+        self._env = env or {}
         self._service_account_name = service_account_name
-
-        # Identity. Pod names must be DNS-1123 compliant.
-        provided_id = sandbox_id or session_id
-        if provided_id is not None:
-            super().__init__(provided_id)
-        else:
-            super().__init__(uuid.uuid4().hex)
-        self._pod_name = _sanitize_pod_name(self._id, prefix="pab-sandbox-")
+        self._last_activity = time.time()
 
         if in_cluster is None:
             in_cluster = _detect_in_cluster()
@@ -173,270 +119,253 @@ class KubernetesPodSandbox(BaseSandbox):
                 k8s_config.load_kube_config()
         except Exception as exc:
             raise RuntimeError(f"failed to load kubernetes config: {exc}") from exc
+        self._core: Any = k8s_client.CoreV1Api()
 
-        self._core = k8s_client.CoreV1Api()
-        self._pod_ip: str | None = None
-        self._http: Any = None
-        self._stopped = False
+    @property
+    def id(self) -> str:
+        """Unique identifier for this sandbox."""
+        return self._id
+
+    @property
+    def pod_name(self) -> str:
+        """The pod's name in its namespace."""
+        return self._pod_name
+
+    @property
+    def work_dir(self) -> str:
+        """Directory commands start in."""
+        return self._work_dir
+
+    @property
+    def idle_timeout(self) -> int:
+        """Idle seconds after which `SessionManager` may reap this sandbox."""
+        return self._idle_timeout
+
+    @property
+    def last_activity(self) -> float:
+        """Wall clock of the last operation, which idle cleanup reaps against."""
+        return self._last_activity
+
+    def touch(self) -> None:
+        """Record activity, so idle cleanup does not reap a sandbox in use."""
+        self._last_activity = time.time()
+
+    # ── Lifecycle ──────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Create the pod and wait for it to be Ready."""
+        """Create the pod and wait until it is Ready.
+
+        Raises:
+            RuntimeError: The pod could not be created, finished before it was
+                Ready, or was not Ready in `startup_timeout`; it is deleted again.
+        """
         body = _build_pod_body(
             name=self._pod_name,
             image=self._image,
             namespace=self._namespace,
-            port=self._port,
-            mode=self._mode,
-            exec_token=self._exec_token,
-            extra_labels=self._extra_labels,
-            extra_env=self._extra_env,
+            work_dir=self._work_dir,
+            extra_labels=self._labels,
+            extra_env=self._env,
             service_account_name=self._service_account_name,
             override=self._pod_template,
         )
         try:
             self._core.create_namespaced_pod(self._namespace, body)
         except Exception as exc:
-            self._cleanup_quietly()
             raise RuntimeError(f"failed to create sandbox pod {self._pod_name}: {exc}") from exc
-
-        deadline = time.time() + self._startup_timeout
-        while time.time() < deadline:
-            pod: Any = self._core.read_namespaced_pod(self._pod_name, self._namespace)
-            phase = pod.status.phase
-            if phase in ("Failed", "Succeeded"):
-                self._cleanup_quietly()
-                raise RuntimeError(f"sandbox pod {self._pod_name} entered terminal phase {phase}")
-            if phase == "Running" and pod.status.pod_ip:
-                conditions = pod.status.conditions or []
-                if any(c.type == "Ready" and c.status == "True" for c in conditions):
-                    self._pod_ip = pod.status.pod_ip
-                    if self._mode == "http":
-                        self._http = self._httpx.Client(
-                            base_url=f"http://{self._pod_ip}:{self._port}",
-                            timeout=self._httpx.Timeout(
-                                connect=2.0,
-                                read=DEFAULT_EXEC_TIMEOUT,
-                                write=10.0,
-                                pool=2.0,
-                            ),
-                            headers={"X-Sandbox-Token": self._exec_token},
-                        )
+        deadline = time.monotonic() + self._startup_timeout
+        while time.monotonic() < deadline:
+            try:
+                if self._ready():
                     return
+            except SandboxUnavailableError as exc:
+                self.stop()
+                raise RuntimeError(f"sandbox pod {self._pod_name} did not start: {exc}") from exc
             time.sleep(0.5)
-
-        self._cleanup_quietly()
+        self.stop()
         raise RuntimeError(f"sandbox pod {self._pod_name} not ready in {self._startup_timeout}s")
 
-    def is_alive(self) -> bool:
-        if self._stopped:
-            return False
+    def attach(self) -> None:
+        """Check that the pod exists and is running, without creating anything.
+
+        Raises:
+            SandboxUnavailableError: There is no such pod, or it has finished.
+        """
+        if not self._ready():
+            raise SandboxUnavailableError(f"pod {self._pod_name} is not running")
+
+    def _ready(self) -> bool:
+        """Whether the pod is Running and Ready.
+
+        Raises:
+            SandboxUnavailableError: The pod is gone or in a terminal phase.
+        """
+        from kubernetes.client.rest import ApiException
+
         try:
             pod: Any = self._core.read_namespaced_pod(self._pod_name, self._namespace)
+        except ApiException as exc:
+            if exc.status == 404:
+                raise SandboxUnavailableError(f"pod {self._pod_name} does not exist") from exc
+            raise
+        phase = pod.status.phase
+        if phase in ("Failed", "Succeeded"):
+            raise SandboxUnavailableError(f"pod {self._pod_name} has finished ({phase})")
+        conditions = pod.status.conditions or []
+        return phase == "Running" and any(
+            c.type == "Ready" and c.status == "True" for c in conditions
+        )
+
+    def is_alive(self) -> bool:
+        """Whether the pod is running."""
+        try:
+            return self._ready()
         except Exception:
             return False
-        return bool(pod.status.phase == "Running")
 
     def stop(self, purge: bool = False) -> None:
-        """Close the connection and delete the pod when this sandbox owns it.
+        """Delete the pod.
 
         Args:
-            purge: Accepted for one signature across every sandbox, and it makes
-                no difference here. A pod is deleted or it is not, and that is
-                `delete_on_stop`'s decision rather than the caller's - there is
-                no state kept for a later attach to preserve.
+            purge: Accepted for one signature across every sandbox; a pod keeps
+                nothing a later attach could find, so stopping is deleting.
         """
-        if self._stopped:
-            return
-        self._stopped = True
-        if self._http is not None:
-            with contextlib.suppress(Exception):
-                self._http.close()
-        if self._delete_on_stop:
-            self._cleanup_quietly()
-
-    def __del__(self) -> None:  # pragma: no cover
-        with contextlib.suppress(Exception):
-            self.stop()
-
-    def _cleanup_quietly(self) -> None:
+        del purge
         with contextlib.suppress(Exception):
             self._core.delete_namespaced_pod(
                 self._pod_name,
                 self._namespace,
-                grace_period_seconds=30,
+                grace_period_seconds=0,
                 propagation_policy="Background",
             )
 
-    def execute(self, command: str, timeout: int | None = None) -> ExecuteResponse:
-        self.touch()
-        timeout_seconds = timeout if timeout is not None else DEFAULT_EXEC_TIMEOUT
+    # ── Commands ───────────────────────────────────────────────────────
 
-        if self._mode == "http":
-            return self._execute_http(command, timeout_seconds)
-        return self._execute_api(command, timeout_seconds)
+    def _exec(self, argv: Sequence[str]) -> Any:
+        from kubernetes.stream import stream
 
-    def edit(
-        self, path: str, old_string: str, new_string: str, replace_all: bool = False
-    ) -> EditResult:
-        """Edit a file by fetching it, replacing in Python and writing it back."""
-        self.touch()
-        content = self.read_bytes(path).decode("utf-8", errors="replace")
-        if not content:
-            return EditResult(error=f"File '{path}' not found")
-
-        outcome = replace_in_content(content, old_string, new_string, replace_all)
-        if not isinstance(outcome, Replacement):
-            return EditResult(error=outcome)
-
-        written = self.write(path, outcome.content)
-        if written.error is not None:
-            return EditResult(error=written.error)
-        return EditResult(path=path, occurrences=outcome.occurrences)
-
-    def _execute_http(self, command: str, timeout_seconds: int) -> ExecuteResponse:
-        try:
-            r = self._http.post(
-                "/exec",
-                json={"command": command, "timeout_seconds": timeout_seconds},
-                timeout=timeout_seconds + 5,
-            )
-            r.raise_for_status()
-        except Exception as exc:
-            return ExecuteResponse(output=f"Error: {exc}", exit_code=1, truncated=False)
-
-        body = r.json()
-        return ExecuteResponse(
-            output=body.get("output", "")[:MAX_EXECUTE_OUTPUT_BYTES],
-            exit_code=body.get("exit_code"),
-            truncated=bool(body.get("truncated")),
+        return stream(
+            self._core.connect_get_namespaced_pod_exec,
+            self._pod_name,
+            self._namespace,
+            command=list(argv),
+            stderr=True,
+            stdin=False,
+            stdout=True,
+            tty=False,
+            _preload_content=False,
         )
 
-    def _execute_api(self, command: str, timeout_seconds: int) -> ExecuteResponse:
-        from kubernetes.stream import stream  # WPS433: lazy
+    async def run_command(
+        self,
+        argv: Sequence[str],
+        *,
+        run_id: str,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        output_limit: int | None = None,
+    ) -> CommandOutcome:
+        """Run `argv` in the pod with stdin at EOF; see `CommandRunner.run_command`.
 
-        # Wrap with timeout so a hung command can't hang us forever.
-        # Requires `timeout` (coreutils / BusyBox) and `/bin/sh` in the
-        # image; absent on distroless. See the class docstring (`mode`).
-        wrapped = ["timeout", str(timeout_seconds), "sh", "-c", command]
+        Raises:
+            SandboxUnavailableError: The pod is gone, before or during the command.
+        """
+        if not argv:
+            raise ValueError("argv must name a program")
+        self.touch()
+        assignments = [f"{name}={value}" for name, value in (env or {}).items()]
+        command = [
+            "sh",
+            "-c",
+            _CD_THEN_EXEC,
+            "sh",
+            self._work_dir,
+            "env",
+            *assignments,
+            *wrapped_argv(argv, run_id),
+        ]
+        sink = Sink(output_limit if output_limit is not None else MAX_RUN_OUTPUT_BYTES)
+        stopped = threading.Event()
         try:
-            resp = stream(
-                self._core.connect_get_namespaced_pod_exec,
-                self._pod_name,
-                self._namespace,
-                command=wrapped,
-                stderr=True,
-                stdin=False,
-                stdout=True,
-                tty=False,
-                _preload_content=False,
-            )
-        except Exception as exc:
-            return ExecuteResponse(output=f"Error: {exc}", exit_code=1, truncated=False)
+            response = await anyio.to_thread.run_sync(self._exec, command)
+        except Exception as error:
+            raise self._translate(error) from error
 
-        # `close` in `finally`: the read loop below can raise on a dropped
-        # connection, and the websocket would then stay open for the life of the
-        # process — one leaked socket per failed command.
+        finished = False
+        exit_code: int | None = None
         try:
-            output = bytearray()
-            while resp.is_open() and len(output) < MAX_EXECUTE_OUTPUT_BYTES:
-                resp.update(timeout=1)
-                if resp.peek_stdout():
-                    output.extend(resp.read_stdout().encode("utf-8", errors="replace"))
-                if resp.peek_stderr():
-                    output.extend(resp.read_stderr().encode("utf-8", errors="replace"))
-            # `1` for an unknown status, never `0`. The loop also exits once the
-            # output cap is hit, with the command still running and no return
-            # code yet — reporting that as success told the caller a truncated
-            # command had passed. `LocalBackend` already defaults to `1`.
-            exit_code = resp.returncode if resp.returncode is not None else 1
-        except Exception as exc:
-            return ExecuteResponse(output=f"Error: {exc}", exit_code=1, truncated=False)
+            with anyio.move_on_after(timeout) as deadline:
+                await anyio.to_thread.run_sync(
+                    functools.partial(_drain, response, sink, stopped), abandon_on_cancel=True
+                )
+            finished = not (deadline.cancelled_caught or sink.over_limit)
+            if finished:
+                # Read before the close below: the status arrives on its own channel.
+                exit_code = response.returncode
+            else:
+                stdout, stderr = sink.text(partial=True)
+                return CommandOutcome(
+                    stdout=stdout,
+                    stderr=stderr,
+                    timed_out=deadline.cancelled_caught,
+                    output_limited=not deadline.cancelled_caught,
+                )
+        except Exception as error:
+            raise self._translate(error) from error
         finally:
+            if not finished:
+                stopped.set()
+                await self.stop_command(run_id)
             with contextlib.suppress(Exception):
-                resp.close()
+                response.close()
 
-        truncated = len(output) >= MAX_EXECUTE_OUTPUT_BYTES
-        return ExecuteResponse(
-            output=bytes(output[:MAX_EXECUTE_OUTPUT_BYTES]).decode("utf-8", errors="replace"),
-            exit_code=exit_code,
-            truncated=truncated,
-        )
+        if exit_code is None or (
+            exit_code > SIGNAL_EXIT_BASE and not await anyio.to_thread.run_sync(self.is_alive)
+        ):
+            raise SandboxUnavailableError(f"pod {self._pod_name} went away during the command")
+        stdout, stderr = sink.text(partial=False)
+        return CommandOutcome(stdout=stdout, stderr=stderr, exit_code=exit_code)
 
-    def read_bytes(self, path: str) -> bytes:
-        # Match LocalBackend semantics: return b"" on missing / transport /
-        # validation errors. The console toolset's context-file probe walks
-        # well-known paths (/AGENTS.md, /SOUL.md, ...) on every turn; if we
-        # encoded the error as bytes here, the probe would treat the error
-        # string as legit file content and inject it into the system prompt.
-        self.touch()
-        if self._mode == "http":
+    async def stop_command(self, run_id: str) -> None:
+        """Stop the command started under `run_id`, and everything it started.
+
+        Best effort: the caller is already leaving with its own outcome.
+        """
+
+        def stop() -> None:
+            response = self._exec(["sh", "-c", STOPPER, "sh", pid_file(run_id)])
             try:
-                r = self._http.post("/read", json={"path": path, "offset": 0, "limit": 10**9})
-            except Exception:
-                return b""
-            if r.status_code >= 400:
-                return b""
-            content: str = r.json().get("content", "") or ""
-            return content.encode("utf-8")
-        return super().read_bytes(path)
+                response.run_forever(timeout=STOP_GRACE_SECONDS)
+            finally:
+                response.close()
 
-    def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
-        # Match LocalBackend: return "Error: ..." strings rather than raise.
-        # The upstream read_file tool wrapper (str_replace edit_format) does
-        # not catch exceptions; anything raised here propagates through the
-        # capability layer and kills the agent run.
-        self.touch()
-        if self._mode == "http":
-            try:
-                r = self._http.post("/read", json={"path": path, "offset": offset, "limit": limit})
-            except Exception as exc:
-                return f"Error: {exc}"
-            if r.status_code == 404:
-                return f"Error: File '{path}' not found"
-            if r.status_code >= 400:
-                return f"Error: HTTP {r.status_code}"
-            text: str = r.json().get("content", "") or ""
-            return text
-        return super().read(path, offset, limit)
+        with (
+            anyio.CancelScope(shield=True),
+            anyio.move_on_after(STOP_GRACE_SECONDS),
+            contextlib.suppress(Exception),
+        ):
+            await anyio.to_thread.run_sync(stop, abandon_on_cancel=True)
 
-    def ls_info(self, path: str) -> list[FileInfo]:
-        # LocalBackend.ls_info returns [] on missing / out-of-workspace; mirror
-        # so the run survives a model probing a bogus path.
-        self.touch()
-        if self._mode == "http":
-            try:
-                r = self._http.post("/ls", json={"path": path})
-            except Exception:
-                return []
-            if r.status_code >= 400:
-                return []
-            return [_to_file_info(row) for row in r.json()]
-        return super().ls_info(path)
+    def _translate(self, error: BaseException) -> BaseException:
+        """An API answer meaning the pod is gone, as that; anything else as is."""
+        from kubernetes.client.rest import ApiException
 
-    def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
-        self.touch()
-        if self._mode == "http":
-            try:
-                r = self._http.post("/glob", json={"pattern": pattern, "path": path})
-            except Exception:
-                return []
-            if r.status_code >= 400:
-                return []
-            return [_to_file_info(row) for row in r.json()]
-        return super().glob_info(pattern, path)
+        if isinstance(error, ApiException) and error.status in (404, 410):
+            return SandboxUnavailableError(f"pod {self._pod_name} is gone: {error.reason}")
+        return error
 
-    def write(self, path: str, content: str | bytes) -> WriteResult:
-        self.touch()
-        if self._mode == "http":
-            try:
-                raw = content if isinstance(content, bytes) else content.encode("utf-8")
-                payload = base64.b64encode(raw).decode("ascii")
-                r = self._http.post("/write", json={"path": path, "content_b64": payload})
-                r.raise_for_status()
-            except Exception as exc:
-                return WriteResult(error=f"Error: {exc}")
-            return WriteResult(path=path)
-        return super().write(path, content)
+
+def _drain(response: Any, sink: Sink, stopped: threading.Event) -> None:
+    """Copy an exec's channels into `sink` until it ends, overflows or is stopped."""
+    while response.is_open() and not stopped.is_set():
+        response.update(timeout=POLL_SECONDS)
+        out = response.read_stdout() if response.peek_stdout() else None
+        err = response.read_stderr() if response.peek_stderr() else None
+        if not sink.add(
+            out.encode("utf-8", errors="replace") if out else None,
+            err.encode("utf-8", errors="replace") if err else None,
+        ):
+            return
 
 
 def _detect_in_cluster() -> bool:
@@ -446,11 +375,8 @@ def _detect_in_cluster() -> bool:
 def _sanitize_pod_name(raw: str, *, prefix: str = "pab-sandbox-") -> str:
     """DNS-1123: lowercase, digits, hyphen; max 63 chars, must start+end alnum."""
     cleaned = "".join(c if (c.isalnum() or c == "-") else "-" for c in raw.lower())
-    cleaned = cleaned.strip("-")
-    if not cleaned:
-        cleaned = uuid.uuid4().hex
-    name = f"{prefix}{cleaned}"
-    return name[:63].rstrip("-") or f"{prefix}{uuid.uuid4().hex[:8]}"
+    cleaned = cleaned.strip("-") or uuid.uuid4().hex
+    return f"{prefix}{cleaned}"[:63].rstrip("-")
 
 
 def _build_pod_body(
@@ -458,107 +384,43 @@ def _build_pod_body(
     name: str,
     image: str,
     namespace: str,
-    port: int,
-    mode: str,
-    exec_token: str,
+    work_dir: str,
     extra_labels: dict[str, str],
     extra_env: dict[str, str],
     service_account_name: str,
     override: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    """The pod to create: `override` with our parts filled in, or a hardened default."""
     if override is not None:
-        # Per the docstring, the override is "your spec, used verbatim
-        # with image / env / labels / ports filled in". Honour that
-        # contract: the user's pod spec wins on everything except the
-        # bits the sandbox client itself needs to talk to the pod.
+        # The caller's spec wins on everything except what a sandbox has to
+        # control: its name, its image and the labels that find it.
         body: dict[str, Any] = copy.deepcopy(override)
         meta = body.setdefault("metadata", {})
         meta["name"] = name
         meta.setdefault("namespace", namespace)
         labels = meta.setdefault("labels", {})
         labels.setdefault("app", "pab-sandbox")
-        for k, v in extra_labels.items():
-            labels.setdefault(k, v)
-
-        spec = body.setdefault("spec", {})
-        containers = spec.setdefault("containers", [{}])
-        container = containers[0]
+        for key, value in extra_labels.items():
+            labels.setdefault(key, value)
+        container = body.setdefault("spec", {}).setdefault("containers", [{}])[0]
         container["image"] = image
         container.setdefault("name", "sandbox")
-
         env_list: list[dict[str, str]] = list(container.get("env") or [])
-        env_names = {e.get("name") for e in env_list}
-        for required in (
-            {"name": "SANDBOX_EXEC_TOKEN", "value": exec_token},
-            {"name": "SANDBOX_PORT", "value": str(port)},
-            {"name": "PYTHONUNBUFFERED", "value": "1"},
-        ):
-            if required["name"] not in env_names:
-                env_list.append(required)
-        for k, v in extra_env.items():
-            if k not in env_names:
-                env_list.append({"name": k, "value": v})
+        named = {entry.get("name") for entry in env_list}
+        env_list.extend(
+            {"name": key, "value": value} for key, value in extra_env.items() if key not in named
+        )
         container["env"] = env_list
-
-        if mode == "http":
-            ports = container.setdefault("ports", [])
-            if not any(p.get("containerPort") == port for p in ports):
-                ports.append({"containerPort": port, "name": "exec"})
-            container.setdefault(
-                "readinessProbe",
-                {
-                    "httpGet": {"path": "/health", "port": port},
-                    "initialDelaySeconds": 1,
-                    "periodSeconds": 2,
-                    "failureThreshold": 5,
-                },
-            )
         return body
-
-    default_labels = {"app": "pab-sandbox", **extra_labels}
-    default_env: list[dict[str, str]] = [
-        {"name": "SANDBOX_EXEC_TOKEN", "value": exec_token},
-        {"name": "SANDBOX_PORT", "value": str(port)},
-        {"name": "PYTHONUNBUFFERED", "value": "1"},
-    ]
-    for k, v in extra_env.items():
-        default_env.append({"name": k, "value": v})
-
-    default_container: dict[str, Any] = {
-        "name": "sandbox",
-        "image": image,
-        "imagePullPolicy": "IfNotPresent",
-        "env": default_env,
-        "securityContext": {
-            "allowPrivilegeEscalation": False,
-            "readOnlyRootFilesystem": True,
-            "runAsNonRoot": True,
-            "runAsUser": 1000,
-            "runAsGroup": 1000,
-            "capabilities": {"drop": ["ALL"]},
-        },
-        "resources": {
-            "requests": {"memory": "256Mi", "cpu": "100m"},
-            "limits": {"memory": "768Mi", "cpu": "1"},
-        },
-        "volumeMounts": [
-            {"name": "workspace", "mountPath": "/workspace"},
-            {"name": "tmp", "mountPath": "/tmp"},
-        ],
-    }
-    if mode == "http":
-        default_container["ports"] = [{"containerPort": port, "name": "exec"}]
-        default_container["readinessProbe"] = {
-            "httpGet": {"path": "/health", "port": port},
-            "initialDelaySeconds": 1,
-            "periodSeconds": 2,
-            "failureThreshold": 5,
-        }
 
     return {
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {"name": name, "namespace": namespace, "labels": default_labels},
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {"app": "pab-sandbox", **extra_labels},
+        },
         "spec": {
             "restartPolicy": "Never",
             "automountServiceAccountToken": False,
@@ -572,22 +434,39 @@ def _build_pod_body(
                 "fsGroup": 1000,
                 "seccompProfile": {"type": "RuntimeDefault"},
             },
-            "containers": [default_container],
+            "containers": [
+                {
+                    "name": "sandbox",
+                    "image": image,
+                    "imagePullPolicy": "IfNotPresent",
+                    # Commands are exec'd into it, so it only has to stay up.
+                    "command": ["sleep", "infinity"],
+                    "workingDir": work_dir,
+                    "env": [
+                        {"name": "PYTHONUNBUFFERED", "value": "1"},
+                        *({"name": key, "value": value} for key, value in extra_env.items()),
+                    ],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                        "runAsNonRoot": True,
+                        "runAsUser": 1000,
+                        "runAsGroup": 1000,
+                        "capabilities": {"drop": ["ALL"]},
+                    },
+                    "resources": {
+                        "requests": {"memory": "256Mi", "cpu": "100m"},
+                        "limits": {"memory": "768Mi", "cpu": "1"},
+                    },
+                    "volumeMounts": [
+                        {"name": "workspace", "mountPath": work_dir},
+                        {"name": "tmp", "mountPath": "/tmp"},
+                    ],
+                }
+            ],
             "volumes": [
                 {"name": "workspace", "emptyDir": {"sizeLimit": "1Gi"}},
                 {"name": "tmp", "emptyDir": {"sizeLimit": "256Mi"}},
             ],
         },
     }
-
-
-def _to_file_info(row: dict[str, Any]) -> FileInfo:
-    return FileInfo(
-        name=row.get("name", ""),
-        path=row.get("path", ""),
-        is_dir=bool(row.get("is_dir", False)),
-        size=row.get("size"),
-        # The in-pod server ships with the user's image, so an older one simply
-        # does not send this yet.
-        modified_at=row.get("modified_at"),
-    )

@@ -17,7 +17,7 @@ def missing(monkeypatch: pytest.MonkeyPatch):
 
 class TestLoad:
     def test_installed_module_is_returned(self):
-        assert _optional.load("httpx", purpose="RemoteSandbox").__name__ == "httpx"
+        assert _optional.load("httpx", purpose="WorkspaceArchive").__name__ == "httpx"
 
     def test_error_names_the_extra_and_the_purpose(self, missing):
         with pytest.raises(ImportError) as excinfo:

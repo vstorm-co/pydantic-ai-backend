@@ -9,15 +9,17 @@ Example with the default Docker backend:
 
     manager = SessionManager(default_runtime="python-datascience")
     sandbox = await manager.get_or_create("user-123")
-    result = sandbox.execute("python script.py")
+    outcome = await sandbox.run_command(["python", "script.py"], run_id=uuid.uuid4().hex)
     await manager.release("user-123")
     ```
 
 Example with a custom factory:
     ```python
-    from pydantic_ai_backends import DaytonaSandbox, SessionManager
+    from pydantic_ai_backends import KubernetesPodSandbox, SessionManager
 
-    manager = SessionManager(sandbox_factory=lambda sid: DaytonaSandbox(sandbox_id=sid))
+    manager = SessionManager(
+        sandbox_factory=lambda sid: KubernetesPodSandbox(image="python:3.12-slim", sandbox_id=sid)
+    )
     sandbox = await manager.get_or_create("user-123")
     ```
 """
@@ -52,7 +54,7 @@ DEFAULT_CLEANUP_INTERVAL = 300
 LEGACY_ACTIVITY_ATTR = "_last_activity"
 LEGACY_IDLE_TIMEOUT_ATTR = "_idle_timeout"
 """Attributes read as a fallback: custom factory sandboxes were documented
-against these before `BaseSandbox` exposed `last_activity` and `touch`."""
+against these before the sandboxes exposed `last_activity` and `touch`."""
 
 
 @dataclass

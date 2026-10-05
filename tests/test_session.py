@@ -938,7 +938,7 @@ class TestShutdownStopsSessionsConcurrently:
 
 
 class AsyncSandbox:
-    """A natively async sandbox, the shape `AsyncBaseSandbox` gives you."""
+    """A natively async sandbox: one whose lifecycle methods await."""
 
     def __init__(self, session_id: str) -> None:
         self._id = session_id
@@ -1076,8 +1076,8 @@ class TestReleaseIsSerializedWithCreation:
 
         The await is the whole point: `DockerSandbox.is_alive` is synchronous, so
         `get_or_create` never suspends inside its critical section for one and
-        the race is invisible. An `AsyncBaseSandbox` subclass — an SSH or HTTP
-        probe, `RemoteSandbox` over a slow link — does suspend there.
+        the race is invisible. A sandbox probed over SSH or HTTP, or across a
+        slow link, does suspend there.
         """
 
         built = 0

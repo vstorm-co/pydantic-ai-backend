@@ -1,48 +1,25 @@
-# Remote API
+# sandboxd API
 
-Client and service for sandboxes that live in another process. See
-[Remote Sandboxes](../concepts/remote.md) for the concepts and the security
-model.
-
-## RemoteSandbox
-
-Needs the `remote` extra (`httpx`).
-
-::: pydantic_ai_backends.remote.client.RemoteSandbox
-    options:
-      show_root_heading: true
-      members:
-        - __init__
-        - session_id
-        - start
-        - stop
-        - is_alive
-        - resource_usage
-        - execute
-        - read
-        - read_bytes
-        - write
-        - edit
-        - exists
-        - ls_info
-        - glob_info
-        - grep_raw
+The sandbox service and the read-only archive of what its sessions left behind.
+See [sandboxd](../concepts/remote.md) for the concepts and the security model; the
+client is [`SandboxdWorkspace`](workspaces.md#sandboxdworkspace).
 
 ## WorkspaceArchive
 
 Read-only view of the files sessions left behind, with no sandbox running. Needs
 the `remote` extra.
 
-::: pydantic_ai_backends.remote.client.WorkspaceArchive
+::: pydantic_ai_backends.remote.archive.WorkspaceArchive
     options:
       show_root_heading: true
       members:
         - __init__
         - ls
         - read
+        - read_bytes
         - close
 
-::: pydantic_ai_backends.remote.client.WorkspaceArchiveError
+::: pydantic_ai_backends.remote.archive.WorkspaceArchiveError
     options:
       show_root_heading: true
 
@@ -105,6 +82,8 @@ The HTTP contract as Pydantic models — one source of truth for both sides.
       show_root_heading: false
       members:
         - CreateSessionRequest
+        - RunRequest
+        - RunResponse
         - SessionCreated
         - SessionInfo
         - SessionList

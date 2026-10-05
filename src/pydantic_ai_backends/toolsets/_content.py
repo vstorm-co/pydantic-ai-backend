@@ -12,8 +12,7 @@ import io
 from pydantic_ai import BinaryContent
 
 from pydantic_ai_backends._optional import load_optional
-from pydantic_ai_backends.adapter import ensure_async
-from pydantic_ai_backends.protocol import AsyncBackendProtocol, BackendProtocol
+from pydantic_ai_backends.toolsets._workspace import FileOps
 
 IMAGE_EXTENSIONS: frozenset[str] = frozenset({"png", "jpg", "jpeg", "gif", "webp"})
 """Extensions recognized as images when image_support is enabled."""
@@ -60,7 +59,7 @@ def file_extension(path: str) -> str:
 
 
 async def image_content(
-    backend: BackendProtocol | AsyncBackendProtocol,
+    backend: FileOps,
     path: str,
     max_image_bytes: int,
 ) -> BinaryContent | str | None:
@@ -84,7 +83,7 @@ async def image_content(
 
 
 async def document_content(
-    backend: BackendProtocol | AsyncBackendProtocol,
+    backend: FileOps,
     path: str,
     max_document_bytes: int,
 ) -> BinaryContent | str | None:
@@ -130,7 +129,7 @@ def downscale_image(data: bytes, max_dim: int = DEFAULT_MAX_IMAGE_DIMENSION) -> 
 
 
 async def _read_within_limit(
-    backend: BackendProtocol | AsyncBackendProtocol,
+    backend: FileOps,
     path: str,
     max_bytes: int,
     kind: str,
@@ -138,12 +137,12 @@ async def _read_within_limit(
     """Read raw bytes, refusing a missing, empty or oversized file.
 
     Args:
-        backend: Backend to read from.
+        backend: Operations to read through.
         path: File path to read.
         max_bytes: Largest acceptable size.
         kind: Content kind (`"Image"`, `"Document"`) for the error message.
     """
-    raw = await ensure_async(backend).read_bytes(path)
+    raw = await backend.read_bytes(path)
     if not raw:
         return f"Error: {kind} file '{path}' not found or empty"
     if len(raw) > max_bytes:

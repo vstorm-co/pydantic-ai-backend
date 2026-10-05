@@ -7,6 +7,185 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.32] - 2026-10-05
+
+### Added
+
+- **`SandboxdWorkspace(session_name=...)` and `DaytonaWorkspace(sandbox_name=...)`.**
+  The workspace is named by whoever configures it rather than by the provider: a
+  run with no ref opens it under the name, or attaches when it exists, so an
+  application can key a session on its own record - a conversation, a user -
+  without storing a ref first. `DockerWorkspace(container_name=...)` did this for
+  Docker in 0.2.31. Two clients opening one name at once end up in one session.
+  A ref is still attach-only, so a run that knows the session existed hears it is
+  gone instead of starting over in an empty one, and a ref naming anything else
+  is left to another capability.
+
+- **`ConfinedWorkspace`.** Pydantic AI's local workspace confines nothing, so moving from
+  `LocalBackend(root_dir=...)` to it let the file tools - which usually run without
+  approval - write anywhere the process can. `ConfinedWorkspace` wraps any workspace and
+  refuses a file operation whose real path, symlinks followed, leaves its working directory,
+  with `WorkspacePathError` (a `PermissionError`); the console's `glob` and `grep` check
+  their search root the same way. Commands are not confined: isolate those with a sandbox.
+
+### Fixed
+
+- **`grep` on macOS searched only the top directory.** BSD grep matches `--exclude-dir`
+  against the path it walks, `./src`, and the hidden-directory pattern `.[!.]*` matched every
+  such path, so with `ignore_hidden` (the default) nothing below the search root was found.
+  Two patterns now cover GNU grep, which tests a directory's base name, and BSD grep.
+
+- **The `console` extra installs `chardet`.** `read_file` decodes every text file
+  through encoding detection, and `chardet` came only with the `docker` and `server`
+  extras - so an application installing `console` without them, as one whose sandboxes
+  run elsewhere does, had every read answered "chardet is required".
+
+## [0.2.31] - 2026-10-05
+
+### Added
+
+- **`DockerWorkspace(volumes=..., container_name=...)`.** `volumes` mounts host
+  directories into the container, so an agent can work on a project in place.
+  `container_name` gives every run the same container, named by whoever
+  configures the workspace: created on first use, attached after, by this
+  process or the next. A ref naming it must still find it there, and no ref
+  reaches another container through it. Both were reachable only by building
+  `DockerWorkspaceBackend` with a sandbox factory of your own.
+
+### Fixed
+
+- **The package ships `py.typed`.** Its annotations were invisible to type
+  checkers in projects that install it, which read every name as `Any`.
+
+## [0.2.30] - 2026-10-05
+
+**⚠️ Breaking: the library is now built on Pydantic AI workspaces.** Pydantic AI
+2.52 gave every tool one environment to work in, `ctx.workspace`, with its own
+file and command contract. This library had a second one — `BackendProtocol`
+and its backends — so every tool, adapter and sandbox existed twice. That
+abstraction is gone: the sandboxes are now workspaces, and the console tools
+work in whichever workspace a run has, including the harness's E2B, Modal and
+Sprites. `pydantic-ai-slim>=2.52.0` is the floor for the `console` and
+`workspaces` extras. See the "Workspaces" page for the model, and below for
+what replaces each removed name.
+
+### Added
+
+- **Five workspace capabilities**, in `pydantic_ai_backends.workspaces` and the
+  package root: `DockerWorkspace` (a container on this host), `SandboxdWorkspace`
+  (a `sandboxd` session, so the agent's process holds no Docker socket),
+  `KubernetesWorkspace` (a pod, through `pods/exec`), `DaytonaWorkspace` (a
+  Daytona sandbox) and `StateWorkspace` (a `StateBackend` document, files only).
+  Each is created on first use, attached again by its ref on a later run, never
+  deleted for you (`await capability.destroy(ref)`), and fails with
+  `WorkspaceUnavailableError` when its environment is gone rather than
+  continuing in an empty one. `DockerWorkspace` and `SandboxdWorkspace` pass
+  Pydantic AI's `WorkspaceBackendSuite` against a real Docker daemon;
+  `StateWorkspace` passes its filesystem rules in CI. The Kubernetes and
+  Daytona suites run behind `-m kubernetes` / `-m daytona` and are not yet
+  verified against a live cluster or account. A ref is input — it arrives with
+  the message history — so `DockerWorkspace` attaches to and destroys only
+  containers named the way it names its own, never another container on the
+  host.
+- **Commands that stop with everything they started.** Every command-capable
+  workspace runs commands through a small wrapper that records the command's
+  process group, so a timeout or a cancelled run stops the command and its
+  children with a second command. stdout and stderr come back apart,
+  `WorkspaceTimeoutError` carries partial output, and output past 10 MiB raises
+  `WorkspaceOutputLimitError`.
+- **`sandboxd` runs commands for a workspace: `POST /sessions/{id}/run`** takes
+  an argv, `env` and a `run_id`, keeps stdout and stderr apart and answers `410`
+  for a vanished sandbox, including one that died between commands and whose
+  files died with it (no `workspace_root`, no persisted container) rather than
+  replacing it with an empty one. A persisted container is started again but
+  never recreated, so one that was removed is a `410` too; `POST /sessions/{id}/runs/{run_id}/stop` stops a
+  command and its process group. A session open request with `attach` attaches
+  without ever creating, answering `404` when there is nothing left to attach to.
+- **`CommandRunner`, `CommandOutcome` and `SandboxUnavailableError`**: what a
+  sandbox implements to back a container workspace or a `sandboxd` session.
+  `DockerSandbox` and `KubernetesPodSandbox` implement it.
+- **A read-only workspace hides the mutating tools.** On `ReadOnlyWorkspace` or
+  `LocalWorkspace(read_only=True)`, `ConsoleCapability` offers no `write_file`,
+  `edit_file` or `execute`, whatever the ruleset allows.
+- **Permission rules bind however a path is spelled.** The console tools check
+  a path as the model wrote it and as the workspace resolves it against its
+  working directory, so a deny on `/workspace/private/**` also refuses
+  `private/notes.txt`, and command arguments resolve against the same directory.
+  Reads, writes, edits and `grep` matches are also checked where the
+  workspace's `realpath` says the path leads, so a symlink cannot stand in for a
+  denied file.
+  `LocalBackend` resolved paths and links against its root; this keeps that
+  protection on `LocalWorkspace` and gives it to every other workspace.
+- **An unavailable workspace is reported, not read as empty.** With no
+  workspace attached, or its environment gone, `ls`, `glob`, `grep` and an image
+  read answer with that error instead of an empty directory or a missing file.
+
+### Removed
+
+- **`BackendProtocol`, `SandboxProtocol` and their async variants**, with
+  `adapter.py` (`ensure_async` and the sync/async adapters). Tools reach the
+  environment through `ctx.workspace`.
+- **`LocalBackend`**: use Pydantic AI's `LocalWorkspace`, which takes
+  `read_only=` for a directory the agent may only read. It does not confine
+  paths: an absolute path reaches anything the process can, where
+  `LocalBackend(allowed_directories=...)` refused everything outside its
+  directories. Deny what must stay out of reach with a permission ruleset, or
+  use a container workspace for a real boundary.
+- **`CompositeBackend` and `PrefixRouter`**: a run has one workspace. Compose
+  policies around it with Pydantic AI's `WrapperWorkspace`.
+- **`BaseSandbox` and `AsyncBaseSandbox`**: file operations are derived by
+  Pydantic AI's `Workspace` from the shell; a new sandbox implements
+  `CommandRunner`.
+- **`RemoteSandbox`**: use `SandboxdWorkspace`. `WorkspaceArchive` and
+  `WorkspaceArchiveError` moved to `pydantic_ai_backends.remote.archive` and stay
+  importable from the package root.
+- **`DaytonaSandbox`**: use `DaytonaWorkspace`. The `daytona` extra now installs
+  the `daytona` package; the old `daytona-sdk` installed `daytona_sdk`, which the
+  code never imported, so the previous class could not be loaded with its own
+  extra.
+- **`sandboxd` file and exec routes** — `/exec`, `/read`, `/write`, `/edit`,
+  `/ls`, `/glob`, `/grep` and `/exists` under `/sessions/{id}` — and their wire
+  models. `/run` is the one way in; the archive routes under `/workspaces` are
+  unchanged.
+- **The background shell tools** — `run_in_background`, `read_output`,
+  `kill_shell`, `list_shells` — and `ConsoleCapability(include_background=...)`.
+  Pydantic AI's workspace contract has no background processes; a command that
+  must outlive its call can be started through `execute` with its output
+  redirected — `nohup server > server.log 2>&1 &` returns at once.
+- **`ConsoleCapability(backend=...)` and `ConsoleDeps`**: the tools work in the
+  run's workspace, supplied by a workspace capability or `agent.run(workspace=...)`.
+- **`KubernetesPodSandbox`'s HTTP mode**: it reaches the pod only through
+  `pods/exec`, and the default pod runs `sleep infinity`.
+- **`DockerSandbox` file operations** (`read`, `write`, `edit`, `ls_info`,
+  `glob_info`, `grep_raw`, `execute`) and `max_read_bytes`: reach files through
+  a workspace, run commands with `run_command`.
+- **The live file browser in the `sandboxd` dashboard.** The terminal runs
+  through `/run`; files are browsed in the stored workspace.
+
+### Changed
+
+- **`StateBackend` is a document store, not a backend.** It keeps `files` and
+  the `directories` created — both JSON — and follows a filesystem's rules,
+  raising `FileNotFoundError`, `IsADirectoryError` and `NotADirectoryError`.
+  `StateWorkspace` serves documents from a store the application owns. A
+  directory a write or `make_dir` created stays when the last thing in it is
+  removed. A document written by an earlier version loads unchanged.
+
+### Fixed
+
+- **`grep` found nothing on macOS.** BSD `grep` matches `--exclude` against the
+  whole path (`./f.txt`), so excluding hidden files with `.*` excluded every
+  file. Hidden directories are excluded by the shell and hidden files filtered
+  afterwards.
+- **`glob` and `grep` reported "no matches" when the sandbox was unreachable.**
+  Transport failures now surface as errors.
+- **File-read tracking was lost between tool calls** when the tools ran in a
+  workspace. What a toolset has read is now kept per workspace, and released
+  with it, so a long-lived agent does not keep every workspace it worked in.
+- **`grep` on a single file found nothing with GNU grep**, which leaves the file
+  name out for one file; the line then did not parse as a match. `-H` makes it
+  print the name.
+
 ## [0.2.29] - 2026-08-22
 
 ### Fixed
@@ -503,7 +682,7 @@ before upgrading is deferred.
 
   The guard deliberately lets pydantic-ai's control-flow exceptions past — `ModelRetry`, `ApprovalRequired`, `CallDeferred` and the `Skip*` family. Those are not failures, they steer the run, and catching `ModelRetry` in particular would turn a retry into a dead end the model cannot recover from. `UserError` passes through too, because reporting a misuse of the library to the model as a failed file operation hides the bug; it subclasses `RuntimeError`, so the narrower handler this replaced was already swallowing it.
 - **The shell derivation every sandbox depends on is measured.** `BaseSandbox` carried a blanket `# pragma: no cover`, so the command construction and output parsing behind Docker, Daytona, Kubernetes and any third-party sandbox contributed nothing to the 100% gate. Moving it into one module made it directly testable, and it is now covered — including the quoting of a hostile path, `ls` rows with spaces in the name, a `grep` line containing colons, and the failure branch of every operation.
-- **The failure contract is written down.** What a backend must return when an operation fails was real, load-bearing and documented nowhere, so implementors were deducing it from our source. `protocol.py` now states it per method, including the asymmetry that matters most: `read` may return an `Error: ` string but `read_bytes` must return `b""`, because its caller cannot tell an error message from real file content — a probe staging a screenshot would treat `b"Error: not found"` as the image.
+- **The failure contract is written down.** What a backend must return when an operation fails was real, load-bearing and documented nowhere, so implementers were deducing it from our source. `protocol.py` now states it per method, including the asymmetry that matters most: `read` may return an `Error: ` string but `read_bytes` must return `b""`, because its caller cannot tell an error message from real file content — a probe staging a screenshot would treat `b"Error: not found"` as the image.
 
 - **`SandboxdConfig(container_ttl=...)`** removes a persisted sandbox container that has been stopped for that long, leaving its workspace untouched. It separates the two things a session accumulates: what it *installed* is rebuildable, what it *wrote* is not — so a deployment can reclaim the first on a schedule while keeping an agent's files for ever, which is what its user expects. `workspace_ttl` remains the opposite knob and stays `None` by default. The sweep finds containers by their name prefix rather than from a record of its own, because after a restart Docker is the only source of what is still lying around.
 - **`SandboxdConfig(evict_idle_after=...)`** turns the session ceiling from a hard cap on how many sessions may exist into a working-set size. At the ceiling the least recently used session idle for at least that long is closed to make room, instead of the incoming request being refused — which was the wrong answer when the pool was full of sandboxes nobody was using. With `workspace_root` set the evicted session loses nothing but its container: its next request re-attaches and finds its files, for the price of a container start. A session idle for less than the threshold is never a candidate, because killing an agent's work to serve somebody else's first request is worse than making them wait, and a pool of genuinely busy sessions still answers `429`. Requires `workspace_root`, and the config refuses without it rather than silently discarding an evicted session's files.

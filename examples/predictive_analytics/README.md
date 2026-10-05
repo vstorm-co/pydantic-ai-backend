@@ -1,6 +1,6 @@
 # Predictive Analytics Demo
 
-PydanticAI agent with Docker sandbox for data science predictions.
+Pydantic AI agent with a Docker workspace for data science predictions.
 
 ![3 products comparison — historical trends + 6-month forecast](../../assets/3_products_example.png)
 
@@ -16,16 +16,16 @@ A chat-based analytics assistant that can:
 
 ## Architecture
 
-![Architecture diagram — backends, toolsets, and sandbox](../../assets/architecture.png)
+![pydantic-ai-backend by layer: the agent's tools call ctx.workspace, Pydantic AI's contract, and a workspace from this library or from Pydantic AI answers it](../../assets/architecture.png)
 
 ```
 Browser (HTML/JS + Chart.js)
     | WebSocket
 FastAPI Server
     |
-PydanticAI Agent
+Pydantic AI Agent
     ├── query_data      → reads sales_data.json
-    ├── predict          → sub-agent + DockerSandbox
+    ├── predict          → sub-agent working in a DockerWorkspace container
     └── generate_chart   → LineChartData → Chart.js
 ```
 
@@ -66,7 +66,7 @@ First startup pulls `python:3.12-slim` and installs data science packages (panda
 
 | File | Purpose |
 |------|---------|
-| `agent.py` | PydanticAI agent + 3 tools (query_data, predict, generate_chart) |
+| `agent.py` | Pydantic AI agent + 3 tools (query_data, predict, generate_chart) |
 | `server.py` | FastAPI + WebSocket streaming |
 | `models.py` | Pydantic models (LineChartData, AnalyticsDeps) |
 | `data/sales_data.json` | Sample dataset (216 records) |
@@ -76,7 +76,7 @@ First startup pulls `python:3.12-slim` and installs data science packages (panda
 
 1. Main agent calls `predict("Predict Widget Alpha sales for 6 months")`
 2. Sales data is written into the Docker container at `/workspace/sales_data.json`
-3. A sub-agent (PydanticAI) is created with `create_console_toolset()` (read, write, execute)
+3. A sub-agent (Pydantic AI) is created with `create_console_toolset()` (read, write, execute)
 4. Sub-agent writes a Python script using pandas/sklearn
 5. Sub-agent executes the script in Docker
 6. Results flow back to the main agent

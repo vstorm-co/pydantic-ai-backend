@@ -1,130 +1,60 @@
-# Daytona Sandbox
+# Daytona
 
-`DaytonaSandbox` provides cloud-based isolated code execution via [Daytona](https://daytona.io/) ephemeral sandboxes. Sub-90ms startup, no Docker daemon required.
+`DaytonaWorkspace` gives an agent a [Daytona](https://www.daytona.io) sandbox as its
+[workspace](workspaces.md).
 
-!!! warning "Requires Daytona SDK"
-    ```bash
-    pip install pydantic-ai-backend[daytona]
-    ```
-    You also need a Daytona API key — set `DAYTONA_API_KEY` environment variable or pass `api_key=` directly.
+!!! warning "Not checked against a live account in CI"
+    The unit tests drive a fake client. `tests/test_workspace_daytona_conformance.py` runs
+    Pydantic AI's conformance suite against real sandboxes when `DAYTONA_API_KEY` is set:
+    `uv run pytest -m daytona tests/test_workspace_daytona_conformance.py`.
 
-## Basic Usage with pydantic-ai
+```bash
+pip install "pydantic-ai-backend[console,daytona]"
+```
+
+The extra installs the `daytona` package, whose module is `daytona`. The older
+`daytona-sdk` package installs `daytona_sdk` instead, which is why the previous
+`DaytonaSandbox` failed to import with the extra it declared.
+
+## Basic Usage
 
 ```python
-from dataclasses import dataclass
+from daytona import DaytonaConfig
 from pydantic_ai import Agent
-from pydantic_ai_backends import DaytonaSandbox, create_console_toolset
 
+from pydantic_ai_backends import ConsoleCapability, DaytonaWorkspace
 
-@dataclass
-class Deps:
-    backend: DaytonaSandbox
-
-
-# Create cloud sandbox (starts automatically)
-sandbox = DaytonaSandbox(api_key="dtna_...")
-
-try:
-    toolset = create_console_toolset()
-    agent = Agent("openai:gpt-4o", deps_type=Deps)
-    agent = agent.with_toolset(toolset)
-
-    result = agent.run_sync(
-        "Write a Python script that fetches weather data and saves it to a CSV",
-        deps=Deps(backend=sandbox),
-    )
-    print(result.output)
-finally:
-    sandbox.stop()  # Delete the cloud sandbox
+sandboxes = DaytonaWorkspace(config=DaytonaConfig(api_key="dtn_..."))
+agent = Agent("anthropic:claude-opus-5-5", capabilities=[sandboxes, ConsoleCapability()])
 ```
 
-## Authentication
+Without `config`, the SDK reads `DAYTONA_API_KEY`, `DAYTONA_API_URL` and `DAYTONA_TARGET`.
+`create_params` (`CreateSandboxFromSnapshotParams` or `CreateSandboxFromImageParams`)
+shapes a new sandbox.
 
-Daytona requires an API key. You can provide it in two ways:
+The first operation creates a sandbox and records its id as the run's ref. A later run
+attaches to it, starting it when Daytona stopped or archived it; one that is destroyed or
+gone fails with `WorkspaceUnavailableError`. `destroy(ref)` deletes it. Daytona's own
+auto-stop and auto-delete still apply.
+
+`sandbox_name` names the sandbox instead: a run with no ref creates it under that name, or
+attaches to the sandbox that already has it, so an application can key a sandbox on its
+own record without storing a ref first. Its ref carries the name. Two clients creating
+the same name at once end up in one sandbox. A ref is still attach-only, so a sandbox
+deleted meanwhile is `WorkspaceUnavailableError` rather than a new one.
 
 ```python
-# Option 1: Environment variable (recommended)
-import os
-
-os.environ["DAYTONA_API_KEY"] = "dtna_..."
-sandbox = DaytonaSandbox()
-
-# Option 2: Direct parameter
-sandbox = DaytonaSandbox(api_key="dtna_...")
+sandboxes = DaytonaWorkspace(config=config, sandbox_name=f"conv-{conversation_id}")
 ```
 
-## Configuration
+## How a command runs
 
-```python
-sandbox = DaytonaSandbox(
-    api_key="dtna_...",  # API key (or DAYTONA_API_KEY env var)
-    work_dir="/home/daytona",  # Working directory (default)
-    startup_timeout=180,  # Max seconds to wait for sandbox ready
-)
-```
+As a synchronous session command, the one Daytona API that reports stdout and stderr apart
+along with the exit code. Each command runs as its own `sh`, so nothing a command does to
+the session's shell carries into the next one, with stdin at `/dev/null`. A command whose
+caller times out or is cancelled is stopped by a second command that signals its process
+group. Daytona answers a session command only once it ends, so a timed-out command comes
+back with no partial output.
 
-## How It Works
-
-`DaytonaSandbox` extends [`BaseSandbox`][pydantic_ai_backends.backends.base.BaseSandbox], inheriting shell-based implementations of `ls_info`, `read`, `glob_info`, and `grep_raw`. It overrides:
-
-| Method | Implementation |
-|--------|---------------|
-| `execute()` | Daytona SDK `sandbox.process.exec()` |
-| `_read_bytes()` | Daytona native file download API |
-| `write()` | Daytona native file upload API |
-| `edit()` | Read → Python string replace → write |
-
-Native file APIs are more efficient than shell-based alternatives for binary content and large files.
-
-## Daytona vs Docker
-
-| Feature | `DaytonaSandbox` | `DockerSandbox` |
-|---------|-----------------|----------------|
-| Infrastructure | Cloud (Daytona platform) | Local Docker daemon |
-| Startup time | Sub-90ms | Seconds (image pull + start) |
-| Setup required | API key only | Docker installed + running |
-| Isolation | Cloud VM | Container |
-| Persistence | Ephemeral | Ephemeral (volumes optional) |
-| Cost | Daytona pricing | Free (local resources) |
-| Runtimes | Default environment | Custom `RuntimeConfig` |
-| Best for | CI/CD, serverless, cloud deployments | Local development, self-hosted |
-
-## Lifecycle Management
-
-```python
-sandbox = DaytonaSandbox(api_key="dtna_...")
-
-# Check if sandbox is responsive
-if sandbox.is_alive():
-    result = sandbox.execute("python --version")
-    print(result.output)
-
-# Clean up when done
-sandbox.stop()
-```
-
-The sandbox is also cleaned up automatically via `__del__` when the object is garbage collected.
-
-## Error Handling
-
-```python
-from pydantic_ai_backends import DaytonaSandbox
-
-# Missing API key
-try:
-    sandbox = DaytonaSandbox()  # No key in env either
-except ValueError as e:
-    print(e)  # "Daytona API key is required..."
-
-# Sandbox startup timeout
-try:
-    sandbox = DaytonaSandbox(api_key="dtna_...", startup_timeout=5)
-except RuntimeError as e:
-    print(e)  # "Daytona sandbox failed to start within 5 seconds"
-```
-
-## Next Steps
-
-- [Backends Overview](backends.md) - Compare all backends
-- [Docker Sandbox](docker.md) - Local alternative with Docker
-- [Console Toolset](console-toolset.md) - Ready-to-use tools for agents
+Without `client=`, each operation opens and closes its own `AsyncDaytona`; pass one you own
+to share its connection across runs.

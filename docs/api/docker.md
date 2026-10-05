@@ -2,38 +2,25 @@
 
 ## DockerSandbox
 
+The container `DockerWorkspace` runs on. Use it directly to manage containers
+yourself; it runs commands through the [`CommandRunner`][pydantic_ai_backends.protocol.CommandRunner]
+protocol and has no file operations of its own — reach files through a workspace.
+
 ::: pydantic_ai_backends.backends.docker.sandbox.DockerSandbox
     options:
       show_root_heading: true
       members:
         - __init__
         - runtime
+        - id
         - session_id
-        - execute
-        - read
-        - write
-        - ls_info
-        - glob_info
-        - grep_raw
+        - work_dir
         - start
         - stop
         - is_alive
-
-## BaseSandbox
-
-::: pydantic_ai_backends.backends.docker.sandbox.BaseSandbox
-    options:
-      show_root_heading: true
-      members:
-        - __init__
-        - id
-        - execute
-        - ls_info
-        - read
-        - write
-        - edit
-        - glob_info
-        - grep_raw
+        - resource_usage
+        - run_command
+        - stop_command
 
 ## SessionManager
 
@@ -46,6 +33,7 @@
         - release
         - cleanup_idle
         - start_cleanup_loop
+        - stop_cleanup_loop
         - shutdown
         - sessions
         - session_count
@@ -53,7 +41,7 @@
 ## RuntimeConfig
 
 The runtime descriptor (image, setup commands, environment) used by
-[`DockerSandbox`][pydantic_ai_backends.DockerSandbox] and the session manager is
+[`DockerSandbox`][pydantic_ai_backends.backends.docker.sandbox.DockerSandbox], `DockerWorkspace` and the session manager is
 documented in the type reference: [`RuntimeConfig`][pydantic_ai_backends.types.RuntimeConfig].
 
 ## Built-in Runtimes
@@ -65,9 +53,9 @@ from pydantic_ai_backends import BUILTIN_RUNTIMES
 print(sorted(BUILTIN_RUNTIMES))
 
 # Use a runtime
-from pydantic_ai_backends import DockerSandbox
+from pydantic_ai_backends import DockerWorkspace
 
-sandbox = DockerSandbox(runtime="python-datascience")
+workspace = DockerWorkspace(runtime="python-datascience")
 ```
 
 | Runtime | Image | What it adds |

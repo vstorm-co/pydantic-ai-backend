@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
-
-from pydantic_ai_backends import DockerSandbox
+from pydantic_ai.workspaces import Workspace
 
 
 class DataPoint(BaseModel):
@@ -36,5 +35,6 @@ class LineChartData(BaseModel):
 class AnalyticsDeps:
     """Dependencies for the analytics agent."""
 
-    sandbox: DockerSandbox
+    workspace: Workspace
+    """The container the prediction sub-agent writes and runs code in."""
     data_path: str

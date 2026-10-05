@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install mkdocs-material mkdocstrings[python] mkdocs-autorefs
-          pip install -e ".[console,docker]"
+          pip install -e ".[console,docker,workspaces]"
 
       - name: Build and deploy
         run: mkdocs gh-deploy --force

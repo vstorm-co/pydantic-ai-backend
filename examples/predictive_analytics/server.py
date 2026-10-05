@@ -9,7 +9,6 @@ Or:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -29,8 +28,9 @@ from pydantic_ai import (
 )
 from pydantic_ai._agent_graph import End, UserPromptNode
 from pydantic_ai.messages import FunctionToolCallEvent, FunctionToolResultEvent, ModelMessage
+from pydantic_ai.workspaces import Workspace
 
-from pydantic_ai_backends import DockerSandbox
+from pydantic_ai_backends import DockerWorkspace
 
 from .agent import CHART_DATA_PREFIX, analytics_agent
 from .models import AnalyticsDeps
@@ -42,27 +42,24 @@ DATA_PATH = BASE_DIR / "data" / "sales_data.json"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-sandbox: DockerSandbox | None = None
+containers = DockerWorkspace(image="python:3.12-slim")
+workspace: Workspace | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start Docker sandbox on startup, cleanup on shutdown."""
-    global sandbox
-    logger.info("Starting Docker sandbox...")
-    sandbox = DockerSandbox(image="python:3.12-slim")
-    await asyncio.to_thread(sandbox.start)
-    logger.info("Docker sandbox ready — installing data science packages...")
-    result = await asyncio.to_thread(
-        sandbox.execute,
-        "pip install -q pandas numpy scikit-learn 2>&1 | tail -1",
-        timeout=120,
+    """Start a container on startup, remove it on shutdown."""
+    global workspace
+    logger.info("Starting the Docker container...")
+    workspace = Workspace(containers.backend())
+    result = await workspace.run(
+        "pip install -q pandas numpy scikit-learn 2>&1 | tail -1", shell=True, timeout=120
     )
-    logger.info(f"Packages installed: {result.output.strip()}")
+    logger.info(f"Packages installed: {result.stdout.strip()}")
     yield
-    if sandbox:
-        sandbox.stop()
-        logger.info("Docker sandbox stopped")
+    if workspace.ref is not None:
+        await containers.destroy(workspace.ref)
+        logger.info("Docker container removed")
 
 
 app = FastAPI(title="Predictive Analytics Demo", lifespan=lifespan)
@@ -79,7 +76,7 @@ async def root():
 async def health():
     return {
         "status": "ok",
-        "sandbox_alive": sandbox.is_alive() if sandbox else False,
+        "container": workspace.ref.id if workspace is not None and workspace.ref else None,
     }
 
 
@@ -103,8 +100,8 @@ async def websocket_chat(websocket: WebSocket):
             if not user_message:
                 continue
 
-            assert sandbox is not None
-            deps = AnalyticsDeps(sandbox=sandbox, data_path=str(DATA_PATH))
+            assert workspace is not None
+            deps = AnalyticsDeps(workspace=workspace, data_path=str(DATA_PATH))
 
             await websocket.send_json({"type": "start"})
 

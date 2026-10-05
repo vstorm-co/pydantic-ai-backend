@@ -1,29 +1,17 @@
-"""Remote sandboxes over HTTP.
+"""The `sandboxd` service and what an application reads from it.
 
-`RemoteSandbox` lets an application use sandboxes that live in another process,
-so the application itself never needs Docker access. The service on the other
-end is `sandboxd` (:mod:`pydantic_ai_backends.remote.server`), which requires
-the `server` extra; the client only needs `httpx`.
-
-```python
-from pydantic_ai_backends.remote import RemoteSandbox
-
-sandbox = RemoteSandbox("http://sandboxd:8080", token="...")
-print(sandbox.execute("echo hi").output)   # the session opens on first use
-sandbox.stop()
-```
+`sandboxd` (:mod:`pydantic_ai_backends.remote.server`, the `server` extra) owns
+the Docker socket and rents out sandboxes over HTTP; an agent reaches one as a
+Pydantic AI workspace through :class:`~pydantic_ai_backends.workspaces.SandboxdWorkspace`.
 
 :class:`WorkspaceArchive` reads what sessions left behind without starting a
 sandbox at all, so browsing an old conversation's files costs nothing.
 """
 
-from pydantic_ai_backends.remote.client import (
-    RemoteSandbox as RemoteSandbox,
-)
-from pydantic_ai_backends.remote.client import (
+from pydantic_ai_backends.remote.archive import (
     WorkspaceArchive as WorkspaceArchive,
 )
-from pydantic_ai_backends.remote.client import (
+from pydantic_ai_backends.remote.archive import (
     WorkspaceArchiveError as WorkspaceArchiveError,
 )
 from pydantic_ai_backends.remote.wire import (
@@ -36,7 +24,6 @@ from pydantic_ai_backends.remote.wire import (
 __all__ = [
     "SESSION_ID_PATTERN",
     "TOKEN_HEADER",
-    "RemoteSandbox",
     "WorkspaceArchive",
     "WorkspaceArchiveError",
 ]

@@ -1,151 +1,131 @@
-"""In-memory file storage backend."""
+"""A filesystem kept as a JSON document, for a host that stores the document itself."""
 
 from __future__ import annotations
 
 import base64
 import binascii
-import re
+import posixpath
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Literal
 
-from wcmatch import glob as wcglob
-
-from pydantic_ai_backends._editing import Replacement, replace_in_content
-from pydantic_ai_backends._paths import normalize_path, unsafe_path_reason
-from pydantic_ai_backends.types import EditResult, FileData, FileInfo, GrepMatch, WriteResult
-
-
-def is_hidden_path(path: str) -> bool:
-    """Whether any directory or the filename itself starts with a dot."""
-    return path.startswith(".") or "/." in path
+from pydantic_ai_backends.types import FileData
 
 
 class StateBackend:
-    """In-memory file storage backend.
+    """A filesystem kept as a JSON document: files, and the directories created.
 
-    Files live in a dictionary and are ephemeral — lost when the process ends,
-    unless a host persists :attr:`files` and hands it back. Useful for testing,
-    for scratch space alongside a real backend, and as the whole storage layer
-    for an application that keeps the document itself.
+    What :class:`~pydantic_ai_backends.workspaces.StateWorkspace` serves as a
+    Pydantic AI workspace, and what a host persists between runs — `files` and
+    `directories` are both plain JSON, so they fit a PostgreSQL `jsonb` column.
 
-    Binary content is stored base64 (see :class:`~pydantic_ai_backends.FileData`)
-    so that document is always JSON. `read` and `grep` decline to treat such a
-    file as text rather than showing its encoded form; `read_bytes` returns
-    exactly what was written.
+    The operations follow a filesystem's rules and raise its errors, because the
+    workspace contract asks for exactly that: a missing path is
+    `FileNotFoundError`, reading a directory `IsADirectoryError`, a file standing
+    where a directory is expected `NotADirectoryError`.
+
+    Paths are absolute POSIX paths; `.` and `..` are collapsed as text, since
+    there are no symlinks here for `..` to climb out of. `directories` records
+    every directory created, by `make_dir` or as the parent of a written file, so
+    one stays when the last thing in it is removed, as it would on disk. A
+    directory something is stored under exists too, which is how a document
+    written before `directories` existed keeps its tree.
+
+    Text is stored as lines and anything that is not UTF-8 as base64, so the
+    document is always JSON and `read_bytes` returns exactly what was written.
 
     Example:
         ```python
+        import json
+
         from pydantic_ai_backends import StateBackend
 
-        backend = StateBackend()
-        backend.write("/src/app.py", "print('hello')")
-        content = backend.read("/src/app.py")
-        print(content)  # "     1\\tprint('hello')"
-        matches = backend.grep_raw("print")
+        state = StateBackend()
+        state.write_bytes("/src/app.py", b"print('hello')")
+        state.make_dir("/data")
+        saved = json.dumps({"files": state.files, "directories": sorted(state.directories)})
 
-        restored = StateBackend(files=json.loads(json.dumps(backend.files)))
+        loaded = json.loads(saved)
+        restored = StateBackend(files=loaded["files"], directories=loaded["directories"])
         ```
     """
 
-    def __init__(self, files: dict[str, FileData] | None = None):
-        """Initialize the backend.
+    def __init__(
+        self,
+        files: dict[str, FileData] | None = None,
+        directories: Iterable[str] | None = None,
+    ) -> None:
+        """Load a document, or start an empty one.
 
         Args:
-            files: Optional initial file dictionary. A document a previous
-                instance produced, including one that has been through JSON,
-                loads unchanged — as does one written before `encoding` existed.
+            files: Files by path. A document a previous instance produced loads
+                unchanged, including one written before `encoding` existed.
+            directories: Directories created, by path. Any directory holding a
+                file exists anyway, so a document from an earlier version, which
+                lists none, loads unchanged.
         """
         self._files: dict[str, FileData] = files if files is not None else {}
+        self._directories: set[str] = {_normal(path) for path in directories or ()}
 
     @property
     def files(self) -> dict[str, FileData]:
-        """The internal files dictionary.
-
-        Always a JSON-serialisable document: `json.loads(json.dumps(files))`
-        round-trips, and so does storing it in a PostgreSQL `jsonb` column.
-        """
+        """Files by absolute path; JSON-serialisable as it stands."""
         return self._files
 
-    def exists(self, path: str) -> bool:
+    @property
+    def directories(self) -> set[str]:
+        """Directories created; persist it with `sorted()` beside `files`."""
+        return self._directories
+
+    def is_file(self, path: str) -> bool:
         """Whether a file is stored at `path`."""
-        if unsafe_path_reason(path) is not None:
-            return False
-        return normalize_path(path) in self._files
+        return _normal(path) in self._files
 
-    def ls_info(self, path: str) -> list[FileInfo]:
-        """List the files and directories directly under `path`."""
-        if unsafe_path_reason(path) is not None:
-            return []
+    def is_dir(self, path: str) -> bool:
+        """Whether `path` is the root, a directory created, or holds anything."""
+        path = _normal(path)
+        if path == "/" or path in self._directories:
+            return True
+        prefix = path + "/"
+        return any(p.startswith(prefix) for p in self._files) or any(
+            d.startswith(prefix) for d in self._directories
+        )
 
-        path = normalize_path(path)
-        prefix = path if path == "/" else path + "/"
-        entries: dict[str, FileInfo] = {}
-
-        for file_path, file_data in self._files.items():
-            if file_path == path:
-                name = file_path.rsplit("/", 1)[-1]
-                entries[name] = _file_entry(name, file_path, file_data)
-                continue
-            if not file_path.startswith(prefix):
-                continue
-
-            name, _, rest = file_path[len(prefix) :].partition("/")
-            if name in entries:
-                continue
-            if rest:
-                entries[name] = FileInfo(name=name, path=prefix + name, is_dir=True, size=None)
-            else:
-                entries[name] = _file_entry(name, file_path, file_data)
-
-        return sorted(entries.values(), key=lambda x: (not x["is_dir"], x["name"]))
+    def exists(self, path: str) -> bool:
+        """Whether `path` is a file or a directory."""
+        return self.is_file(path) or self.is_dir(path)
 
     def read_bytes(self, path: str) -> bytes:
-        """Read a whole file as bytes, or `b""` when there is none at `path`."""
-        if unsafe_path_reason(path) is not None:
-            return b""
+        """A file's exact bytes.
 
-        stored = self._files.get(normalize_path(path))
-        if stored is None:
-            return b""
-        return _content_bytes(stored)
-
-    def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
-        """Read a slice of a file with line numbers.
-
-        A binary file is refused rather than rendered: its stored form is
-        base64, and handing that to a model as if it were the file's text is
-        worse than saying there is nothing here to read.
+        Raises:
+            IsADirectoryError: `path` is a directory.
+            NotADirectoryError: A file stands where one of its parents should be.
+            FileNotFoundError: Nothing is at `path`.
+            ValueError: The stored content is base64 that does not decode — a
+                document this class did not write.
         """
-        reason = unsafe_path_reason(path)
-        if reason is not None:
-            return f"Error: {reason}"
-
-        path = normalize_path(path)
+        path = _normal(path)
         stored = self._files.get(path)
-        if stored is None:
-            return f"Error: File '{path}' not found"
-        if _is_binary(stored):
-            return f"Error: File '{path}' is binary; read it as bytes instead"
+        if stored is not None:
+            return _content_bytes(stored, path)
+        if self.is_dir(path):
+            raise IsADirectoryError(path)
+        self._check_parents(path)
+        raise FileNotFoundError(path)
 
-        lines = stored["content"]
-        if offset >= len(lines):
-            return f"Error: Offset {offset} exceeds file length ({len(lines)} lines)"
+    def write_bytes(self, path: str, data: bytes) -> None:
+        """Store a file, creating and recording its parents.
 
-        end = min(offset + limit, len(lines))
-        numbered = "\n".join(f"{i + 1:>6}\t{lines[i]}" for i in range(offset, end))
-        if end < len(lines):
-            return f"{numbered}\n\n... ({len(lines) - end} more lines)"
-        return numbered
-
-    def write(self, path: str, content: str | bytes) -> WriteResult:
-        """Write a file, replacing any existing content."""
-        reason = unsafe_path_reason(path)
-        if reason is not None:
-            return WriteResult(error=reason)
-
-        path = normalize_path(path)
-        lines, encoding = _to_storage(content)
-
+        Raises:
+            IsADirectoryError: `path` is a directory.
+            NotADirectoryError: A file stands where one of its parents should be.
+        """
+        path = _normal(path)
+        if self.is_dir(path):
+            raise IsADirectoryError(path)
+        self._check_parents(path)
+        lines, encoding = _to_storage(data)
         now = _timestamp()
         existing = self._files.get(path)
         entry = FileData(
@@ -156,104 +136,84 @@ class StateBackend:
         if encoding is not None:
             entry["encoding"] = encoding
         self._files[path] = entry
-        return WriteResult(path=path)
+        self._record_parents(path)
 
-    def edit(
-        self, path: str, old_string: str, new_string: str, replace_all: bool = False
-    ) -> EditResult:
-        """Edit a file by replacing a string."""
-        reason = unsafe_path_reason(path)
-        if reason is not None:
-            return EditResult(error=reason)
+    def size(self, path: str) -> int:
+        """The length of the file at `path` in bytes, as `read_bytes` would return it."""
+        return len(self.read_bytes(path))
 
-        path = normalize_path(path)
-        stored = self._files.get(path)
-        if stored is None:
-            return EditResult(error=f"File '{path}' not found")
-        if _is_binary(stored):
-            return EditResult(error=f"File '{path}' is binary and cannot be edited as text")
+    def list_dir(self, path: str) -> list[tuple[str, bool]]:
+        """The names directly in a directory, each with whether it is one, sorted.
 
-        outcome = replace_in_content(
-            "\n".join(stored["content"]), old_string, new_string, replace_all
-        )
-        if not isinstance(outcome, Replacement):
-            return EditResult(error=outcome)
-
-        stored["content"] = outcome.content.split("\n")
-        stored["modified_at"] = _timestamp()
-        return EditResult(path=path, occurrences=outcome.occurrences)
-
-    def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
-        """Match stored paths against a glob pattern."""
-        if unsafe_path_reason(path) is not None:
-            return []
-
-        path = normalize_path(path)
-        root = "" if path == "/" else path
-        full_pattern = f"{root}/{pattern.lstrip('/')}"
-
-        results = [
-            _file_entry(file_path.rsplit("/", 1)[-1], file_path, file_data)
-            for file_path, file_data in self._files.items()
-            if wcglob.globmatch(file_path, full_pattern, flags=wcglob.GLOBSTAR)
-        ]
-        return sorted(results, key=lambda x: x["path"])
-
-    def grep_raw(
-        self,
-        pattern: str,
-        path: str | None = None,
-        glob: str | None = None,
-        ignore_hidden: bool = True,
-    ) -> list[GrepMatch] | str:
-        """Search stored file contents for a regex."""
-        try:
-            regex = re.compile(pattern)
-        except re.error as e:
-            return f"Error: Invalid regex pattern: {e}"
-
-        searchable = self._searchable_paths(path, ignore_hidden)
-        if isinstance(searchable, str):
-            return searchable
-
-        if glob:
-            glob_pattern = "/" + glob.lstrip("/")
-            searchable = [
-                p for p in searchable if wcglob.globmatch(p, glob_pattern, flags=wcglob.GLOBSTAR)
-            ]
-
-        # Binary files are skipped rather than searched: their stored form is
-        # base64, so a pattern would be matched against an encoding nobody wrote
-        # and the hit would name a line number that does not exist in the file.
-        return [
-            GrepMatch(path=file_path, line_number=i + 1, line=line)
-            for file_path in searchable
-            if not _is_binary(self._files[file_path])
-            for i, line in enumerate(self._files[file_path]["content"])
-            if regex.search(line)
-        ]
-
-    def _searchable_paths(self, path: str | None, ignore_hidden: bool) -> list[str] | str:
-        """Paths grep should walk, or an error message when `path` is invalid.
-
-        A file named outright is searched even when hidden; `ignore_hidden` only
-        filters the directory walk.
+        Raises:
+            NotADirectoryError: `path` is a file, or a file stands in its way.
+            FileNotFoundError: Nothing is at `path`.
         """
-        visible = [p for p in self._files if not ignore_hidden or not is_hidden_path(p)]
-
-        if path is None:
-            return visible
-
-        reason = unsafe_path_reason(path)
-        if reason is not None:
-            return f"Error: {reason}"
-
-        path = normalize_path(path)
+        path = _normal(path)
         if path in self._files:
-            return [path]
+            raise NotADirectoryError(path)
+        if not self.is_dir(path):
+            self._check_parents(path)
+            raise FileNotFoundError(path)
+        prefix = "/" if path == "/" else path + "/"
+        entries: dict[str, bool] = {}
+        for stored in (*self._files, *self._directories):
+            if not stored.startswith(prefix) or stored == path:
+                continue
+            name, _, rest = stored[len(prefix) :].partition("/")
+            entries[name] = entries.get(name, False) or bool(rest) or stored in self._directories
+        return sorted(entries.items())
 
-        prefix = path if path == "/" else path + "/"
-        return [p for p in visible if p.startswith(prefix)]
+    def make_dir(self, path: str) -> None:
+        """Create a directory and any missing parents; one that exists is fine.
+
+        Raises:
+            FileExistsError: A file is at `path`.
+            NotADirectoryError: A file stands where one of its parents should be.
+        """
+        path = _normal(path)
+        if path in self._files:
+            raise FileExistsError(path)
+        self._check_parents(path)
+        if path != "/":
+            self._directories.add(path)
+            self._record_parents(path)
+
+    def remove(self, path: str) -> None:
+        """Remove a file, or a directory and everything under it.
+
+        Raises:
+            FileNotFoundError: Nothing is at `path`.
+        """
+        path = _normal(path)
+        if self._files.pop(path, None) is not None:
+            return
+        if not self.is_dir(path):
+            raise FileNotFoundError(path)
+        prefix = "/" if path == "/" else path + "/"
+        for stored in [p for p in self._files if p.startswith(prefix)]:
+            del self._files[stored]
+        self._directories = {d for d in self._directories if d != path and not d.startswith(prefix)}
+
+    def _record_parents(self, path: str) -> None:
+        """Record the directories above `path`, which a write or `make_dir` created."""
+        parent = posixpath.dirname(path)
+        while parent != "/":
+            self._directories.add(parent)
+            parent = posixpath.dirname(parent)
+
+    def _check_parents(self, path: str) -> None:
+        """Refuse a path that runs through a file, the way a filesystem does."""
+        parent = posixpath.dirname(path)
+        while parent != "/":
+            if parent in self._files:
+                raise NotADirectoryError(parent)
+            parent = posixpath.dirname(parent)
+
+
+def _normal(path: str) -> str:
+    """`path` absolute, with `.`, `..` and repeated slashes collapsed as text."""
+    return posixpath.normpath(posixpath.join("/", path)).replace("//", "/")
 
 
 def _timestamp() -> str:
@@ -269,73 +229,27 @@ of text — exact on the way back out, and the reason the resulting document cou
 not be serialised (see :class:`~pydantic_ai_backends.FileData`). A host that
 persisted such a document and loads it here still gets its bytes back, because
 encoding with the same handler is the inverse of how they went in.
-
-Kept for that alone. New binary content never reaches this path: `_to_storage`
-sends it to base64 instead.
 """
 
 
-def _to_storage(content: str | bytes) -> tuple[list[str], Literal["base64"] | None]:
-    """The lines to store for `content`, and the encoding marker they need.
+def _to_storage(data: bytes) -> tuple[list[str], Literal["base64"] | None]:
+    """The lines to store for `data`, and the encoding marker they need.
 
-    Text — including bytes that decode as UTF-8 — is stored as lines, because a
-    file written as `b"print(1)"` should still be readable, greppable and
-    editable as the text it is. Only content that cannot be UTF-8 becomes
-    base64, which is what keeps the stored document valid JSON.
+    Bytes that decode as UTF-8 are stored as lines, so the document stays
+    readable to whoever inspects it; anything else becomes base64, which is what
+    keeps the document valid JSON.
     """
-    if isinstance(content, bytes):
-        try:
-            return content.decode("utf-8").split("\n"), None
-        except UnicodeDecodeError:
-            return [base64.b64encode(content).decode("ascii")], "base64"
-
     try:
-        content.encode("utf-8")
-    except UnicodeEncodeError:
-        # A `str` carrying lone surrogates — what a caller gets from decoding
-        # bytes with `surrogateescape`, and the one way text could still put an
-        # unserialisable value into the document. Store the bytes it stands for.
-        raw = content.encode("utf-8", errors=BYTES_ERRORS)
-        return [base64.b64encode(raw).decode("ascii")], "base64"
-    return content.split("\n"), None
+        return data.decode("utf-8").split("\n"), None
+    except UnicodeDecodeError:
+        return [base64.b64encode(data).decode("ascii")], "base64"
 
 
-def _is_binary(data: FileData) -> bool:
-    """Whether this entry's `content` is base64 rather than lines of text."""
-    return data.get("encoding") == "base64"
-
-
-def _content_bytes(data: FileData) -> bytes:
-    """The file's bytes, whichever way its content is stored.
-
-    Returns `b""` for a base64 entry that does not decode, per the protocol's
-    contract that `read_bytes` never reports an error it could be confused for
-    content. Reachable because `files=` accepts a document this backend did not
-    write, and a truncated one is a real way to arrive here.
-    """
-    if _is_binary(data):
+def _content_bytes(data: FileData, path: str) -> bytes:
+    """The file's bytes, whichever way its content is stored."""
+    if data.get("encoding") == "base64":
         try:
             return base64.b64decode("".join(data["content"]), validate=True)
-        except binascii.Error:
-            return b""
-    return _encode("\n".join(data["content"]))
-
-
-def _encode(text: str) -> bytes:
-    """Stored text back as the bytes it was written from."""
-    return text.encode("utf-8", errors=BYTES_ERRORS)
-
-
-def _file_entry(name: str, path: str, data: FileData) -> FileInfo:
-    return FileInfo(
-        name=name,
-        path=path,
-        is_dir=False,
-        # The size a reader gets from `read_bytes`, which for a base64 entry is
-        # the decoded length and not the length of the encoding. The separators
-        # count too: text is stored split on "\n" and rejoined on the way out,
-        # so summing the lines alone reported one byte less per line.
-        size=len(_content_bytes(data)),
-        # `.get`: a document persisted before the key existed loads without it.
-        modified_at=data.get("modified_at"),
-    )
+        except binascii.Error as error:
+            raise ValueError(f"{path} holds base64 that does not decode") from error
+    return "\n".join(data["content"]).encode("utf-8", errors=BYTES_ERRORS)

@@ -19,66 +19,23 @@ pip install pydantic-ai-backend
 
 ## Optional Dependencies
 
-### Console Toolset
+Every workspace and the console tools need Pydantic AI 2.52 or newer.
 
-For the ready-to-use pydantic-ai toolset:
-
-```bash
-uv add pydantic-ai-backend[console]
-# or
-pip install pydantic-ai-backend[console]
-```
-
-### Docker Sandbox
-
-For isolated code execution in Docker containers:
-
-```bash
-uv add pydantic-ai-backend[docker]
-# or
-pip install pydantic-ai-backend[docker]
-```
-
-### Daytona Sandbox
-
-For isolated code execution in Daytona cloud sandboxes (installs `daytona-sdk`):
+| Extra | Gives you | Installs |
+|---|---|---|
+| `console` | `ConsoleCapability`, `create_console_toolset` | `pydantic-ai-slim` |
+| `workspaces` | `StateWorkspace`, `SandboxdWorkspace` (no further extra needed) | `pydantic-ai-slim` |
+| `docker` | `DockerWorkspace`, `DockerSandbox` | `docker` |
+| `kubernetes` | `KubernetesWorkspace` | `kubernetes` |
+| `daytona` | `DaytonaWorkspace` | `daytona` |
+| `remote` | `WorkspaceArchive`, reading a `sandboxd` workspace without a sandbox | `httpx` |
+| `server` | `sandboxd`, the service — install it in the *service* image, not your app | FastAPI, uvicorn, `docker` |
+| `images` | Downscaling large images `read_file` returns | Pillow |
 
 ```bash
-uv add pydantic-ai-backend[daytona]
+uv add "pydantic-ai-backend[console,docker]"
 # or
-pip install pydantic-ai-backend[daytona]
-```
-
-### Remote Sandbox (client)
-
-To use sandboxes that live in another process, so your application never needs
-Docker access (installs `httpx` only):
-
-```bash
-uv add pydantic-ai-backend[remote]
-# or
-pip install pydantic-ai-backend[remote]
-```
-
-### sandboxd (service)
-
-For the service that owns Docker and rents out sandboxes over HTTP. Install this
-in the *sandbox service* image, not in your application:
-
-```bash
-uv add pydantic-ai-backend[server]
-# or
-pip install pydantic-ai-backend[server]
-```
-
-See [Remote Sandboxes](concepts/remote.md).
-
-### All Dependencies
-
-```bash
-uv add pydantic-ai-backend[console,docker,daytona,remote]
-# or
-pip install pydantic-ai-backend[console,docker,daytona,remote]
+pip install "pydantic-ai-backend[console,docker]"
 ```
 
 ## Environment Setup
@@ -99,9 +56,7 @@ If using the console toolset with pydantic-ai, set your model provider's API key
     export ANTHROPIC_API_KEY=your-api-key
     ```
 
-### Docker (for DockerSandbox)
-
-For using `DockerSandbox`:
+### Docker (for DockerWorkspace)
 
 1. Install Docker: [Get Docker](https://docs.docker.com/get-docker/)
 2. Ensure Docker daemon is running
@@ -111,10 +66,9 @@ For using `DockerSandbox`:
 docker pull python:3.12-slim
 ```
 
-### Daytona (for DaytonaSandbox)
+### Daytona (for DaytonaWorkspace)
 
-For using `DaytonaSandbox`, set your Daytona API key (or pass `api_key=` to the
-constructor):
+Set your Daytona API key, or pass a `DaytonaConfig` to `DaytonaWorkspace(config=...)`:
 
 ```bash
 export DAYTONA_API_KEY=your-api-key
@@ -122,49 +76,17 @@ export DAYTONA_API_KEY=your-api-key
 
 ## Verify Installation
 
-### Basic (LocalBackend)
-
 ```python
-from pydantic_ai_backends import LocalBackend
-
-backend = LocalBackend(root_dir=".")
-backend.write("test.txt", "Hello from pydantic-ai-backend!")
-print(backend.read("test.txt"))
-```
-
-### With Console Toolset
-
-```python
-from dataclasses import dataclass
 from pydantic_ai import Agent
-from pydantic_ai_backends import LocalBackend, create_console_toolset
 
+from pydantic_ai_backends import ConsoleCapability, DockerWorkspace
 
-@dataclass
-class Deps:
-    backend: LocalBackend
+workspace = DockerWorkspace(image="python:3.12-slim")
+agent = Agent("anthropic:claude-opus-5-5", capabilities=[workspace, ConsoleCapability()])
 
-
-backend = LocalBackend(root_dir=".", enable_execute=False)
-toolset = create_console_toolset(include_execute=False)
-
-agent = Agent("openai:gpt-4o-mini", deps_type=Deps)
-agent = agent.with_toolset(toolset)
-
-result = agent.run_sync("List files in current directory", deps=Deps(backend=backend))
+result = agent.run_sync("Write hello.py that prints a greeting, then run it")
 print(result.output)
-```
-
-### With Docker
-
-```python
-from pydantic_ai_backends import DockerSandbox
-
-sandbox = DockerSandbox(image="python:3.12-slim")
-sandbox.write("/workspace/hello.py", "print('Hello from Docker!')")
-result = sandbox.execute("python /workspace/hello.py")
-print(result.output)  # "Hello from Docker!"
-sandbox.stop()
+await workspace.destroy(result.workspace.ref)  # the container outlives the run
 ```
 
 ## Troubleshooting
@@ -216,10 +138,10 @@ one per sandbox or per runtime alias:
 ```
 
 ```python
-from pydantic_ai_backends import DockerSandbox
+from pydantic_ai_backends import DockerWorkspace
 
 # gVisor: syscalls handled in userspace, not by the host kernel.
-sandbox = DockerSandbox(image="python:3.12-slim", oci_runtime="runsc")
+workspace = DockerWorkspace(image="python:3.12-slim", oci_runtime="runsc")
 ```
 
 Or service-wide and per runtime in `sandboxd`, where a runtime's own choice wins
@@ -289,5 +211,5 @@ own host before promising anyone a density number.
 ## Next Steps
 
 - [Core Concepts](concepts/index.md) - Learn the fundamentals
-- [Local Backend Example](examples/local-backend.md) - Start with local files
+- [Local Workspace Example](examples/local-workspace.md) - Start with a directory on your machine
 - [API Reference](api/index.md) - Complete API documentation

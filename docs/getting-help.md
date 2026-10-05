@@ -23,7 +23,7 @@ For bugs, feature requests, or questions:
 [Clear description of the bug]
 
 ## Steps to Reproduce
-1. Create backend with...
+1. Create workspace with...
 2. Call method...
 3. Observe error...
 
@@ -38,7 +38,7 @@ For bugs, feature requests, or questions:
 - pydantic-ai version: X.X.X
 - Python version: 3.XX
 - OS: [e.g., macOS 14.0, Ubuntu 22.04]
-- Docker version (if using DockerSandbox): X.X.X
+- Docker version (if using DockerWorkspace or sandboxd): X.X.X
 ```
 
 ## Community Resources
@@ -52,53 +52,48 @@ pydantic-ai-backend is designed for use with Pydantic AI. Their documentation is
 
 ### Related Projects
 
-- [pydantic-deep](https://github.com/vstorm-co/pydantic-deep) - Full agent framework
+- [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) - Full agent framework
 - [pydantic-ai-todo](https://github.com/vstorm-co/pydantic-ai-todo) - Task planning toolset
 - [subagents-pydantic-ai](https://github.com/vstorm-co/subagents-pydantic-ai) - Multi-agent orchestration
 - [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) - Context management
 
 ## FAQ
 
-### Which backend should I use?
+### Which workspace should I use?
 
-| Use Case | Backend |
-|----------|---------|
-| Unit tests | `StateBackend` (in-memory, fast) |
-| Local CLI tools | `LocalBackend` (persistent files) |
-| Multi-user web apps | `DockerSandbox` + `SessionManager` |
-| Untrusted code | `DockerSandbox` (isolated) |
-| Mixed sources | `CompositeBackend` (route by path) |
+| Use Case | Workspace |
+|----------|-----------|
+| Unit tests, or files kept in your database | `StateWorkspace` |
+| Local CLI tools on your own code | Pydantic AI's `LocalWorkspace` |
+| Model-written code on one host | `DockerWorkspace` |
+| An app in a container serving many users | `SandboxdWorkspace` |
+| Sandboxes scheduled by a cluster | `KubernetesWorkspace` |
+| Hosted sandboxes | `DaytonaWorkspace` |
 
 ### How do I run without Docker?
 
-Use `LocalBackend` for local filesystem operations:
+Use Pydantic AI's `LocalWorkspace` for a directory on your machine:
 
 ```python
-from pydantic_ai_backends import LocalBackend
+from pydantic_ai.capabilities import LocalWorkspace
 
-backend = LocalBackend(root_dir="./workspace")
+from pydantic_ai_backends import ConsoleCapability
+
+capabilities = [LocalWorkspace("./workspace"), ConsoleCapability()]
 ```
 
-For testing, use `StateBackend`:
+For tests, use `StateWorkspace`, which keeps files in memory and runs no commands:
 
 ```python
-from pydantic_ai_backends import StateBackend
+from pydantic_ai_backends import ConsoleCapability, StateWorkspace
 
-backend = StateBackend()  # In-memory, no side effects
+capabilities = [StateWorkspace(), ConsoleCapability()]
 ```
 
 ### How do I disable shell execution?
 
-For `LocalBackend`:
-
 ```python
-backend = LocalBackend(root_dir="./workspace", enable_execute=False)
-```
-
-For the console toolset:
-
-```python
-toolset = create_console_toolset(include_execute=False)
+ConsoleCapability(include_execute=False)
 ```
 
 ### How do I restrict file access?
@@ -106,19 +101,18 @@ toolset = create_console_toolset(include_execute=False)
 Use the permission system:
 
 ```python
-from pydantic_ai_backends import LocalBackend
+from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_backends.permissions import READONLY_RULESET
 
-backend = LocalBackend(root_dir="/workspace", permissions=READONLY_RULESET)
+ConsoleCapability(permissions=READONLY_RULESET)
 ```
 
-Or use `allowed_directories`:
+Or give the run a read-only workspace, which refuses every change at the workspace itself:
 
 ```python
-backend = LocalBackend(
-    root_dir="/workspace",
-    allowed_directories=["/workspace", "/shared"],
-)
+from pydantic_ai.capabilities import LocalWorkspace
+
+LocalWorkspace("./workspace", read_only=True)
 ```
 
 ### Docker container won't start

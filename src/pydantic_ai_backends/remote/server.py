@@ -1,7 +1,7 @@
 """sandboxd — an HTTP service that owns Docker and rents out sandboxes.
 
-Run this next to the Docker socket and point applications at it with
-:class:`~pydantic_ai_backends.remote.RemoteSandbox`. The application never needs
+Run this next to the Docker socket and give agents its sessions as workspaces
+with :class:`~pydantic_ai_backends.workspaces.SandboxdWorkspace`. The application never needs
 Docker access, which is the whole point: a containerised app that mounted the
 socket to start sandboxes would be handing itself host root.
 
@@ -40,31 +40,31 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import binascii
 import functools
 import inspect
 import logging
 import os
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import time
 import uuid
 from collections import Counter, deque
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Annotated, Any, TypeVar
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.responses import HTMLResponse
 
-from pydantic_ai_backends.adapter import ensure_async
+from pydantic_ai_backends._limits import MAX_RUN_OUTPUT_BYTES
 from pydantic_ai_backends.backends.docker._image import buildkit_available
 from pydantic_ai_backends.backends.docker.runtimes import get_runtime
 from pydantic_ai_backends.backends.docker.session import (
@@ -73,6 +73,7 @@ from pydantic_ai_backends.backends.docker.session import (
     alive_of,
     last_activity_of,
 )
+from pydantic_ai_backends.protocol import CommandRunner, SandboxUnavailableError
 from pydantic_ai_backends.remote import wire
 from pydantic_ai_backends.remote._workspace import (
     WorkspacePathError,
@@ -87,7 +88,6 @@ from pydantic_ai_backends.types import RuntimeConfig, SandboxUsage
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
 
-    from pydantic_ai_backends.protocol import AsyncSandboxProtocol
 
 _logger = logging.getLogger(__name__)
 
@@ -833,6 +833,8 @@ class _Pending:
 
     runtime: SandboxRuntime
     tenant: str | None
+    started: bool = False
+    """Whether a sandbox has been built for the session, so the next one heals it."""
 
 
 @dataclass(slots=True)
@@ -843,8 +845,12 @@ class _Outcome:
     detail: str = ""
 
 
-def _default_builder(config: SandboxdConfig) -> SandboxBuilder:
-    """Build the Docker-backed sandbox factory described by `config`."""
+def _default_builder(config: SandboxdConfig, *, reattach_only: bool = False) -> SandboxBuilder:
+    """Build the Docker-backed sandbox factory described by `config`.
+
+    With `reattach_only` the sandboxes it builds start the session's persisted
+    container and never create one, to heal a session whose files live only there.
+    """
 
     def build(session_id: str, runtime: SandboxRuntime) -> Any:
         from pydantic_ai_backends.backends.docker.sandbox import DockerSandbox
@@ -867,8 +873,8 @@ def _default_builder(config: SandboxdConfig) -> SandboxBuilder:
             volumes=_session_volumes(config, session_id),
             container_name=_container_name(config, session_id),
             idle_timeout=config.idle_timeout,
-            max_read_bytes=config.max_read_bytes,
             tmpfs={"/tmp": f"size={config.tmpfs_size}"} if config.tmpfs_size else None,
+            reattach_only=reattach_only,
             **config.limits_for(runtime),
         )
 
@@ -1143,9 +1149,15 @@ class _Service:
         build_sandbox: SandboxBuilder,
         prewarm: Callable[[], None] | None = None,
         docker_client: Callable[[], Any] | None = None,
+        reattach_sandbox: SandboxBuilder | None = None,
     ) -> None:
         self.config = config
         self._build_sandbox = build_sandbox
+        # Heals a session whose files live only in its persisted container: a
+        # name alone does not prove the container is still there, and a
+        # replacement built from scratch would be empty. `None` for an injected
+        # builder, which knows nothing of containers.
+        self._reattach_sandbox = reattach_sandbox
         self._prewarm = prewarm
         self._docker_client = docker_client
         self._sessions: dict[str, _Session] = {}
@@ -1203,7 +1215,16 @@ class _Service:
         self._inflight.pop(session_id, None)
 
     def _new_sandbox(self, session_id: str) -> Any:
-        return self._build_sandbox(session_id, self._pending[session_id].runtime)
+        pending = self._pending[session_id]
+        if (
+            pending.started
+            and self._reattach_sandbox is not None
+            and self.config.persist_containers
+            and self.config.workspace_root is None
+        ):
+            return self._reattach_sandbox(session_id, pending.runtime)
+        pending.started = True
+        return self._build_sandbox(session_id, pending.runtime)
 
     def startup(self) -> None:
         """Create the worker pool and begin reaping idle sessions and workspaces."""
@@ -1342,12 +1363,6 @@ class _Service:
         if record is None:
             raise HTTPException(status_code=404, detail=f"No such session: {session_id}")
 
-    def adapter(self, sandbox: Any) -> AsyncSandboxProtocol:
-        """Async view of a sandbox, bound to the service's own thread pool."""
-        # `ensure_async` is typed to the base backend protocol; anything with
-        # `execute` — which every sandbox has — comes back as a sandbox adapter.
-        return cast("AsyncSandboxProtocol", ensure_async(sandbox, executor=self._executor))
-
     async def sandbox(self, session_id: str) -> Any:
         """Live sandbox for an already-authorized session, healing a dead one.
 
@@ -1357,19 +1372,43 @@ class _Service:
         is woken here, which is the only place it can be, since waking is what
         the next request means.
 
+        A dead sandbox is replaced only where its files outlive it: on a
+        `workspace_root`, or in a persisted container started again. Otherwise
+        the replacement would be empty, and a client continuing its work would
+        carry on in a fresh directory as if its files were there. That includes
+        a persisted container somebody removed: it is started again if it
+        exists and never recreated.
+
         Raises:
-            HTTPException: 404 when the session has since disappeared, and 429
-                when it is hibernated and every resident session is busy. The
-                second is backpressure rather than an error: the work is still
-                there, and the caller is being asked to come back.
+            HTTPException: 404 when the session has since disappeared, 410 when
+                its sandbox died and took its files with it — including a
+                persisted container that was removed — and 429 when it is
+                hibernated and every resident session is busy. The last is
+                backpressure rather than an error: the work is still there, and
+                the caller is being asked to come back.
         """
+        resident = self.manager.sessions.get(session_id)
+        if (
+            resident is not None
+            and not self._files_outlive_sandbox()
+            and not await alive_of(resident)
+        ):
+            raise HTTPException(
+                status_code=410,
+                detail=f"The sandbox of session {session_id} is gone, and its files with it",
+            )
         try:
-            if session_id not in self.manager.sessions:
+            if resident is None:
                 # Waking claims a slot, so somebody idle may have to give one up.
                 await self.make_room()
             sandbox = await self.manager.get_or_create(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"No such session: {session_id}") from exc
+        except SandboxUnavailableError as exc:
+            raise HTTPException(
+                status_code=410,
+                detail=f"The sandbox of session {session_id} is gone, and its files with it: {exc}",
+            ) from exc
         except SessionLimitExceeded as exc:
             raise HTTPException(
                 status_code=429,
@@ -1380,6 +1419,10 @@ class _Service:
         if record is not None:  # pragma: no branch - an authorized caller has one
             record.hibernated_at = None
         return sandbox
+
+    def _files_outlive_sandbox(self) -> bool:
+        """Whether a session's files survive its sandbox dying."""
+        return self.config.workspace_root is not None or self.config.persist_containers
 
     def peek(self, session_id: str) -> Any:
         """Existing sandbox for a session, without creating anything.
@@ -1662,14 +1705,18 @@ class _Service:
                 ),
             ) from exc
 
+        if body.attach and body.session_id is None:
+            raise HTTPException(status_code=400, detail="attach needs the session_id to attach to")
         session_id = body.session_id or f"s-{uuid.uuid4().hex[:16]}"
         open_already = self._sessions.get(session_id)
         if open_already is not None:
-            if not body.reuse:
+            if not (body.reuse or body.attach):
                 raise HTTPException(status_code=409, detail=f"Session exists: {session_id}")
             return await self._attach(session_id, open_already, body.runtime)
         if session_id in self._pending:
             raise HTTPException(status_code=409, detail=f"Session is opening: {session_id}")
+        if body.attach and not self._holds_workspace(session_id):
+            raise HTTPException(status_code=404, detail=f"Nothing to attach to: {session_id}")
 
         # Claimed before the first await. Starting a sandbox suspends, so without
         # this two requests naming one id both get past the check above, both are
@@ -1701,6 +1748,17 @@ class _Service:
             session=self.describe(session_id, sandbox, alive=await alive_of(sandbox)),
             token=self._sessions[session_id].token,
         )
+
+    def _holds_workspace(self, session_id: str) -> bool:
+        """Whether files from a closed session `session_id` are still on disk.
+
+        Only a configured `workspace_root` outlives a session. Without one a
+        closed session left nothing a later attach could find, so there is
+        nothing to attach to.
+        """
+        if self.config.workspace_root is None:
+            return False
+        return workspace_root_for(Path(self.config.workspace_root), session_id).is_dir()
 
     async def make_room(self) -> str | None:
         """Close the least recently used idle session when the pool is full.
@@ -2021,38 +2079,24 @@ class _Service:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    def command_timeout(self, requested: int | None) -> int:
-        """Clamp a requested command timeout to the service ceiling."""
-        if requested is None:
-            return self.config.execute_timeout
-        return min(requested, self.config.execute_timeout)
+    def run_timeout(self, requested: float | None) -> float:
+        """Deadline for a `/run` command: the request's, within the service ceiling."""
+        ceiling = float(self.config.execute_timeout)
+        return ceiling if requested is None else min(requested, ceiling)
 
-    async def bounded(self, operation: Awaitable[_T]) -> _T:
-        """Await one sandbox operation under the service's command ceiling.
-
-        `execute_timeout` is documented as applying to every command, and it was
-        applied to `/exec` alone. Everything else — `ls`, `glob`, `grep`, `read`,
-        `write` — reaches the sandbox's shell too, and an uncapped one of those
-        occupies a worker thread that nothing reclaims: a grep over a large tree
-        is enough, and `max_workers` of them wedge the service. Enforced here
-        rather than per backend so the promise is kept in the one place that
-        makes it.
-
-        The thread running the call cannot be interrupted, so this bounds how
-        long a *client* waits rather than how long the command runs. The
-        backend's own per-operation timeouts bound the command; this is what
-        stops the request from outliving them.
+    def runner(self, sandbox: Any) -> CommandRunner:
+        """The sandbox's workspace-contract command runner.
 
         Raises:
-            HTTPException: 504 when the operation outlasts the ceiling.
+            HTTPException: 501 for a sandbox from a custom builder that does not
+                implement `CommandRunner`.
         """
-        try:
-            return await asyncio.wait_for(operation, timeout=self.config.execute_timeout)
-        except (asyncio.TimeoutError, TimeoutError) as exc:
+        if not isinstance(sandbox, CommandRunner):
             raise HTTPException(
-                status_code=504,
-                detail=f"Operation exceeded the {self.config.execute_timeout}s service ceiling",
-            ) from exc
+                status_code=501,
+                detail=f"{type(sandbox).__name__} cannot run commands for a workspace",
+            )
+        return sandbox
 
 
 def _service_of(request: Request) -> _Service:
@@ -2245,142 +2289,62 @@ def _register_workspace_routes(app: FastAPI, service: _Service) -> None:
         return await service.archive_read_bytes(session_id, body)
 
 
-def _register_operation_routes(app: FastAPI, service: _Service) -> None:
-    """The file and command operations, all scoped to one session."""
+def _register_run_routes(app: FastAPI, service: _Service) -> None:
+    """Commands for a Pydantic AI workspace, under its failure contract."""
 
-    @app.post("/sessions/{session_id}/exec", response_model=wire.ExecResponse)
-    async def exec_command(
-        session_id: AuthorizedSession, body: wire.ExecRequest
-    ) -> wire.ExecResponse:
-        """Run a shell command, capped by the service's `execute_timeout`."""
-        sandbox = await service.sandbox(session_id)
-        with service.observe(session_id, "exec", body.command) as outcome:
-            # Both: the clamped timeout kills the command inside the sandbox,
-            # and `bounded` stops a backend that ignores it from holding the
-            # request — and its worker — for ever.
-            result = await service.bounded(
-                service.adapter(sandbox).execute(
-                    body.command, service.command_timeout(body.timeout_seconds)
+    @app.post("/sessions/{session_id}/run", response_model=wire.RunResponse)
+    async def run_command(session_id: AuthorizedSession, body: wire.RunRequest) -> wire.RunResponse:
+        """Run one program for a Pydantic AI workspace.
+
+        A sandbox that has disappeared is a 410 rather than a command that
+        failed, and the streams come back apart. The command is
+        stopped at its deadline here, and `/runs/{run_id}/stop` stops it sooner
+        for a client that gave up waiting.
+        """
+        runner = service.runner(await service.sandbox(session_id))
+        with service.observe(session_id, "run", shlex.join(body.argv)) as outcome:
+            try:
+                result = await runner.run_command(
+                    body.argv,
+                    run_id=body.run_id,
+                    env=body.env or None,
+                    timeout=service.run_timeout(body.timeout_seconds),
+                    output_limit=MAX_RUN_OUTPUT_BYTES,
                 )
-            )
+            except SandboxUnavailableError as exc:
+                outcome.detail = "sandbox gone"
+                raise HTTPException(status_code=410, detail=str(exc)) from exc
             outcome.ok = result.exit_code == 0
-            outcome.detail = f"exit {result.exit_code}"
-        return wire.ExecResponse(
-            output=result.output, exit_code=result.exit_code, truncated=result.truncated
+            outcome.detail = (
+                "timed out"
+                if result.timed_out
+                else "output limit"
+                if result.output_limited
+                else f"exit {result.exit_code}"
+            )
+        return wire.RunResponse(
+            stdout=result.stdout,
+            stderr=result.stderr,
+            exit_code=result.exit_code,
+            timed_out=result.timed_out,
+            output_limited=result.output_limited,
+            output_limit=MAX_RUN_OUTPUT_BYTES if result.output_limited else None,
         )
 
-    @app.post("/sessions/{session_id}/read", response_model=wire.ReadResponse)
-    async def read_file(session_id: AuthorizedSession, body: wire.ReadRequest) -> wire.ReadResponse:
-        """Read a slice of a text file."""
-        sandbox = await service.sandbox(session_id)
-        with service.observe(session_id, "read", body.path) as outcome:
-            content = await service.bounded(
-                service.adapter(sandbox).read(body.path, body.offset, body.limit)
-            )
-            outcome.ok = not content.startswith(("Error:", "[Error"))
-            outcome.detail = f"{len(content)} chars"
-        return wire.ReadResponse(content=content)
+    @app.post("/sessions/{session_id}/runs/{run_id}/stop", status_code=204)
+    async def stop_run(
+        session_id: AuthorizedSession,
+        run_id: Annotated[str, PathParam(pattern=wire.RUN_ID_PATTERN)],
+    ) -> None:
+        """Stop a `/run` command and everything it started.
 
-    @app.post("/sessions/{session_id}/read_bytes", response_model=wire.ReadBytesResponse)
-    async def read_file_bytes(
-        session_id: AuthorizedSession, body: wire.ReadBytesRequest
-    ) -> wire.ReadBytesResponse:
-        """Read a whole file as base64."""
-        sandbox = await service.sandbox(session_id)
-        with service.observe(session_id, "read_bytes", body.path) as outcome:
-            raw = await service.bounded(service.adapter(sandbox).read_bytes(body.path))
-            outcome.ok = bool(raw)
-            outcome.detail = f"{len(raw)} bytes"
-        return wire.ReadBytesResponse(content_b64=base64.b64encode(raw).decode("ascii"))
-
-    @app.post("/sessions/{session_id}/write", response_model=wire.WriteResponse)
-    async def write_file(
-        session_id: AuthorizedSession, body: wire.WriteRequest
-    ) -> wire.WriteResponse:
-        """Write a file from base64 content."""
-        try:
-            raw = base64.b64decode(body.content_b64, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise HTTPException(
-                status_code=400, detail=f"content_b64 is not valid base64: {exc}"
-            ) from exc
-
-        sandbox = await service.sandbox(session_id)
-        with service.observe(session_id, "write", body.path) as outcome:
-            result = await service.bounded(service.adapter(sandbox).write(body.path, raw))
-            outcome.ok = result.error is None
-            outcome.detail = result.error or f"{len(raw)} bytes"
-        return wire.WriteResponse(path=result.path, error=result.error)
-
-    @app.post("/sessions/{session_id}/edit", response_model=wire.EditResponse)
-    async def edit_file(session_id: AuthorizedSession, body: wire.EditRequest) -> wire.EditResponse:
-        """Replace a string inside a file."""
-        sandbox = await service.sandbox(session_id)
-        with service.observe(session_id, "edit", body.path) as outcome:
-            result = await service.bounded(
-                service.adapter(sandbox).edit(
-                    body.path, body.old_string, body.new_string, body.replace_all
-                )
-            )
-            outcome.ok = result.error is None
-            outcome.detail = result.error or f"{result.occurrences} replaced"
-        return wire.EditResponse(
-            path=result.path, error=result.error, occurrences=result.occurrences
-        )
-
-    @app.post("/sessions/{session_id}/exists", response_model=wire.ExistsResponse)
-    async def path_exists(
-        session_id: AuthorizedSession, body: wire.ExistsRequest
-    ) -> wire.ExistsResponse:
-        """Test whether a path is a regular file."""
-        sandbox = await service.sandbox(session_id)
-        with service.observe(session_id, "exists", body.path) as outcome:
-            found = await service.bounded(service.adapter(sandbox).exists(body.path))
-            outcome.ok = True
-            outcome.detail = "found" if found else "missing"
-        return wire.ExistsResponse(exists=found)
-
-    @app.post("/sessions/{session_id}/ls", response_model=list[wire.FileEntry])
-    async def list_dir(session_id: AuthorizedSession, body: wire.LsRequest) -> list[wire.FileEntry]:
-        """List one directory."""
-        sandbox = await service.sandbox(session_id)
-        with service.observe(session_id, "ls", body.path) as outcome:
-            rows = await service.bounded(service.adapter(sandbox).ls_info(body.path))
-            outcome.ok = True
-            outcome.detail = f"{len(rows)} entries"
-        return [wire.FileEntry(**row) for row in rows]
-
-    @app.post("/sessions/{session_id}/glob", response_model=list[wire.FileEntry])
-    async def glob_files(
-        session_id: AuthorizedSession, body: wire.GlobRequest
-    ) -> list[wire.FileEntry]:
-        """Match files by glob pattern."""
-        sandbox = await service.sandbox(session_id)
-        with service.observe(session_id, "glob", f"{body.pattern} in {body.path}") as outcome:
-            rows = await service.bounded(
-                service.adapter(sandbox).glob_info(body.pattern, body.path)
-            )
-            outcome.ok = True
-            outcome.detail = f"{len(rows)} matches"
-        return [wire.FileEntry(**row) for row in rows]
-
-    @app.post("/sessions/{session_id}/grep", response_model=wire.GrepResponse)
-    async def grep_files(
-        session_id: AuthorizedSession, body: wire.GrepRequest
-    ) -> wire.GrepResponse:
-        """Search file contents."""
-        sandbox = await service.sandbox(session_id)
-        with service.observe(session_id, "grep", body.pattern) as outcome:
-            found = await service.bounded(
-                service.adapter(sandbox).grep_raw(
-                    body.pattern, body.path, body.glob, body.ignore_hidden
-                )
-            )
-            outcome.ok = not isinstance(found, str)
-            outcome.detail = found if isinstance(found, str) else f"{len(found)} matches"
-        if isinstance(found, str):
-            return wire.GrepResponse(error=found)
-        return wire.GrepResponse(matches=[wire.GrepMatchEntry(**match) for match in found])
+        A run that already finished, or a session with no sandbox right now, has
+        nothing to stop; that is a success rather than an error, since a client
+        stops a run exactly when it no longer knows how far it got.
+        """
+        sandbox = service.peek(session_id)
+        if isinstance(sandbox, CommandRunner):
+            await sandbox.stop_command(run_id)
 
 
 def create_app(
@@ -2408,6 +2372,7 @@ def create_app(
         sandbox_builder or _default_builder(config),
         prewarm=None if sandbox_builder else _default_prewarm(config),
         docker_client=None if sandbox_builder else _default_docker_client,
+        reattach_sandbox=None if sandbox_builder else _default_builder(config, reattach_only=True),
     )
 
     @asynccontextmanager
@@ -2426,7 +2391,7 @@ def create_app(
     app.state.service = service
     _register_session_routes(app, service)
     _register_workspace_routes(app, service)
-    _register_operation_routes(app, service)
+    _register_run_routes(app, service)
     return app
 
 
