@@ -52,7 +52,7 @@ pydantic-ai-backend is designed for use with Pydantic AI. Their documentation is
 
 ### Related Projects
 
-- [pydantic-deep](https://github.com/vstorm-co/pydantic-deep) - Full agent framework
+- [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) - Full agent framework
 - [pydantic-ai-todo](https://github.com/vstorm-co/pydantic-ai-todo) - Task planning toolset
 - [subagents-pydantic-ai](https://github.com/vstorm-co/subagents-pydantic-ai) - Multi-agent orchestration
 - [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) - Context management
