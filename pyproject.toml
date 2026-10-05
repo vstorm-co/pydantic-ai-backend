@@ -1,11 +1,11 @@
 [project]
 name = "pydantic-ai-backend"
-version = "0.2.29"
+version = "0.2.32"
 description = "File storage and sandbox backends for AI agents"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "VStorm" }]
+authors = [{ name = "Vstorm" }]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -27,13 +27,23 @@ dependencies = [
 
 [project.optional-dependencies]
 console = [
-    "pydantic-ai-slim>=1.74.0",
+    # The console tools work in `ctx.workspace`, which arrived in 2.52.0.
+    "pydantic-ai-slim>=2.52.0",
+    # `read_file` decodes every text file through encoding detection.
+    "chardet>=5.2.0",
+]
+workspaces = [
+    # Workspaces landed in 2.52.0: `pydantic_ai.workspaces` and `RunContext.workspace`.
+    "pydantic-ai-slim>=2.52.0",
 ]
 images = [
     "pillow>=10.0.0",
 ]
 daytona = [
-    "daytona-sdk>=0.9.0",
+    # `daytona`, not `daytona-sdk`: the latter installs the module `daytona_sdk`,
+    # and the code imports `daytona`. 0.220 is the release the session-command
+    # API used here was read from.
+    "daytona>=0.220.0",
 ]
 docker = [
     "docker>=7.0",
@@ -42,7 +52,6 @@ docker = [
 ]
 kubernetes = [
     "kubernetes>=29.0.0",
-    "httpx>=0.28.0",
 ]
 remote = [
     "httpx>=0.28.0",
@@ -56,7 +65,7 @@ server = [
     "chardet>=5.2.0",
 ]
 dev = [
-    "pydantic-ai-slim>=1.74.0",
+    "pydantic-ai-slim>=2.52.0",
     "pytest>=9.0.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=7.0.0",
@@ -77,6 +86,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/vstorm-co/pydantic-ai-backend"
+Documentation = "https://vstorm-co.github.io/pydantic-ai-backend/"
 Repository = "https://github.com/vstorm-co/pydantic-ai-backend"
 Issues = "https://github.com/vstorm-co/pydantic-ai-backend/issues"
 
@@ -119,8 +129,9 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "docker: marks tests as requiring Docker (deselect with '-m \"not docker\"')",
     "kubernetes: requires a running kind/k3d cluster (deselect with '-m \"not kubernetes\"')",
+    "daytona: creates sandboxes on a Daytona account (deselect with '-m \"not daytona\"')",
 ]
-addopts = "-m 'not docker and not kubernetes'"
+addopts = "-m 'not docker and not kubernetes and not daytona'"
 
 # Coverage configuration
 [tool.coverage.run]

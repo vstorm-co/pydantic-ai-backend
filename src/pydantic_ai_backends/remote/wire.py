@@ -1,13 +1,10 @@
-"""Wire protocol shared by the remote sandbox client and server.
+"""Wire protocol between `sandboxd` and its clients.
 
-These models are the single source of truth for the HTTP contract. The
-operation endpoints (`/exec`, `/read`, `/write`, `/ls`, `/glob`) keep the field
-names that :class:`~pydantic_ai_backends.backends.kubernetes.KubernetesPodSandbox`
-already sends in `mode="http"`, so one server can serve both clients; `/edit`,
-`/grep`, `/exists` and `/read_bytes` are additions.
+These models are the single source of truth for the HTTP contract: sessions,
+`/run` for a Pydantic AI workspace, the archive reads, the policy.
 
-Binary-capable payloads travel base64-encoded (`content_b64`) because JSON
-cannot carry arbitrary bytes, and a sandbox holds real files.
+Binary payloads travel base64-encoded (`content_b64`) because JSON cannot carry
+arbitrary bytes, and a workspace holds real files.
 """
 
 from __future__ import annotations
@@ -23,24 +20,52 @@ SESSION_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 """Session ids appear in URLs and in on-disk workspace paths, so they are
 restricted to characters that cannot traverse a directory or confuse a path."""
 
+RUN_ID_PATTERN = r"^[0-9a-f]{32}$"
+"""A `/run` id: a uuid4 hex, which is also what keeps it safe in a file name."""
+
 TENANT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 """Tenant labels are reported back in listings, so they carry the same
 restriction as session ids rather than being free text."""
 
 
-class ExecRequest(BaseModel):
-    """Run a shell command inside the sandbox."""
+class RunRequest(BaseModel):
+    """Run one program, under the contract a Pydantic AI workspace needs.
 
-    command: str
-    timeout_seconds: int | None = None
+    The streams come back apart, a dead sandbox is reported as one rather than
+    as a command that failed, and a command whose caller gave up can be stopped.
+    """
+
+    argv: list[str] = Field(min_length=1)
+    """The program and its arguments, passed through literally. A shell command
+    is `["/bin/sh", "-c", "..."]`, spelled out by the client."""
+
+    env: dict[str, str] = Field(default_factory=dict)
+    """Variables layered over the sandbox's own environment."""
+
+    timeout_seconds: float | None = Field(default=None, gt=0)
+    """Deadline for the command. Clamped to the service's `execute_timeout`, and
+    that ceiling applies when this is `None`."""
+
+    run_id: str = Field(pattern=RUN_ID_PATTERN)
+    """Chosen by the client, so it can stop the run from another request when it
+    stops waiting for this one."""
 
 
-class ExecResponse(BaseModel):
-    """Result of a command, mirroring `ExecuteResponse`."""
+class RunResponse(BaseModel):
+    """How a `/run` command ended: finished, timed out, or over its output limit.
 
-    output: str
+    A non-zero `exit_code` is a result. `timed_out` and `output_limited` carry no
+    exit code and only the beginning of each stream, because the command was
+    stopped rather than allowed to finish.
+    """
+
+    stdout: str
+    stderr: str
     exit_code: int | None = None
-    truncated: bool = False
+    timed_out: bool = False
+    output_limited: bool = False
+    output_limit: int | None = None
+    """The ceiling an `output_limited` command crossed, in bytes."""
 
 
 class ReadRequest(BaseModel):
@@ -72,48 +97,10 @@ class ReadBytesResponse(BaseModel):
     content_b64: str
 
 
-class WriteRequest(BaseModel):
-    """Write a file, creating parent directories as needed."""
-
-    path: str
-    content_b64: str
-
-
-class WriteResponse(BaseModel):
-    """Result of a write, mirroring `WriteResult`."""
-
-    path: str | None = None
-    error: str | None = None
-
-
-class EditRequest(BaseModel):
-    """Replace a string inside an existing file."""
-
-    path: str
-    old_string: str
-    new_string: str
-    replace_all: bool = False
-
-
-class EditResponse(BaseModel):
-    """Result of an edit, mirroring `EditResult`."""
-
-    path: str | None = None
-    error: str | None = None
-    occurrences: int | None = None
-
-
 class LsRequest(BaseModel):
     """List one directory."""
 
     path: str
-
-
-class GlobRequest(BaseModel):
-    """Match files by glob pattern under a root."""
-
-    pattern: str
-    path: str = "/"
 
 
 class FileEntry(BaseModel):
@@ -126,46 +113,6 @@ class FileEntry(BaseModel):
     modified_at: str | None = None
     """ISO 8601, when the backend reports one. Defaults absent so a client and a
     service on either side of this release keep understanding each other."""
-
-
-class GrepRequest(BaseModel):
-    """Search file contents by regular expression."""
-
-    pattern: str
-    path: str | None = None
-    glob: str | None = None
-    ignore_hidden: bool = True
-
-
-class GrepMatchEntry(BaseModel):
-    """One grep hit, mirroring `GrepMatch`."""
-
-    path: str
-    line_number: int
-    line: str
-
-
-class GrepResponse(BaseModel):
-    """Grep hits, or `error` when the search itself failed.
-
-    Models `grep_raw`'s `list[GrepMatch] | str` return: `error` set means the
-    string branch, and `matches` is then empty.
-    """
-
-    matches: list[GrepMatchEntry] = Field(default_factory=list)
-    error: str | None = None
-
-
-class ExistsRequest(BaseModel):
-    """Test whether a path is a regular file."""
-
-    path: str
-
-
-class ExistsResponse(BaseModel):
-    """Whether the path is a regular file."""
-
-    exists: bool
 
 
 class CreateSessionRequest(BaseModel):
@@ -201,6 +148,15 @@ class CreateSessionRequest(BaseModel):
     opened with; a `runtime` that disagrees is rejected rather than ignored.
     """
 
+    attach: bool = False
+    """Only attach, never create: refuse with 404 when `session_id` names neither
+    an open session nor a workspace this service still holds.
+
+    What a client continuing earlier work needs. `reuse` alone opens a fresh,
+    empty session when the old one is gone, so the caller would carry on in an
+    empty directory believing its files were there. Implies `reuse`.
+    """
+
 
 class SessionEvent(BaseModel):
     """One operation performed against a session.
@@ -214,7 +170,7 @@ class SessionEvent(BaseModel):
     """Monotonic per-session sequence number, for incremental polling."""
     at: float
     op: str
-    """Operation name: `exec`, `read`, `write`, `edit`, `ls`, `glob`, `grep`, `exists`."""
+    """Operation name: `run` for a command, which is the one operation a session takes."""
     target: str
     """Command or path the operation addressed, truncated."""
     ok: bool

@@ -12,12 +12,6 @@
     options:
       show_root_heading: true
 
-## ConsoleDeps
-
-::: pydantic_ai_backends.toolsets.console.ConsoleDeps
-    options:
-      show_root_heading: true
-
 ## ToolText
 
 ::: pydantic_ai_backends.toolsets.descriptions.ToolText
@@ -58,8 +52,4 @@ async def grep(
     ignore_hidden: bool = True,
 ) -> str: ...
 async def execute(ctx, command: str, timeout: int | None = 120) -> str: ...
-async def run_in_background(ctx, command: str) -> str: ...
-async def read_output(ctx, shell_id: str) -> str: ...
-async def kill_shell(ctx, shell_id: str) -> str: ...
-async def list_shells(ctx) -> str: ...
 ```

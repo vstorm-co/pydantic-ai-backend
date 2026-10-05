@@ -5,7 +5,7 @@ to file operations and shell commands.
 
 Basic usage:
     ```python
-    from pydantic_ai_backends import LocalBackend
+    from pydantic_ai_backends import ConsoleCapability
     from pydantic_ai_backends.permissions import (
         DEFAULT_RULESET,
         PermissionChecker,
@@ -18,11 +18,8 @@ Basic usage:
     if checker.is_allowed("read", "/path/to/file.txt"):
         print("Read is allowed")
 
-    # Use with LocalBackend
-    backend = LocalBackend(
-        root_dir="/workspace",
-        permissions=DEFAULT_RULESET,
-    )
+    # Enforce it on the console tools
+    console = ConsoleCapability(permissions=DEFAULT_RULESET)
     ```
 
 Available presets:

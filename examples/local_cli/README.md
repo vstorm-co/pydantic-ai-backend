@@ -1,6 +1,6 @@
 # Local CLI Agent Example
 
-A full-featured CLI coding assistant using `LocalBackend` with `pydantic-ai`.
+A full-featured CLI coding assistant: the console tools in Pydantic AI's `LocalWorkspace`.
 
 ## Use Case
 
@@ -16,7 +16,7 @@ A full-featured CLI coding assistant using `LocalBackend` with `pydantic-ai`.
 pip install pydantic-ai-backend[console]
 
 # Set your API key
-export OPENAI_API_KEY="your-key"
+export ANTHROPIC_API_KEY="your-key"
 
 # Run interactive mode
 python cli_agent.py
@@ -35,13 +35,13 @@ python cli_agent.py
 python cli_agent.py --dir /path/to/project
 
 # Use a different model
-python cli_agent.py --model anthropic:claude-3-haiku
+python cli_agent.py --model anthropic:claude-sonnet-5-5
 
 # Disable shell execution (safer)
 python cli_agent.py --no-execute
 
-# Restrict file access to working directory only
-python cli_agent.py --restrict
+# Refuse every change and command; only the read tools are offered
+python cli_agent.py --read-only
 
 # Include hidden files when searching with grep
 python cli_agent.py --include-hidden
@@ -106,9 +106,10 @@ All tests passed!
 
 ## Security
 
-- Use `--restrict` to limit file access to working directory
-- Use `--no-execute` to disable shell commands
-- LocalBackend runs with your user permissions
+- `LocalWorkspace` runs commands with your user permissions and isolates nothing:
+  the working directory is where commands start, not a boundary
+- Use `--read-only` to refuse every change, or `--no-execute` to drop shell commands
+- For code you did not write, use an isolated workspace such as `DockerWorkspace`
 
 ---
 

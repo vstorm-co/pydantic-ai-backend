@@ -97,11 +97,11 @@ jobs:
           file: coverage.lcov
 
   pydantic-ai-range:
-    # The `console` extra declares `pydantic-ai-slim>=1.74.0`, and every job
+    # The `console` extra declares `pydantic-ai-slim>=2.52.0`, and every job
     # above installs whatever `uv.lock` pins — so the *declared* range was never
-    # exercised at either end. A floor is satisfiable by any 2.x release, which
-    # meant an application on 2.x installed this library cleanly and found out at
-    # runtime whether `prepare_tools` and `before_tool_execute` still behaved.
+    # exercised at either end. A floor is satisfiable by every later release, so
+    # an application on a newer one installs this library cleanly and finds out at
+    # runtime whether `prepare_tools` and `before_tool_execute` still behave.
     #
     # That failure is quiet in the direction that matters: a hook whose signature
     # no longer matches stops hiding the tools a ruleset denied, and the
@@ -111,7 +111,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pydantic-ai: ["1.74.0", "latest"]
+        pydantic-ai: ["2.52.0", "latest"]
     steps:
       - uses: actions/checkout@v7
 

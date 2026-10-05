@@ -10,13 +10,12 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic_ai import Agent, RunContext
 
-from pydantic_ai_backends import DockerSandbox, create_console_toolset, get_console_system_prompt
+from pydantic_ai_backends import create_console_toolset, get_console_system_prompt
 
 from .models import AnalyticsDeps, ChartSeries, DataPoint, LineChartData
 
@@ -157,18 +156,11 @@ async def predict(
             Example: 'Predict Widget Alpha units_sold for the next 6 months
             using linear regression on monthly totals across all regions'
     """
-    sandbox = ctx.deps.sandbox
+    workspace = ctx.deps.workspace
 
     # Write sales data into the Docker container
     data_path = Path(ctx.deps.data_path)
-    with open(data_path) as f:
-        data_content = f.read()
-    sandbox.write("/workspace/sales_data.json", data_content)
-
-    # Dependencies for the sub-agent (satisfies ConsoleDeps protocol)
-    @dataclass
-    class SandboxDeps:
-        backend: DockerSandbox
+    await workspace.write_text("/workspace/sales_data.json", data_path.read_text())
 
     console_toolset = create_console_toolset(
         include_execute=True,
@@ -178,7 +170,7 @@ async def predict(
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    sub_agent: Agent[SandboxDeps, str] = Agent(
+    sub_agent: Agent[None, str] = Agent(
         "openai:gpt-4.1",
         system_prompt=f"""\
 You are a data science code executor. You have a Python environment with pandas, \
@@ -221,15 +213,13 @@ range: between 0 and 3x the historical maximum for that metric.
 - If any prediction exceeds this range, fall back to simple Linear Regression.
 - Print a warning if fallback was triggered.\
 """,
-        deps_type=SandboxDeps,
         toolsets=[console_toolset],
     )
 
-    sub_deps = SandboxDeps(backend=sandbox)
-
+    # The sub-agent works in the same container: `workspace=` hands it over.
     result = await sub_agent.run(
         f"Perform this prediction task:\n\n{task_description}",
-        deps=sub_deps,
+        workspace=workspace,
     )
 
     return result.output
