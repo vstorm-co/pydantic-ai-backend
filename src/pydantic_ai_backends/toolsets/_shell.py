@@ -87,13 +87,16 @@ def grep_command(
     # file, and `parse_grep` then reads no match at all.
     options = ["-rnH"]
     if ignore_hidden:
-        # Directories only, and `.[!.]*` rather than `.*`. BSD grep matches both
-        # excludes against the path as it walks it - `./notes.txt` - so `.*`
-        # excluded the starting directory and a file exclude excluded every
-        # file, and a search of the working directory found nothing on macOS.
-        # Hidden files are dropped by `hidden_match` instead. Quoted, or the
-        # shell expands the pattern against the working directory.
-        options.append(f"--exclude-dir={shlex.quote('.[!.]*')}")
+        # Directories only - hidden files are dropped by `hidden_match` - and two
+        # patterns, because the two greps match them against different things.
+        # GNU grep tests a directory's base name (`.git`), which the first
+        # matches. BSD grep (macOS) tests the path as it walks it (`./.git`,
+        # `./src`), which the second matches for a hidden directory only: `.*`
+        # there excluded the starting directory, and `.[!.]*` excluded every
+        # subdirectory, since `[!.]` matches the `/` of `./src`. Quoted, or the
+        # shell expands the patterns against the working directory.
+        options.append(f"--exclude-dir={shlex.quote('.[!./]*')}")
+        options.append(f"--exclude-dir={shlex.quote('*/.[!.]*')}")
     if glob:
         options.append(f"--include={shlex.quote(glob)}")
     return f"grep {' '.join(options)} -e {shlex.quote(pattern)} {shlex.quote(path or '.')}"
