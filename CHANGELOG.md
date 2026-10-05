@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`DockerWorkspace(volumes=..., container_name=...)`.** `volumes` mounts host
+  directories into the container, so an agent can work on a project in place.
+  `container_name` gives every run the same container, named by whoever
+  configures the workspace: created on first use, attached after, by this
+  process or the next. A ref naming it must still find it there, and no ref
+  reaches another container through it. Both were reachable only by building
+  `DockerWorkspaceBackend` with a sandbox factory of your own.
+
+### Fixed
+
+- **The package ships `py.typed`.** Its annotations were invisible to type
+  checkers in projects that install it, which read every name as `Any`.
+
 ## [0.2.30] - 2026-10-05
 
 **⚠️ Breaking: the library is now built on Pydantic AI workspaces.** Pydantic AI

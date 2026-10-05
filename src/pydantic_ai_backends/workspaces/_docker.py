@@ -79,6 +79,10 @@ class DockerWorkspaceBackend(ContainerWorkspaceBackend):
             the image, runtime and limits, and must not start the container.
         ref: The workspace to attach to; `None` creates one on first use.
         env: Variables every command gets, under any a call passes.
+        container_name: A container chosen by whoever configures the workspace
+            rather than by this class: created under that name on first use
+            when it does not exist, attached when it does. A ref naming it must
+            still find it there, and no ref reaches any other container.
     """
 
     def __init__(
@@ -87,11 +91,16 @@ class DockerWorkspaceBackend(ContainerWorkspaceBackend):
         sandbox_factory: SandboxFactory,
         ref: WorkspaceRef | None = None,
         env: Mapping[str, str] | None = None,
+        container_name: str | None = None,
     ) -> None:
         async def open_container(name: str | None) -> tuple[str, RunnerSandbox]:
-            if name is None:
+            if container_name is not None and name is None:
+                # First use of a configured container: whatever state it is in,
+                # it is the one asked for, and starting the sandbox creates it.
+                name = container_name
+            elif name is None:
                 name = f"{CONTAINER_PREFIX}{uuid.uuid4().hex[:16]}"
-            elif not _created_here(name):
+            elif name != container_name and not _created_here(name):
                 raise SandboxUnavailableError(
                     f"container {name!r} was not created by a DockerWorkspace"
                 )
@@ -161,6 +170,22 @@ class DockerWorkspace(AbstractCapability[object]):
     env: Mapping[str, str] | None = field(default=None, repr=False)
     """Variables every command gets. Nothing is read from the host's environment."""
 
+    volumes: Mapping[str, str] | None = None
+    """Host directories mounted into the container, as `{"/host/path": "/container/path"}`.
+
+    Mounting a project at `work_dir` lets the agent work on its files in place;
+    the container then reaches exactly those host files.
+    """
+
+    container_name: str | None = None
+    """One container for every run, named by you: created on first use, attached after.
+
+    Without it each run without a ref gets a new container and only the ref
+    leads back to it. With it a later process finds the same container -
+    installed packages included - by name. A ref naming another container is
+    left to another capability.
+    """
+
     def __post_init__(self) -> None:
         if self.defer_loading:
             raise UserError(
@@ -178,11 +203,17 @@ class DockerWorkspace(AbstractCapability[object]):
             mem_limit=self.mem_limit,
             cpus=self.cpus,
             oci_runtime=self.oci_runtime,
+            volumes=dict(self.volumes) if self.volumes else None,
         )
 
     def backend(self, ref: WorkspaceRef | None = None) -> DockerWorkspaceBackend:
         """A backend for `ref`, or for a new container; no I/O until its first operation."""
-        return DockerWorkspaceBackend(sandbox_factory=self._sandbox, ref=ref, env=self.env)
+        return DockerWorkspaceBackend(
+            sandbox_factory=self._sandbox,
+            ref=ref,
+            env=self.env,
+            container_name=self.container_name,
+        )
 
     def get_workspace(
         self, ctx: RunContext[object], *, ref: WorkspaceRef | None
@@ -190,6 +221,8 @@ class DockerWorkspace(AbstractCapability[object]):
         """This run's backend, or `None` for a ref another provider owns."""
         del ctx
         if ref is not None and ref.provider != DOCKER_PROVIDER:
+            return None
+        if ref is not None and self.container_name is not None and ref.id != self.container_name:
             return None
         return self.backend(ref)
 
@@ -202,6 +235,6 @@ class DockerWorkspace(AbstractCapability[object]):
         """
         if ref.provider != DOCKER_PROVIDER:
             raise ValueError(f"expected a {DOCKER_PROVIDER!r} workspace ref, got {ref.provider!r}")
-        if not _created_here(ref.id):
+        if ref.id != self.container_name and not _created_here(ref.id):
             raise ValueError(f"container {ref.id!r} was not created by a DockerWorkspace")
         await anyio.to_thread.run_sync(_remove_container, ref.id)
