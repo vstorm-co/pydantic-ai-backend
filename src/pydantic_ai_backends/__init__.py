@@ -36,6 +36,7 @@ from pydantic_ai_backends.types import (
 )
 
 if TYPE_CHECKING:
+    from pydantic_ai_backends._confined import ConfinedWorkspace, WorkspacePathError
     from pydantic_ai_backends.backends.docker import BUILTIN_RUNTIMES, DockerSandbox, SessionManager
     from pydantic_ai_backends.backends.docker.runtimes import get_runtime
     from pydantic_ai_backends.backends.docker.session import SandboxFactory
@@ -105,6 +106,7 @@ if TYPE_CHECKING:
     )
 
 _LAZY_MODULES: dict[str, tuple[str, ...]] = {
+    "pydantic_ai_backends._confined": ("ConfinedWorkspace", "WorkspacePathError"),
     "pydantic_ai_backends.workspaces": (
         "DaytonaWorkspace",
         "DaytonaWorkspaceBackend",
@@ -212,6 +214,7 @@ __all__ = [
     "AskFallback",
     "CommandOutcome",
     "CommandRunner",
+    "ConfinedWorkspace",
     "ConsoleCapability",
     "ConsoleToolset",
     "DaytonaWorkspace",
@@ -248,6 +251,7 @@ __all__ = [
     "ToolText",
     "WorkspaceArchive",
     "WorkspaceArchiveError",
+    "WorkspacePathError",
     "apply_hashline_edit",
     "apply_hashline_edit_with_summary",
     "create_console_toolset",

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ConfinedWorkspace`.** Pydantic AI's local workspace confines nothing, so moving from
+  `LocalBackend(root_dir=...)` to it let the file tools - which usually run without
+  approval - write anywhere the process can. `ConfinedWorkspace` wraps any workspace and
+  refuses a file operation whose real path, symlinks followed, leaves its working directory,
+  with `WorkspacePathError` (a `PermissionError`); the console's `glob` and `grep` check
+  their search root the same way. Commands are not confined: isolate those with a sandbox.
+
 ### Fixed
 
 - **`grep` on macOS searched only the top directory.** BSD grep matches `--exclude-dir`

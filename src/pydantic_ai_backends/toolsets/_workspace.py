@@ -28,6 +28,7 @@ from pydantic_ai.workspaces import (
 )
 from wcmatch import glob as wcglob
 
+from pydantic_ai_backends._confined import confinement
 from pydantic_ai_backends._editing import Replacement, replace_in_content
 from pydantic_ai_backends._limits import MAX_EXECUTE_OUTPUT_BYTES
 from pydantic_ai_backends._text import bytes_to_text
@@ -229,7 +230,11 @@ class WorkspaceOps:
 
         Through `find` where the workspace runs commands, and by walking its
         directories otherwise, so a read-only or file-only workspace can search.
+
+        Raises:
+            WorkspacePathError: The workspace is confined and `path` leads out of it.
         """
+        await self._check_search_root(path)
         if self._runs_commands():
             return _shell.parse_glob(await self._search(_shell.glob_command(pattern, path)))
         root = "." if path.strip() in _shell.ROOT_SPELLINGS else path
@@ -256,6 +261,10 @@ class WorkspaceOps:
         Through `grep` where the workspace runs commands, and by reading its files
         otherwise. Either way a binary file is skipped rather than matched.
         """
+        try:
+            await self._check_search_root(path)
+        except WorkspaceError as error:
+            return f"Error: {error}"
         if self._runs_commands():
             command = _shell.grep_command(pattern, path, glob, ignore_hidden)
             found = _shell.parse_grep(await self._search(command))
@@ -293,6 +302,20 @@ class WorkspaceOps:
                 if regex.search(line)
             )
         return matches
+
+    async def _check_search_root(self, path: str | None) -> None:
+        """Refuse a search rooted outside a `ConfinedWorkspace`.
+
+        `find` and `grep` run as commands, which the confinement leaves alone, so
+        the root is checked here. Neither follows a symlink below the root - `find`
+        never does, `grep -r` only for one named on its command line, which is the
+        root itself - so the root is the one path that needs it.
+        """
+        confined = confinement(self._workspace)
+        if confined is not None:
+            await confined.check(
+                "." if path is None or path.strip() in _shell.ROOT_SPELLINGS else path
+            )
 
     async def _search(self, command: str) -> ExecuteResponse:
         """Run a `find` or `grep`, letting a workspace failure raise.
