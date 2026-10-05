@@ -137,6 +137,31 @@ jobs:
       - name: Run tests
         run: uv run --no-sync pytest -q
 
+  extras:
+    # Every job above installs all extras, so a module importing a package that no
+    # extra it ships with declares passes there - and fails for anyone installing
+    # just that extra. `workspaces` imported `httpx` from `remote` until 0.2.33, and
+    # every `pip install pydantic-deep` broke on it.
+    name: Extras (${{ matrix.extras }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        extras: ["console,workspaces"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Install the package with only these extras
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/extras"
+          uv pip install --python "$RUNNER_TEMP/extras/bin/python" ".[${{ matrix.extras }}]"
+
+      - name: Import every public name
+        run: '"$RUNNER_TEMP/extras/bin/python" scripts/import_every_export.py'
+
   image:
     # A Dockerfile only built at release time is one that breaks at release time.
     # Single platform and no push: this answers "does it still build and start",
@@ -177,7 +202,7 @@ jobs:
   all-checks:
     name: All Checks Passed
     runs-on: ubuntu-latest
-    needs: [lint, typecheck, test, pydantic-ai-range, image]
+    needs: [lint, typecheck, test, pydantic-ai-range, extras, image]
     steps:
       - name: All checks passed
         run: echo "All CI checks passed successfully!"

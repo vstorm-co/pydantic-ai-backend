@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `workspaces` extra installs `httpx`.** `SandboxdWorkspace` talks to its
+  service over HTTP, and importing any workspace imports it - so an install of
+  `workspaces` without `remote` could not import `pydantic_ai_backends.workspaces`
+  at all, and `pydantic-deep` 0.3.45 broke on import. CI now installs the package
+  with only these extras and imports every public name.
+
 ## [0.2.32] - 2026-10-05
 
 ### Added
