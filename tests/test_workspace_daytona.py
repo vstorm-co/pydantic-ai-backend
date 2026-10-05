@@ -69,8 +69,11 @@ class _Process:
 
 
 class _Sandbox:
-    def __init__(self, sandbox_id: str, state: _State = _State.STARTED) -> None:
+    def __init__(
+        self, sandbox_id: str, state: _State = _State.STARTED, name: str | None = None
+    ) -> None:
         self.id = sandbox_id
+        self.name = name or sandbox_id
         self.state = state
         self.started = 0
         self.process = _Process(self)
@@ -90,6 +93,8 @@ class _Daytona:
     opened: int = 0
     closed: int = 0
     params: list[Any] = field(default_factory=list)
+    conflict_once: bool = False
+    """Answer the next create with a conflict, as when another client just made it."""
 
     def __call__(self, config: Any = None) -> _Daytona:
         return self
@@ -103,14 +108,22 @@ class _Daytona:
 
     async def create(self, params: Any = None) -> _Sandbox:
         self.params.append(params)
-        sandbox = _Sandbox(f"sbx-{len(self.sandboxes)}")
+        name = getattr(params, "name", None)
+        if self.conflict_once:
+            self.conflict_once = False
+            self.sandboxes[f"sbx-{len(self.sandboxes)}"] = _Sandbox(
+                f"sbx-{len(self.sandboxes)}", name=name
+            )
+            raise daytona.DaytonaConflictError(f"Sandbox {name} already exists")
+        sandbox = _Sandbox(f"sbx-{len(self.sandboxes)}", name=name)
         self.sandboxes[sandbox.id] = sandbox
         return sandbox
 
-    async def get(self, sandbox_id: str) -> _Sandbox:
-        if sandbox_id not in self.sandboxes:
-            raise daytona.DaytonaNotFoundError(f"Sandbox {sandbox_id} not found")
-        return self.sandboxes[sandbox_id]
+    async def get(self, sandbox_id_or_name: str) -> _Sandbox:
+        for sandbox in self.sandboxes.values():
+            if sandbox_id_or_name in (sandbox.id, sandbox.name):
+                return sandbox
+        raise daytona.DaytonaNotFoundError(f"Sandbox {sandbox_id_or_name} not found")
 
     async def delete(self, sandbox: _Sandbox) -> None:
         self.deleted.append(sandbox.id)
@@ -215,6 +228,53 @@ class TestDaytonaWorkspaceBackend:
     def test_a_ref_from_another_provider_is_refused(self) -> None:
         with pytest.raises(ValueError, match="'daytona' workspace ref"):
             DaytonaWorkspaceBackend(ref=WorkspaceRef(provider="docker", id="x"))
+
+
+class TestNamedSandboxes:
+    """`sandbox_name`: the configurer names the sandbox, so any client finds it."""
+
+    async def test_the_first_operation_creates_it_under_the_name(self, fake: _Daytona) -> None:
+        params = daytona.CreateSandboxFromSnapshotParams(language="python")
+        backend = DaytonaWorkspace(sandbox_name="conv-1", create_params=params).backend()
+        await backend.run(["true"])
+        assert backend.ref == WorkspaceRef(provider="daytona", id="conv-1")
+        assert fake.params[0].name == "conv-1" and fake.params[0].language == "python"
+        assert params.name is None
+
+    async def test_an_existing_one_is_attached_and_started(self, fake: _Daytona) -> None:
+        fake.sandboxes["sbx-9"] = _Sandbox("sbx-9", _State.STOPPED, name="conv-2")
+        backend = DaytonaWorkspace(sandbox_name="conv-2").backend()
+        await backend.run(["true"])
+        assert fake.params == []
+        assert fake.sandboxes["sbx-9"].started == 1
+        assert backend.ref == WorkspaceRef(provider="daytona", id="conv-2")
+
+    async def test_one_created_meanwhile_is_attached(self, fake: _Daytona) -> None:
+        fake.conflict_once = True
+        backend = DaytonaWorkspace(sandbox_name="conv-3").backend()
+        await backend.run(["true"])
+        assert len(fake.sandboxes) == 1
+
+    async def test_one_gone_for_good_is_unavailable(self, fake: _Daytona) -> None:
+        fake.sandboxes["sbx-9"] = _Sandbox("sbx-9", _State.DESTROYED, name="conv-4")
+        backend = DaytonaWorkspace(sandbox_name="conv-4").backend()
+        with pytest.raises(WorkspaceUnavailableError, match="is destroyed"):
+            await backend.run(["true"])
+        assert fake.params == []
+
+    async def test_a_ref_still_only_attaches(self, fake: _Daytona) -> None:
+        capability = DaytonaWorkspace(sandbox_name="conv-5")
+        backend = capability.backend(WorkspaceRef(provider="daytona", id="conv-5"))
+        with pytest.raises(WorkspaceUnavailableError, match="no longer exists"):
+            await backend.run(["true"])
+        assert fake.params == []
+
+    def test_a_ref_naming_another_sandbox_is_left_to_another_capability(self) -> None:
+        capability = DaytonaWorkspace(sandbox_name="conv-6")
+        ctx: Any = None
+        assert capability.get_workspace(ctx, ref=WorkspaceRef(provider="daytona", id="x")) is None
+        named = WorkspaceRef(provider="daytona", id="conv-6")
+        assert isinstance(capability.get_workspace(ctx, ref=named), DaytonaWorkspaceBackend)
 
 
 class TestDaytonaWorkspace:
