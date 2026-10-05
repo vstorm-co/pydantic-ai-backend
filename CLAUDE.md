@@ -94,4 +94,4 @@ uv run pytest -v -s
 
 ## Integration
 
-This library is used by [pydantic-deep](https://github.com/vstorm-co/pydantic-deep) which re-exports its API. Changes here affect pydantic-deep users.
+This library is used by [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) which re-exports its API. Changes here affect pydantic-deep users.
