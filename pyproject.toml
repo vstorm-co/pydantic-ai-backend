@@ -29,6 +29,8 @@ dependencies = [
 console = [
     # The console tools work in `ctx.workspace`, which arrived in 2.52.0.
     "pydantic-ai-slim>=2.52.0",
+    # `read_file` decodes every text file through encoding detection.
+    "chardet>=5.2.0",
 ]
 workspaces = [
     # Workspaces landed in 2.52.0: `pydantic_ai.workspaces` and `RunContext.workspace`.

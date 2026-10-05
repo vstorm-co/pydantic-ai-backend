@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `console` extra installs `chardet`.** `read_file` decodes every text file
+  through encoding detection, and `chardet` came only with the `docker` and `server`
+  extras - so an application installing `console` without them, as one whose sandboxes
+  run elsewhere does, had every read answered "chardet is required".
+
 ## [0.2.31] - 2026-10-05
 
 ### Added
