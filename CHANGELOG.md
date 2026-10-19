@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.34] - 2026-10-19
+
 ### Added
 
 - **`python -m pydantic_ai_backends.remote.prepare`, and `prepare_runtimes()`
