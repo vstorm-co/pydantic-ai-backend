@@ -97,6 +97,18 @@ class ReadBytesResponse(BaseModel):
     content_b64: str
 
 
+class FilePathRequest(BaseModel):
+    """One path in a live session's work directory, for a native file operation."""
+
+    path: str
+
+
+NOT_NATIVE_STATUS = 409
+"""What a native file route answers for a path the sandbox has to resolve: a
+symlink, a special file, one outside the work directory. The client then takes
+the shell path for that one call."""
+
+
 class LsRequest(BaseModel):
     """List one directory."""
 
@@ -320,6 +332,13 @@ class ServicePolicy(BaseModel):
     """Whether the allowlist is pulled and built at startup rather than on demand."""
     buildkit: bool = False
     """Whether image builds use BuildKit, and so keep package caches between them."""
+    native_files: bool = False
+    """Whether a session's file operations are served off the host, not by its sandbox.
+
+    Defaults off, so a client talking to a service older than this falls back to
+    the shell path rather than calling routes that are not there."""
+    native_writes: bool = False
+    """Whether writes are served that way too, and not only reads."""
 
 
 class RuntimeLimitsUpdate(BaseModel):

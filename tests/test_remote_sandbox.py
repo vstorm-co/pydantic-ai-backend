@@ -1449,6 +1449,35 @@ class TestWorkspaceArchiveRoutes:
             ).json()
             assert "escape.txt" not in [row["name"] for row in listed]
 
+    def test_a_listing_through_a_link_is_refused(self, stored):
+        harness, workspace = stored
+        (workspace / "elsewhere").symlink_to(workspace.parent.parent)
+        with harness.client() as client:
+            response = client.post(
+                "/workspaces/cold/ls", json={"path": "elsewhere"}, headers=_service_headers()
+            )
+        assert response.status_code == 400
+
+    def test_a_link_inside_the_workspace_is_not_followed_either(self, stored):
+        """Resolving and then opening left a window in which a live sandbox could
+        swap the target for a link out; so no link is followed at all now."""
+        harness, workspace = stored
+        (workspace / "real.txt").write_text("inside\n")
+        (workspace / "alias.txt").symlink_to("real.txt")
+
+        with harness.client() as client:
+            response = client.post(
+                "/workspaces/cold/read_bytes",
+                json={"path": "alias.txt"},
+                headers=_service_headers(),
+            )
+            listed = client.post(
+                "/workspaces/cold/ls", json={"path": "."}, headers=_service_headers()
+            ).json()
+
+        assert response.status_code == 400
+        assert "alias.txt" not in [row["name"] for row in listed]
+
     def test_an_absolute_host_path_lands_inside_the_workspace(self, stored):
         """`/etc/passwd` becomes `etc/passwd` under the workspace, so it is absent."""
         harness, _ = stored
@@ -3480,3 +3509,167 @@ class TestAsyncSandboxThroughTheService:
 
         assert _usage_of(NoUsage()) is None
         del app
+
+
+class TestNativeFiles:
+    """A live session's file operations, served off its host directory (#perf)."""
+
+    def _workspace(self, harness: Harness, session_id: str) -> Path:
+        assert harness.config.workspace_root is not None
+        return Path(harness.config.workspace_root) / session_id / "workspace"
+
+    def _call(self, client: TestClient, sid: str, token: str, op: str, path: str):
+        return client.post(
+            f"/sessions/{sid}/files/{op}", json={"path": path}, headers={wire.TOKEN_HEADER: token}
+        )
+
+    def test_the_policy_says_what_is_native(self, tmp_path: Path) -> None:
+        with Harness(workspace_root=str(tmp_path)).client() as client:
+            policy = client.get("/policy", headers=_service_headers()).json()
+        assert policy["native_files"] is True
+        assert policy["native_writes"] is True
+
+    def test_without_a_workspace_root_nothing_is(self, client: TestClient) -> None:
+        sid, token = _open_session(client)
+        policy = client.get("/policy", headers=_service_headers()).json()
+        assert (policy["native_files"], policy["native_writes"]) == (False, False)
+        response = self._call(client, sid, token, "read", "/workspace/a")
+        assert response.status_code == wire.NOT_NATIVE_STATUS
+
+    def test_a_sandbox_of_another_user_keeps_its_writes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Files this service creates would be its own user's, not the sandbox's."""
+        from pydantic_ai_backends.remote import server as server_module
+
+        harness = Harness(workspace_root=str(tmp_path), sandbox_uid=os.geteuid())
+        with harness.client() as client:
+            sid, token = _open_session(client)
+            # The service running as somebody else than the sandbox, after the open
+            # that needed them to match to hand the workspace over.
+            monkeypatch.setattr(server_module.os, "geteuid", lambda: 0)
+            (self._workspace(harness, sid) / "a.txt").write_text("readable")
+            assert (
+                client.get("/policy", headers=_service_headers()).json()["native_writes"] is False
+            )
+            assert self._call(client, sid, token, "read", "/workspace/a.txt").content == b"readable"
+            for op in ("mkdir", "remove"):
+                assert self._call(client, sid, token, op, "/workspace/x").status_code == 409
+            written = client.post(
+                f"/sessions/{sid}/files/write",
+                params={"path": "/workspace/b"},
+                content=b"x",
+                headers={wire.TOKEN_HEADER: token},
+            )
+            assert written.status_code == wire.NOT_NATIVE_STATUS
+
+    def test_a_round_trip_through_every_route(self, tmp_path: Path) -> None:
+        harness = Harness(workspace_root=str(tmp_path))
+        with harness.client() as client:
+            sid, token = _open_session(client)
+            headers = {wire.TOKEN_HEADER: token}
+
+            written = client.post(
+                f"/sessions/{sid}/files/write",
+                params={"path": "/workspace/src/main.py"},
+                content=b"print(1)\n",
+                headers=headers,
+            )
+            assert written.status_code == 204
+            assert self._call(client, sid, token, "read", "/workspace/src/main.py").content == (
+                b"print(1)\n"
+            )
+            assert self._call(client, sid, token, "stat", "/workspace/src/main.py").json() == {
+                "name": "main.py",
+                "path": "/workspace/src/main.py",
+                "is_dir": False,
+                "size": 9,
+                "modified_at": None,
+            }
+            listed = self._call(client, sid, token, "list", "/workspace/src").json()
+            assert [row["name"] for row in listed] == ["main.py"]
+            assert self._call(client, sid, token, "mkdir", "/workspace/out").status_code == 204
+            assert self._call(client, sid, token, "remove", "/workspace/src").status_code == 204
+            assert not (self._workspace(harness, sid) / "src").exists()
+
+            ops = [
+                event["op"]
+                for event in client.get(f"/sessions/{sid}/events", headers=headers).json()["events"]
+            ]
+            assert ops == ["write", "read", "stat", "ls", "mkdir", "remove"]
+
+    def test_what_the_sandbox_must_resolve_is_handed_back(self, tmp_path: Path) -> None:
+        harness = Harness(workspace_root=str(tmp_path))
+        with harness.client() as client:
+            sid, token = _open_session(client)
+            (self._workspace(harness, sid) / "link").symlink_to("/etc/hostname")
+
+            linked = self._call(client, sid, token, "read", "/workspace/link")
+            outside = self._call(client, sid, token, "read", "/etc/hostname")
+
+        assert linked.status_code == wire.NOT_NATIVE_STATUS
+        assert outside.status_code == wire.NOT_NATIVE_STATUS
+
+    def test_path_errors_carry_their_type(self, tmp_path: Path) -> None:
+        harness = Harness(workspace_root=str(tmp_path))
+        with harness.client() as client:
+            sid, token = _open_session(client)
+            (self._workspace(harness, sid) / "dir").mkdir()
+
+            missing = self._call(client, sid, token, "read", "/workspace/absent")
+            directory = self._call(client, sid, token, "read", "/workspace/dir")
+            relative = self._call(client, sid, token, "read", "relative")
+
+        assert missing.status_code == 404
+        assert missing.json()["detail"]["error"] == "FileNotFoundError"
+        assert directory.status_code == 400
+        assert directory.json()["detail"]["error"] == "IsADirectoryError"
+        assert relative.json()["detail"]["error"] == "ValueError"
+
+    def test_a_file_the_service_may_not_open_is_handed_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The sandbox may still be able to read it."""
+        from pydantic_ai_backends.remote import _hostfs
+
+        def refused(*_args: Any, **_kwargs: Any) -> bytes:
+            raise PermissionError("denied")
+
+        monkeypatch.setattr(_hostfs, "read", refused)
+        with Harness(workspace_root=str(tmp_path)).client() as client:
+            sid, token = _open_session(client)
+            response = self._call(client, sid, token, "read", "/workspace/a")
+        assert response.status_code == wire.NOT_NATIVE_STATUS
+
+    def test_a_write_over_the_ceiling_is_the_sandboxs(self, tmp_path: Path) -> None:
+        with Harness(workspace_root=str(tmp_path), max_read_bytes=4).client() as client:
+            sid, token = _open_session(client)
+            response = client.post(
+                f"/sessions/{sid}/files/write",
+                params={"path": "/workspace/big"},
+                content=b"too large",
+                headers={wire.TOKEN_HEADER: token},
+            )
+        assert response.status_code == wire.NOT_NATIVE_STATUS
+
+    def test_a_file_operation_counts_as_activity(self, tmp_path: Path) -> None:
+        """A run that only edits files must not be reaped as idle."""
+        harness = Harness(workspace_root=str(tmp_path))
+        with harness.client() as client:
+            sid, token = _open_session(client)
+            touched: list[bool] = []
+            harness.built[sid].touch = lambda: touched.append(True)  # type: ignore[attr-defined]
+            self._call(client, sid, token, "stat", "/workspace")
+        assert touched == [True]
+
+
+async def test_the_service_raises_the_ceiling_on_running_commands() -> None:
+    """Forty, anyio's default, made the forty-first command wait for a slot."""
+    import anyio.to_thread
+
+    service = Harness(max_running_commands=123).app.state.service
+    service.startup()
+    try:
+        assert anyio.to_thread.current_default_thread_limiter().total_tokens == 123
+    finally:
+        await service.shutdown()

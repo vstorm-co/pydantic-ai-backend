@@ -23,6 +23,8 @@ from fastapi.testclient import TestClient
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.workspaces import (
     LocalWorkspaceBackend,
+    SupportsFilesystem,
+    Workspace,
     WorkspaceBackend,
     WorkspaceOutputLimitError,
     WorkspaceRef,
@@ -650,3 +652,198 @@ class TestPurgeRaces:
 
         async with _answering(handler) as client:
             await SandboxdWorkspaceBackend("http://sandboxd", token="t", client=client).purge()
+
+
+def _native(request: httpx.Request, *, writes: bool = True) -> httpx.Response | None:
+    """`_opened`, from a service that serves file operations off the host."""
+    if request.url.path == "/policy":
+        policy = wire.ServicePolicy(execute_timeout=60, native_files=True, native_writes=writes)
+        return httpx.Response(200, content=policy.model_dump_json())
+    return _opened(request)
+
+
+class TestNativeFileOperations:
+    """One request per file operation where the service offers it, the shell where not."""
+
+    async def test_each_operation_is_one_request_and_no_command(self) -> None:
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if (opened := _native(request)) is not None:
+                return opened
+            seen.append(request.url.path.rsplit("/", 1)[1])
+            op = seen[-1]
+            if op == "read":
+                return httpx.Response(200, content=b"bytes")
+            if op == "stat":
+                entry = wire.FileEntry(name="a", path="/workspace/a", is_dir=False, size=5)
+                return httpx.Response(200, content=entry.model_dump_json())
+            if op == "list":
+                return httpx.Response(
+                    200, json=[{"name": "a", "path": "/workspace/a", "is_dir": True}]
+                )
+            if op == "write":
+                assert request.url.params["path"] == "/workspace/a"
+                assert request.content == b"new"
+            return httpx.Response(204)
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend("http://x", token="t", client=client)
+            assert await backend.read_bytes("/workspace/a") == b"bytes"
+            await backend.write_bytes("/workspace/a", b"new")
+            assert (await backend.stat("/workspace/a")).size == 5
+            assert (await backend.list_dir("/workspace"))[0].is_dir
+            await backend.make_dir("/workspace/d")
+            await backend.remove("/workspace/d")
+            assert await backend.exists("/workspace/a") is True
+        assert seen == ["read", "write", "stat", "list", "mkdir", "remove", "stat"]
+
+    async def test_what_the_service_hands_back_goes_through_the_shell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The shell path itself is the conformance suite's to prove, against Docker."""
+        handed: list[tuple[str, str]] = []
+
+        class Shell:
+            def __getattr__(self, op: str) -> Any:
+                async def call(path: str, *_args: Any) -> Any:
+                    handed.append((op, path))
+                    return [] if op == "list_dir" else b"" if op == "read_bytes" else None
+
+                return call
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if (opened := _native(request)) is not None:
+                return opened
+            return httpx.Response(wire.NOT_NATIVE_STATUS, json={"detail": "a link"})
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend("http://x", token="t", client=client)
+            monkeypatch.setattr(backend, "_shell", Shell)
+            await backend.read_bytes("/workspace/l")
+            await backend.write_bytes("/workspace/l", b"x")
+            await backend.stat("/workspace/l")
+            await backend.list_dir("/workspace/l")
+            await backend.make_dir("/workspace/l")
+            await backend.remove("/workspace/l")
+        assert [op for op, _ in handed] == [
+            "read_bytes",
+            "write_bytes",
+            "stat",
+            "list_dir",
+            "make_dir",
+            "remove",
+        ]
+
+    async def test_the_shell_path_is_a_workspace_over_its_commands(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            ran = wire.RunResponse(stdout="/workspace\n", stderr="", exit_code=0)
+            return _native(request) or httpx.Response(200, content=ran.model_dump_json())
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend("http://x", token="t", client=client)
+            shell = backend._shell()
+            assert isinstance(shell, Workspace)
+            assert not isinstance(shell.backend, SupportsFilesystem)
+            assert await shell.working_dir() == "/workspace"
+            assert shell.ref == backend.ref
+
+    async def test_a_service_without_native_files_is_only_ever_asked_for_commands(
+        self,
+    ) -> None:
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            ran = wire.RunResponse(stdout="", stderr="", exit_code=0)
+            return _opened(request) or httpx.Response(200, content=ran.model_dump_json())
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend("http://x", token="t", client=client)
+            await backend.make_dir("/workspace/d")
+        assert not any("/files/" in path for path in paths)
+
+    async def test_a_service_that_keeps_writes_reads_natively_and_writes_by_shell(self) -> None:
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if (opened := _native(request, writes=False)) is not None:
+                return opened
+            paths.append(request.url.path)
+            if request.url.path.endswith("/files/read"):
+                return httpx.Response(200, content=b"x")
+            ran = wire.RunResponse(stdout="", stderr="", exit_code=0)
+            return httpx.Response(200, content=ran.model_dump_json())
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend("http://x", token="t", client=client)
+            assert await backend.read_bytes("/workspace/a") == b"x"
+            await backend.make_dir("/workspace/d")
+        assert paths[0].endswith("/files/read")
+        assert all(path.endswith("/run") for path in paths[1:])
+
+    @pytest.mark.parametrize(
+        ("status", "error", "raised"),
+        [
+            (404, "FileNotFoundError", FileNotFoundError),
+            (400, "IsADirectoryError", IsADirectoryError),
+            (400, "NotADirectoryError", NotADirectoryError),
+            (400, "FileExistsError", FileExistsError),
+            (400, "ValueError", ValueError),
+        ],
+    )
+    async def test_a_path_error_is_the_builtin_one(
+        self, status: int, error: str, raised: type[Exception]
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            opened = _native(request)
+            if opened is not None:
+                return opened
+            return httpx.Response(status, json={"detail": {"error": error, "message": "it"}})
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend("http://x", token="t", client=client)
+            with pytest.raises(raised):
+                await backend.read_bytes("/workspace/a")
+
+    async def test_a_missing_path_does_not_exist(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            opened = _native(request)
+            if opened is not None:
+                return opened
+            detail = {"error": "FileNotFoundError", "message": "no"}
+            return httpx.Response(404, json={"detail": detail})
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend("http://x", token="t", client=client)
+            assert await backend.exists("/workspace/absent") is False
+
+    @pytest.mark.parametrize("body", [{"detail": "No such session: s-1"}, None])
+    async def test_a_gone_session_is_unavailable(self, body: dict[str, str] | None) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            opened = _native(request)
+            if opened is not None:
+                return opened
+            return httpx.Response(404, json=body) if body else httpx.Response(410, text="gone")
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend("http://x", token="t", client=client)
+            with pytest.raises(WorkspaceUnavailableError):
+                await backend.read_bytes("/workspace/a")
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            httpx.Response(400, text="not json"),
+            httpx.Response(400, json={"detail": {"error": "SomethingElse"}}),
+            httpx.Response(500, text="boom"),
+        ],
+    )
+    async def test_anything_else_is_an_http_error(self, response: httpx.Response) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _native(request) or response
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend("http://x", token="t", client=client)
+            with pytest.raises(httpx.HTTPStatusError):
+                await backend.read_bytes("/workspace/a")

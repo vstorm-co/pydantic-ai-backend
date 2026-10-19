@@ -684,15 +684,50 @@ listing showed it.
 ### Why this is the most careful code in the module
 
 These endpoints read the host filesystem, so path containment is the only thing
-between a caller and the rest of the machine. Two ways in are closed, both by
-resolving first and checking after:
+between a caller and the rest of the machine. Two ways in are closed:
 
-- `..` in a requested path.
+- `..` in a requested path, refused before anything is opened.
 - **A symlink the sandbox itself planted.** Untrusted code in a container can run
   `ln -s /etc/shadow notes.txt`. Inside the container that points at the
-  container's own file; read from the host side it would resolve to the host's. So
-  a path that resolves outside the workspace is refused even when the link sits
-  inside it, and such an entry is omitted from a listing rather than reported.
+  container's own file; read from the host side it would resolve to the host's.
+  Checking where a path resolves and then opening it is not enough, because a live
+  sandbox can swap a directory for a link in between. So nothing is opened by
+  name: every component is opened from its parent's descriptor with `O_NOFOLLOW`.
+  A link is never followed, wherever it points, and a listing leaves links out.
+
+## A live session's files, off the host
+
+With a `workspace_root`, the service also answers a live session's file operations
+itself: `/sessions/{id}/files/read`, `write`, `stat`, `list`, `mkdir` and `remove`,
+under the session's token. They work the way the archive routes above do, from the
+session's directory on the host, through descriptors that follow no link.
+`SandboxdWorkspace` uses them whenever `/policy` says `native_files`.
+
+Without them, Pydantic AI derives every file operation from shell commands in the
+container, one or more `docker exec` each. Measured on Docker Desktop:
+
+| Operation | Through the shell | Native |
+|---|---|---|
+| read a 1 KB file | 107 ms | 4 ms |
+| write a 2 KB file | 155 ms | 4 ms |
+| read a 300 KB file | 321 ms | 4 ms |
+| write a 300 KB file | 502 ms | 4 ms |
+| list a directory | 52 ms | 4 ms |
+
+Some paths are handed back for the shell to handle, answered with `409` for that
+one call:
+
+- a path through or to a link;
+- a special file;
+- a path outside the work directory;
+- a file larger than `max_read_bytes`;
+- a file the service may not open.
+
+Those are the sandbox's to resolve in its own view.
+
+Writes are native only when the sandbox runs as the service's own user, or as
+root. Otherwise a file the service created would be one the sandbox could read
+and not change. `SANDBOXD_NATIVE_FILES=0` turns all of it off.
 
 ### Never hand a session token to a browser
 
@@ -741,6 +776,11 @@ sees `WorkspaceUnavailableError` instead of carrying on in an empty directory.
 - Blocking sandbox calls run on the service's own thread pool (`max_workers`),
   kept separate from asyncio's shared default one because sandbox commands are
   long.
+- A running command holds a thread for as long as it runs, reading its output.
+  `max_running_commands` (`SANDBOXD_MAX_RUNNING_COMMANDS`, 256 by default) is how
+  many may run at once across every session. It was anyio's default of 40, so the
+  forty-first command on the service - an `ls` in somebody else's session - waited
+  for one of them to finish.
 
 ## Observability
 

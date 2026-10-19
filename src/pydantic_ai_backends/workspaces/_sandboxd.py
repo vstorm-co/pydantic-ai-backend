@@ -11,13 +11,16 @@ from dataclasses import dataclass, field
 
 import anyio
 import httpx
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.workspaces import (
     CommandResult,
+    FileEntry,
     SupportsCommands,
+    SupportsFilesystem,
+    Workspace,
     WorkspaceBackend,
     WorkspaceCommand,
     WorkspaceRef,
@@ -71,16 +74,85 @@ class _Session:
     session_id: str
     token: str
     execute_timeout: float
+    native_reads: bool = False
+    native_writes: bool = False
 
 
-class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
+_PATH_ERRORS: dict[str, type[Exception]] = {
+    "FileNotFoundError": FileNotFoundError,
+    "IsADirectoryError": IsADirectoryError,
+    "NotADirectoryError": NotADirectoryError,
+    "FileExistsError": FileExistsError,
+    "ValueError": ValueError,
+}
+"""The path errors a native file route reports, by the name it sends."""
+
+
+_ENTRIES: TypeAdapter[list[wire.FileEntry]] = TypeAdapter(list[wire.FileEntry])
+
+
+def _entry(row: wire.FileEntry) -> FileEntry:
+    return FileEntry(name=row.name, path=row.path, is_dir=row.is_dir, size=row.size)
+
+
+def _path_error(response: httpx.Response) -> Exception | None:
+    """The builtin error a native route reported, if it reported one."""
+    if response.status_code not in (400, 404):
+        return None
+    try:
+        detail = response.json().get("detail")
+    except ValueError:
+        return None
+    if not isinstance(detail, dict):
+        return None
+    kind = _PATH_ERRORS.get(str(detail.get("error")))
+    return None if kind is None else kind(str(detail.get("message", "")))
+
+
+class _CommandsOnly:
+    """A backend seen through its commands alone, for the shell-derived file operations.
+
+    `Workspace` derives every file operation from `run` when its backend has no
+    native filesystem. Wrapped in this, the sandboxd backend is such a backend
+    again, which is the path a native route hands an operation back to.
+    """
+
+    def __init__(self, backend: SandboxdWorkspaceBackend) -> None:
+        self._backend = backend
+
+    @property
+    def ref(self) -> WorkspaceRef | None:
+        return self._backend.ref
+
+    async def working_dir(self) -> str:
+        return await self._backend.working_dir()
+
+    async def run(
+        self,
+        command: WorkspaceCommand,
+        *,
+        shell: bool = False,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> CommandResult:
+        return await self._backend.run(command, shell=shell, env=env, timeout=timeout)
+
+
+class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem):
     """One `sandboxd` session, as the environment an agent run works in.
 
     Commands go through the service's `/run`, which keeps stdout and stderr
-    apart, reports a vanished sandbox as one and can be stopped; `Workspace`
-    derives file operations through them. The session's files live on the
-    service host, so a ref still attaches after the container was reaped, for as
-    long as the service keeps the workspace (its `workspace_ttl`).
+    apart, reports a vanished sandbox as one and can be stopped. The session's
+    files live on the service host, so a ref still attaches after the container
+    was reaped, for as long as the service keeps the workspace (its
+    `workspace_ttl`).
+
+    **File operations are served off that host directory** where the service
+    says it can (`ServicePolicy.native_files`): a read or a write is then one
+    request handled in a millisecond, instead of the one to nine `docker exec`s
+    the shell derivation costs. A path the service hands back - a symlink, a
+    special file, anything outside the work directory - and every operation on
+    a service that does not offer this, goes through the shell as before.
 
     Every command is bounded by the service's `execute_timeout`, including one
     asking for no timeout: the service enforces its ceiling on every caller.
@@ -258,6 +330,8 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
             session_id=created.session.session_id,
             token=created.token,
             execute_timeout=float(policy.execute_timeout),
+            native_reads=policy.native_files,
+            native_writes=policy.native_writes,
         )
 
     async def _connect(self) -> _Session:
@@ -349,6 +423,100 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         return command_result(
             outcome, timeout=applied, limit=ran.output_limit or MAX_RUN_OUTPUT_BYTES
         )
+
+    async def read_bytes(self, path: str) -> bytes:
+        """A file's contents; see `SupportsFilesystem.read_bytes`."""
+        response = await self._native("read", path, writes=False)
+        return (await self._shell().read_bytes(path)) if response is None else response.content
+
+    async def write_bytes(self, path: str, data: bytes) -> None:
+        """Write a file, creating its parents; see `SupportsFilesystem.write_bytes`."""
+        if await self._native("write", path, writes=True, content=data) is None:
+            await self._shell().write_bytes(path, data)
+
+    async def stat(self, path: str) -> FileEntry:
+        """A path's metadata; see `SupportsFilesystem.stat`."""
+        response = await self._native("stat", path, writes=False)
+        if response is None:
+            return await self._shell().stat(path)
+        return _entry(wire.FileEntry.model_validate_json(response.content))
+
+    async def list_dir(self, path: str) -> list[FileEntry]:
+        """A directory's entries; see `SupportsFilesystem.list_dir`."""
+        response = await self._native("list", path, writes=False)
+        if response is None:
+            return list(await self._shell().list_dir(path))
+        rows = _ENTRIES.validate_json(response.content)
+        return [_entry(row) for row in rows]
+
+    async def make_dir(self, path: str) -> None:
+        """`mkdir -p`; see `SupportsFilesystem.make_dir`."""
+        if await self._native("mkdir", path, writes=True) is None:
+            await self._shell().make_dir(path)
+
+    async def remove(self, path: str) -> None:
+        """Remove a file or a tree; see `SupportsFilesystem.remove`."""
+        if await self._native("remove", path, writes=True) is None:
+            await self._shell().remove(path)
+
+    async def exists(self, path: str) -> bool:
+        """Whether something is at `path`; see `SupportsFilesystem.exists`."""
+        try:
+            await self.stat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return True
+
+    def _shell(self) -> Workspace:
+        """The shell-derived file operations, for what the service hands back."""
+        return Workspace(_CommandsOnly(self))
+
+    async def _native(
+        self, op: str, path: str, *, writes: bool, content: bytes | None = None
+    ) -> httpx.Response | None:
+        """Ask the service to do one file operation itself.
+
+        Returns:
+            The answer, or `None` when the service does not do this one natively
+            - it said so in its policy, or handed this path back - and the shell
+            has to.
+
+        Raises:
+            The builtin path error the service reported, or
+            `WorkspaceUnavailableError` for a session that is gone.
+        """
+        session = await self._connect()
+        if not (session.native_writes if writes else session.native_reads):
+            return None
+        route = f"/sessions/{session.session_id}/files/{op}"
+        headers = {wire.TOKEN_HEADER: session.token}
+        async with self._http() as client:
+            if content is None:
+                response = await client.post(
+                    self._url(route),
+                    json={"path": path},
+                    headers=headers,
+                    timeout=self._request_timeout,
+                )
+            else:
+                response = await client.post(
+                    self._url(route),
+                    params={"path": path},
+                    content=content,
+                    headers={**headers, "content-type": "application/octet-stream"},
+                    timeout=self._request_timeout,
+                )
+        if response.status_code == wire.NOT_NATIVE_STATUS:
+            return None
+        error = _path_error(response)
+        if error is not None:
+            raise error
+        if response.status_code in _GONE:
+            raise WorkspaceUnavailableError(
+                f"sandboxd session {session.session_id!r} is gone: {response.text}"
+            )
+        response.raise_for_status()
+        return response
 
     async def purge(self) -> None:
         """Close this backend's session and delete its files. Already gone is fine.
