@@ -2123,11 +2123,85 @@ class TestPrewarming:
             default_runtime="z-fine",
         )
 
+        monkeypatch.setattr("pydantic_ai_backends.remote.server.time.sleep", lambda _s: None)
         with caplog.at_level("ERROR"):
             _default_prewarm(config)()
 
         assert pulled == ["python:3.12-slim"]
         assert "Could not prepare runtime a-broken" in caplog.text
+
+    def _fake_docker(self, monkeypatch, resolve) -> None:
+        client_module = types.ModuleType("pydantic_ai_backends.backends.docker._client")
+        client_module.docker_client = lambda: object()
+        monkeypatch.setitem(
+            sys.modules, "pydantic_ai_backends.backends.docker._client", client_module
+        )
+        image_module = types.ModuleType("pydantic_ai_backends.backends.docker._image")
+        image_module.pull_if_absent = lambda _client, _image: False
+        image_module.resolve_image = resolve
+        monkeypatch.setitem(
+            sys.modules, "pydantic_ai_backends.backends.docker._image", image_module
+        )
+
+    def test_a_build_that_fails_once_is_tried_again(self, monkeypatch, caplog):
+        """The first build of a changed runtime on a production host died
+        exporting a layer, and the next one succeeded."""
+        from pydantic_ai_backends.remote.server import SandboxRuntime, prepare_runtimes
+
+        tries: list[str] = []
+
+        def resolve(_client, runtime, _fallback):
+            tries.append(runtime.name)
+            if len(tries) == 1:
+                raise RuntimeError("failed to export layer: CreateDiff")
+
+        self._fake_docker(monkeypatch, resolve)
+        waited: list[float] = []
+        config = SandboxdConfig(
+            token="t",
+            runtimes={"lab": SandboxRuntime(runtime="python-datascience")},
+            default_runtime="lab",
+        )
+
+        with caplog.at_level("WARNING"):
+            failed = prepare_runtimes(config, attempts=2, pause=7, sleep=waited.append)
+
+        assert failed == []
+        assert tries == ["python-datascience", "python-datascience"]
+        assert waited == [7]
+        assert "attempt 1 of 2" in caplog.text
+
+    def test_a_runtime_that_never_builds_is_named(self, monkeypatch):
+        from pydantic_ai_backends.remote.server import SandboxRuntime, prepare_runtimes
+
+        def resolve(_client, _runtime, _fallback):
+            raise RuntimeError("no space left on device")
+
+        self._fake_docker(monkeypatch, resolve)
+        config = SandboxdConfig(
+            token="t",
+            runtimes={
+                "lab": SandboxRuntime(runtime="python-datascience"),
+                "plain": "python:3.12-slim",
+            },
+            default_runtime="plain",
+        )
+
+        failed = prepare_runtimes(config, attempts=3, sleep=lambda _s: None)
+
+        assert failed == ["lab"]
+
+    def test_the_background_pass_tries_each_runtime_twice(self, monkeypatch):
+        from pydantic_ai_backends.remote import server as server_mod
+
+        calls: list[dict[str, object]] = []
+        monkeypatch.setattr(
+            server_mod, "prepare_runtimes", lambda _config, **kwargs: calls.append(kwargs) or []
+        )
+
+        server_mod._default_prewarm(SandboxdConfig(token="t"))()
+
+        assert calls == [{"attempts": 2}]
 
 
 class TestUsageSamplingScales:

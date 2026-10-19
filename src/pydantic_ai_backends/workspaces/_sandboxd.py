@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import re
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 
 import anyio
@@ -33,6 +34,8 @@ from pydantic_ai_backends.workspaces._commands import (
     layered_env,
 )
 
+logger = logging.getLogger(__name__)
+
 SANDBOXD_PROVIDER = "sandboxd"
 """Default `WorkspaceRef.provider` of a `sandboxd` workspace."""
 
@@ -48,6 +51,14 @@ STOP_GRACE_SECONDS = 5.0
 
 OPENING_RETRY_SECONDS = 0.2
 """Pause before asking again for a named session another client is opening."""
+
+DEFAULT_OPENING_TIMEOUT = 600.0
+"""Seconds opening a session may take. It can include building the runtime's
+image on the service host, which is minutes on a cold cache - far past a
+request that runs no command."""
+
+WAIT_NOTICE_SECONDS = 3.0
+"""How long opening may take before `on_wait` is told it is waiting."""
 
 _GONE = frozenset({404, 410})
 """Statuses meaning the session or its sandbox no longer exists."""
@@ -88,6 +99,13 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         client: An `httpx.AsyncClient` to share. Owned by the caller, who
             closes it; without one each request uses a client of its own.
         request_timeout: Seconds for a request that runs no command.
+        opening_timeout: Seconds opening the session may take, waiting on the
+            service included. Longer than `request_timeout` because an open can
+            build the runtime's image first.
+        on_wait: Awaited once when opening takes longer than a few seconds -
+            the service is building the runtime, or another client is opening
+            the same name - so a caller can say why nothing is happening yet.
+            A failure in it is logged and does not stop the open.
         session_name: A session id chosen by whoever configures the workspace
             rather than by the service: with no ref, the first operation opens
             the session under it, or attaches when it is open or its files are
@@ -109,6 +127,8 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         client: httpx.AsyncClient | None = None,
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
         session_name: str | None = None,
+        opening_timeout: float = DEFAULT_OPENING_TIMEOUT,
+        on_wait: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         if ref is not None and ref.provider != provider:
             raise ValueError(f"expected a {provider!r} workspace ref, got {ref.provider!r}")
@@ -126,6 +146,8 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
         self._client = client
         self._request_timeout = request_timeout
         self._session_name = session_name
+        self._opening_timeout = max(opening_timeout, request_timeout)
+        self._on_wait = on_wait
         self._session: _Session | None = None
         self._working_dir: str | None = None
         self._lock = anyio.Lock()
@@ -159,8 +181,12 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
                 timeout=timeout,
             )
 
-    async def _open(self) -> _Session:
-        """Open or attach to the session, then learn the service's command ceiling."""
+    async def _create(self) -> httpx.Response:
+        """Ask the service for the session, waiting for as long as opening may take.
+
+        The request itself gets `opening_timeout`, because the service builds a
+        runtime's image inside the first open that needs it.
+        """
         named = self._ref is None and self._session_name is not None
         request = wire.CreateSessionRequest(
             session_id=self._session_name if self._ref is None else self._ref.id,
@@ -169,18 +195,48 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands):
             reuse=named,
             attach=self._ref is not None,
         )
+        give_up = anyio.current_time() + self._opening_timeout
         response = await self._post(
-            "/sessions", request, token=self._token, timeout=self._request_timeout
+            "/sessions", request, token=self._token, timeout=self._opening_timeout
         )
         # With `reuse` a 409 means another client is opening the same name right
-        # now - two first runs of one conversation, say. It is theirs a moment
-        # later, so ask again rather than fail one of them.
-        give_up = anyio.current_time() + self._request_timeout
+        # now - two first runs of one conversation, say, or one of them waiting on
+        # an image build. It is theirs a moment later, so ask again rather than
+        # fail one of them.
         while named and response.status_code == 409 and anyio.current_time() < give_up:
             await anyio.sleep(OPENING_RETRY_SECONDS)
             response = await self._post(
-                "/sessions", request, token=self._token, timeout=self._request_timeout
+                "/sessions", request, token=self._token, timeout=self._opening_timeout
             )
+        return response
+
+    @staticmethod
+    async def _announce_wait(on_wait: Callable[[], Awaitable[None]]) -> None:
+        """Tell `on_wait` once that opening is taking a while; cancelled if it is not."""
+        await anyio.sleep(WAIT_NOTICE_SECONDS)
+        try:
+            await on_wait()
+        except Exception:
+            # A notice is decoration: the session it is about must still open.
+            logger.warning("sandboxd_wait_notice_failed", exc_info=True)
+
+    async def _open(self) -> _Session:
+        """Open or attach to the session, then learn the service's command ceiling."""
+        # Kept out of the task group: an exception leaving its body comes out as an
+        # `ExceptionGroup`, and a caller of `run` catches `httpx.HTTPError`.
+        failure: Exception | None = None
+        response: httpx.Response | None = None
+        async with anyio.create_task_group() as group:
+            if self._on_wait is not None:
+                group.start_soon(self._announce_wait, self._on_wait)
+            try:
+                response = await self._create()
+            except Exception as exc:
+                failure = exc
+            group.cancel_scope.cancel()
+        if failure is not None:
+            raise failure
+        assert response is not None
         if self._ref is not None and response.status_code == 404:
             raise WorkspaceUnavailableError(f"sandboxd session {self._ref.id!r} no longer exists")
         response.raise_for_status()
@@ -377,6 +433,13 @@ class SandboxdWorkspace(AbstractCapability[object]):
     client: httpx.AsyncClient | None = field(default=None, repr=False, compare=False)
     """An `httpx.AsyncClient` to share across runs, owned and closed by the caller."""
 
+    opening_timeout: float = DEFAULT_OPENING_TIMEOUT
+    """Seconds opening a session may take; it can include building the runtime's image."""
+
+    on_wait: Callable[[], Awaitable[None]] | None = field(default=None, repr=False, compare=False)
+    """Awaited once when opening a session takes more than a few seconds, so a caller
+    can say why nothing is happening yet. A failure in it does not stop the open."""
+
     session_name: str | None = None
     """One session for every run, named by you: opened on first use, attached after.
 
@@ -405,6 +468,8 @@ class SandboxdWorkspace(AbstractCapability[object]):
             env=self.env,
             client=self.client,
             session_name=self.session_name,
+            opening_timeout=self.opening_timeout,
+            on_wait=self.on_wait,
         )
 
     def get_workspace(

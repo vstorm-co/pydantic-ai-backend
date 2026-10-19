@@ -110,13 +110,15 @@ class KubernetesPodSandbox:
 
         if in_cluster is None:
             in_cluster = _detect_in_cluster()
+        # kubernetes 37 ships its config loaders without annotations; they take
+        # a path and return nothing, so there is nothing to narrow.
         try:
             if in_cluster:
-                k8s_config.load_incluster_config()
+                k8s_config.load_incluster_config()  # type: ignore[no-untyped-call]
             elif kube_config_path:
-                k8s_config.load_kube_config(config_file=kube_config_path)
+                k8s_config.load_kube_config(config_file=kube_config_path)  # type: ignore[no-untyped-call]
             else:
-                k8s_config.load_kube_config()
+                k8s_config.load_kube_config()  # type: ignore[no-untyped-call]
         except Exception as exc:
             raise RuntimeError(f"failed to load kubernetes config: {exc}") from exc
         self._core: Any = k8s_client.CoreV1Api()
@@ -200,7 +202,7 @@ class KubernetesPodSandbox:
         Raises:
             SandboxUnavailableError: The pod is gone or in a terminal phase.
         """
-        from kubernetes.client.rest import ApiException
+        from kubernetes.client.exceptions import ApiException
 
         try:
             pod: Any = self._core.read_namespaced_pod(self._pod_name, self._namespace)
@@ -348,7 +350,7 @@ class KubernetesPodSandbox:
 
     def _translate(self, error: BaseException) -> BaseException:
         """An API answer meaning the pod is gone, as that; anything else as is."""
-        from kubernetes.client.rest import ApiException
+        from kubernetes.client.exceptions import ApiException
 
         if isinstance(error, ApiException) and error.status in (404, 410):
             return SandboxUnavailableError(f"pod {self._pod_name} is gone: {error.reason}")

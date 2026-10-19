@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`python -m pydantic_ai_backends.remote.prepare`, and `prepare_runtimes()`
+  behind it.** Pulls and builds every runtime on a sandboxd allowlist, then exits.
+  A deploy runs it in a one-off container of the new image, so the first session
+  after a release that changed a runtime no longer waits minutes on a build, with
+  every `POST /sessions` for it answering 409 meanwhile. Each runtime is tried
+  three times. The exit status says whether every image is local.
+- **`SandboxdWorkspace(on_wait=...)` and `opening_timeout`.** `on_wait` is awaited
+  once when opening a session takes more than a few seconds, so an application
+  can tell the person why the run is quiet. A failure in it is logged and does not
+  stop the open.
+
+### Fixed
+
+- **A runtime build that fails once is tried again at start-up.** The first build
+  of a changed runtime on a production host died exporting a layer (`CreateDiff:
+  mount callback failed`) and the next one succeeded. The service's background
+  pass now retries each runtime once, rather than leaving the build to the first
+  session that asks.
+- **Opening a session waits for the image build.** The open that builds a
+  runtime's image took longer than `request_timeout` (30 s), so the client gave up
+  mid-build and every retry for the next half minute got 409 before raising.
+  Opening now has its own `opening_timeout`, ten minutes by default.
+- **`kubernetes` 37:** `ApiException` is imported from `kubernetes.client.exceptions`,
+  where it is defined, and the untyped config loaders are ignored narrowly; both
+  had turned the type check red.
+
 ## [0.2.33] - 2026-10-06
 
 ### Fixed

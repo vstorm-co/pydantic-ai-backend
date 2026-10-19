@@ -36,6 +36,8 @@ from pydantic_ai_backends.remote import wire
 from pydantic_ai_backends.remote.server import SandboxdConfig, create_app
 from pydantic_ai_backends.types import CommandOutcome
 from pydantic_ai_backends.workspaces import SandboxdWorkspace, SandboxdWorkspaceBackend
+from pydantic_ai_backends.workspaces import _sandboxd as sandboxd_module
+from pydantic_ai_backends.workspaces._sandboxd import DEFAULT_OPENING_TIMEOUT
 from tests.test_remote_sandbox import FakeSandbox, Harness, _open_session, _service_headers
 
 TOKEN = "workspace-service-token"
@@ -333,10 +335,125 @@ class TestNamedSessions:
 
         async with _answering(handler) as client:
             backend = SandboxdWorkspaceBackend(
-                "http://x", token="t", client=client, session_name="conv-busy", request_timeout=0.3
+                "http://x",
+                token="t",
+                client=client,
+                session_name="conv-busy",
+                request_timeout=0.3,
+                opening_timeout=0.3,
             )
             with pytest.raises(httpx.HTTPStatusError):
                 await backend.run(["true"])
+
+    async def test_opening_waits_longer_than_a_plain_request(self) -> None:
+        """An open can build the runtime's image first: minutes, not 30 seconds."""
+        backend = SandboxdWorkspaceBackend("http://x", token="t", request_timeout=5)
+        assert backend._opening_timeout == DEFAULT_OPENING_TIMEOUT
+        assert (
+            SandboxdWorkspaceBackend(
+                "http://x", token="t", request_timeout=900, opening_timeout=60
+            )._opening_timeout
+            == 900
+        )
+
+
+class TestTheCallerHearsThatOpeningIsSlow:
+    """A runtime built inside the first open left the person looking at a run
+    that said nothing for minutes (vstorm-co/agenticos#2222)."""
+
+    async def test_a_slow_open_is_announced_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(sandboxd_module, "WAIT_NOTICE_SECONDS", 0.05)
+        asked: list[bool] = []
+        heard: list[bool] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/sessions":
+                asked.append(True)
+                if len(asked) < 4:
+                    return httpx.Response(409, text="Session is opening: conv-busy")
+            ran = wire.RunResponse(stdout="ok", stderr="", exit_code=0)
+            return _opened(request) or httpx.Response(200, content=ran.model_dump_json())
+
+        async def on_wait() -> None:
+            heard.append(True)
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend(
+                "http://x", token="t", client=client, session_name="conv-busy", on_wait=on_wait
+            )
+            assert (await backend.run(["true"])).stdout == "ok"
+        assert heard == [True]
+
+    async def test_a_quick_open_says_nothing(self) -> None:
+        heard: list[bool] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            ran = wire.RunResponse(stdout="ok", stderr="", exit_code=0)
+            return _opened(request) or httpx.Response(200, content=ran.model_dump_json())
+
+        async def on_wait() -> None:
+            heard.append(True)
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend(
+                "http://x", token="t", client=client, on_wait=on_wait
+            )
+            await backend.run(["true"])
+        assert heard == []
+
+    async def test_a_notice_that_fails_does_not_stop_the_open(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(sandboxd_module, "WAIT_NOTICE_SECONDS", 0.0)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            ran = wire.RunResponse(stdout="ok", stderr="", exit_code=0)
+            return _opened(request) or httpx.Response(200, content=ran.model_dump_json())
+
+        async def on_wait() -> None:
+            raise RuntimeError("the chat went away")
+
+        async def slow_create(self: SandboxdWorkspaceBackend) -> httpx.Response:
+            await anyio.sleep(0.05)
+            return await original(self)
+
+        original = SandboxdWorkspaceBackend._create
+        monkeypatch.setattr(SandboxdWorkspaceBackend, "_create", slow_create)
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend(
+                "http://x", token="t", client=client, on_wait=on_wait
+            )
+            with caplog.at_level("WARNING"):
+                assert (await backend.run(["true"])).stdout == "ok"
+        assert "sandboxd_wait_notice_failed" in caplog.text
+
+    async def test_a_failed_open_raises_what_it_raised(self) -> None:
+        """Not an `ExceptionGroup`: the notice runs beside the open in a task group,
+        and a caller of `run` catches `httpx.HTTPError`."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("refused", request=request)
+
+        async def on_wait() -> None:
+            return None
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend(
+                "http://x", token="t", client=client, on_wait=on_wait
+            )
+            with pytest.raises(httpx.ConnectError):
+                await backend.run(["true"])
+
+    def test_the_capability_hands_both_to_its_backends(self) -> None:
+        async def on_wait() -> None:
+            return None
+
+        capability = SandboxdWorkspace(
+            service_url="http://x", token="t", opening_timeout=120, on_wait=on_wait
+        )
+        backend = capability.backend()
+        assert backend._opening_timeout == 120
+        assert backend._on_wait is on_wait
 
 
 class TestSandboxdWorkspaceCapability:

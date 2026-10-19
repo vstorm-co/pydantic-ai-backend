@@ -13,7 +13,7 @@ from typing import Any
 
 import anyio
 import pytest
-from kubernetes.client.rest import ApiException
+from kubernetes.client.exceptions import ApiException
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.workspaces import WorkspaceRef, WorkspaceUnavailableError
 
