@@ -53,6 +53,13 @@ class TestWhichPathsAreNative:
         with pytest.raises(NotNative, match=r"\.\."):
             _parts("/workspace/a/../../etc/passwd")
 
+    def test_a_dot_component_is_the_sandboxs(self) -> None:
+        """`PurePosixPath` would quietly read `file/.` as `file`."""
+        with pytest.raises(NotNative):
+            _parts("/workspace/file/.")
+        with pytest.raises(NotNative):
+            _parts("/workspace/./file")
+
     def test_a_relative_path_is_refused(self) -> None:
         with pytest.raises(ValueError, match="absolute"):
             _parts("notes.md")
@@ -307,6 +314,15 @@ class TestRealpath:
         monkeypatch.setattr(hostfs.os, "stat", swap)
         with pytest.raises(NotNative):
             hostfs.realpath(root, ["dir", "x"], WORK)
+
+
+class TestSpecialFilesAreDescribedByTheSandbox:
+    def test_stat_and_list_of_a_fifo(self, root: Path) -> None:
+        os.mkfifo(root / "pipe")
+        with pytest.raises(NotNative, match="regular"):
+            hostfs.stat(root, ["pipe"], "/workspace/pipe")
+        with pytest.raises(NotNative, match="regular"):
+            hostfs.list_dir(root, [], "/workspace")
 
 
 class TestMakingDirectories:

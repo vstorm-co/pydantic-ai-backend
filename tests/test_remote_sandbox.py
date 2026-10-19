@@ -3747,6 +3747,42 @@ class TestNativeFiles:
         response = self._call(client, sid, token, "read", "/workspace/a")
         assert response.status_code == wire.NOT_NATIVE_STATUS
 
+    def test_a_runtime_running_as_another_user_keeps_its_writes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AUD-1019-15: only the service-wide `sandbox_uid` was looked at."""
+        from pydantic_ai_backends.remote import server as server_module
+        from pydantic_ai_backends.types import RuntimeConfig
+
+        harness = Harness(workspace_root=str(tmp_path))
+        with harness.client() as client:
+            sid, _ = _open_session(client)
+            service = harness.app.state.service
+            assert service.writes_natively(sid) is True
+            other = RuntimeConfig(
+                name="other", base_image="python:3.12-slim", run_as_uid=os.geteuid() + 1
+            )
+            monkeypatch.setattr(server_module, "_session_runtime", lambda _config, _runtime: other)
+            assert service.writes_natively(sid) is False
+
+    @pytest.mark.parametrize(
+        ("user", "native"),
+        [
+            ("", True),
+            ("root", True),
+            ("0:0", True),
+            (f"{os.geteuid()}:20", True),
+            ("node", False),
+            ("4242", False),
+        ],
+    )
+    def test_the_containers_own_user_decides(self, tmp_path: Path, user: str, native: bool) -> None:
+        harness = Harness(workspace_root=str(tmp_path))
+        with harness.client() as client:
+            sid, _ = _open_session(client)
+            harness.built[sid].container_user = lambda: user  # type: ignore[attr-defined]
+            assert harness.app.state.service.writes_natively(sid) is native
+
     def test_a_sandbox_of_another_user_keeps_its_writes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

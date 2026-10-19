@@ -433,6 +433,19 @@ class DockerSandbox:
         self._alive_checked_at = now
         return self._alive
 
+    def container_user(self) -> str | None:
+        """The user the container runs as, as Docker reports it, or `None` before it exists.
+
+        An empty string is the image's default, which for every image this
+        library builds without `run_as_uid` is root. A name rather than a number
+        is the image's own user, whose uid only the container knows.
+        """
+        if self._container is None:
+            return None
+        config = self._container.attrs.get("Config") or {}
+        user = config.get("User")
+        return user if isinstance(user, str) else None
+
     def resource_usage(self) -> SandboxUsage | None:
         """Sample the container's current resource usage.
 

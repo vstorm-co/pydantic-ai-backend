@@ -79,6 +79,10 @@ def parts_of(path: str, work_dir: str) -> list[str]:
     parts = list(relative.parts)
     if ".." in parts:
         raise NotNative(f"{path} climbs out through ..")
+    # `PurePosixPath` drops a `.` as it parses, so `file/.` would become `file`;
+    # POSIX refuses to open that, and so does the shell path.
+    if "." in path.split("/")[1:]:
+        raise NotNative(f"{path} is not normalized")
     return parts
 
 
@@ -248,6 +252,10 @@ def _entry(name: str, path: str, info: os.stat_result) -> Entry:
     if stat_module.S_ISLNK(info.st_mode):
         raise NotNative(f"{name} is a symbolic link")
     is_dir = stat_module.S_ISDIR(info.st_mode)
+    if not is_dir and not stat_module.S_ISREG(info.st_mode):
+        # A FIFO, a socket or a device is described by the sandbox, as the
+        # module promises; its size here would mean nothing.
+        raise NotNative(f"{name} is not a regular file")
     return Entry(name=name, path=path, is_dir=is_dir, size=None if is_dir else info.st_size)
 
 

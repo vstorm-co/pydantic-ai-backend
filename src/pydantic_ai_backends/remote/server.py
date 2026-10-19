@@ -860,6 +860,14 @@ class _Outcome:
     detail: str = ""
 
 
+def _writes_as_service(user: str) -> bool:
+    """Whether a container running as Docker's `user` can change what this service writes."""
+    uid = user.partition(":")[0]
+    if uid in ("", "root", "0"):
+        return True
+    return uid.isdigit() and int(uid) == os.geteuid()
+
+
 def _session_runtime(config: SandboxdConfig, runtime: SandboxRuntime) -> RuntimeConfig | None:
     """The runtime a session of `runtime` builds and runs, after the service's overrides.
 
@@ -2198,6 +2206,29 @@ class _Service:
         uid = self.config.sandbox_uid
         return self.native_reads and (uid is None or uid == os.geteuid())
 
+    def writes_natively(self, session_id: str) -> bool:
+        """Whether this session's writes are served here, as its sandbox's user would make them.
+
+        `native_writes` judges the service-wide `sandbox_uid`. A runtime can set
+        its own `run_as_uid`, and a ready-made image its own `USER`, so the
+        session's own identity is checked too (AUD-1019-15): a file this service
+        writes is this service's, and a sandbox running as somebody else could
+        read it and not change it. Where the identity is unknown - a named user
+        only the container can resolve - the write goes through the sandbox.
+        """
+        if not self.native_writes:
+            return False
+        record = self._sessions.get(session_id)
+        entry = self.config.runtimes.get(record.runtime) if record is not None else None
+        if entry is not None:
+            session_runtime = _session_runtime(self.config, _as_runtime(entry))
+            uid = session_runtime.run_as_uid if session_runtime is not None else None
+            if uid is not None and uid != os.geteuid():
+                return False
+        reported = getattr(self.manager.sessions.get(session_id), "container_user", None)
+        user = reported() if callable(reported) else None
+        return user is None or _writes_as_service(user)
+
     async def native_file(self, session_id: str, op: str, path: str, call: Callable[..., _T]) -> _T:
         """Run one native file operation for an authorized live session.
 
@@ -2540,7 +2571,7 @@ def _register_run_routes(app: FastAPI, service: _Service) -> None:
         Over `max_read_bytes`, or where writes are not native, it is the
         sandbox's to write, and the client writes it there.
         """
-        if not service.native_writes:
+        if not service.writes_natively(session_id):
             raise HTTPException(status_code=wire.NOT_NATIVE_STATUS, detail="native writes are off")
         data = await _bounded_body(request, service.config.max_read_bytes)
         await service.native_file(
@@ -2593,14 +2624,14 @@ def _register_run_routes(app: FastAPI, service: _Service) -> None:
     @app.post("/sessions/{session_id}/files/mkdir", status_code=204)
     async def make_directory(session_id: AuthorizedSession, body: wire.FilePathRequest) -> None:
         """`mkdir -p`."""
-        if not service.native_writes:
+        if not service.writes_natively(session_id):
             raise HTTPException(status_code=wire.NOT_NATIVE_STATUS, detail="native writes are off")
         await service.native_file(session_id, "mkdir", body.path, hostfs.make_dir)
 
     @app.post("/sessions/{session_id}/files/remove", status_code=204)
     async def remove_path(session_id: AuthorizedSession, body: wire.FilePathRequest) -> None:
         """Remove a file, a link itself, or a directory with what is in it."""
-        if not service.native_writes:
+        if not service.writes_natively(session_id):
             raise HTTPException(status_code=wire.NOT_NATIVE_STATUS, detail="native writes are off")
         await service.native_file(session_id, "remove", body.path, hostfs.remove)
 
