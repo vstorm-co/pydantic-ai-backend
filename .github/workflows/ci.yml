@@ -224,6 +224,30 @@ jobs:
       - name: Pull the image the suites run
         run: docker pull python:3.12-slim
 
+      - name: Probe (temporary)
+        run: |
+          docker version --format '{{.Server.Version}}'
+          cat > /tmp/probe.py <<'PY'
+          import threading, time, docker
+          c = docker.from_env()
+          ctr = c.containers.run("python:3.12-slim", ["sleep", "300"], detach=True)
+          api = c.api
+          ex = api.exec_create(ctr.id, ["sh", "-c", "while true; do sleep 0.1; done"])
+          out = []
+          def drain():
+              for chunk in api.exec_start(ex["Id"], stream=True, demux=True):
+                  pass
+              out.append(time.time())
+          t = threading.Thread(target=drain); t.start(); time.sleep(1)
+          t0 = time.time(); ctr.remove(force=True); print("removed in", round(time.time()-t0, 2))
+          t.join(10); print("stream ended", out and round(out[0]-t0, 2))
+          try:
+              print("inspect", api.exec_inspect(ex["Id"]))
+          except Exception as e:
+              print("inspect error", type(e).__name__, e)
+          PY
+          uv run python /tmp/probe.py
+
       - name: Run the Docker and sandboxd conformance suites
         run: >-
           uv run pytest -m docker -q
