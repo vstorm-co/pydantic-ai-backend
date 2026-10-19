@@ -1587,6 +1587,106 @@ PNG_BYTES = (
 the whole reason `read_bytes` exists."""
 
 
+class TestWorkspaceArchiveTree:
+    """A directory and everything under it, in the one request a file browser makes."""
+
+    @pytest.fixture
+    def stored(self, tmp_path):
+        harness = Harness(workspace_root=str(tmp_path))
+        workspace = tmp_path / "cold" / "workspace"
+        (workspace / "uploads" / "deep").mkdir(parents=True)
+        (workspace / "uploads" / "deep" / "c.txt").write_text("c")
+        (workspace / "uploads" / "b.txt").write_text("b")
+        (workspace / "a.md").write_text("a")
+        (workspace / "elsewhere").symlink_to("/etc")
+        return harness, workspace
+
+    @staticmethod
+    def _tree(harness, **body):
+        with harness.client() as client:
+            response = client.post("/workspaces/cold/tree", json=body, headers=_service_headers())
+        return response
+
+    def test_every_level_comes_back_breadth_first(self, stored):
+        harness, _ = stored
+        response = self._tree(harness)
+
+        assert response.status_code == 200
+        tree = wire.TreeResponse.model_validate(response.json())
+        assert [e.path for e in tree.entries] == [
+            "uploads",
+            "a.md",
+            "uploads/deep",
+            "uploads/b.txt",
+            "uploads/deep/c.txt",
+        ]
+        assert tree.truncated is False
+        # Links are left out, as `ls` leaves them, and nothing was started.
+        assert harness.built == {}
+
+    def test_one_level_is_ls_and_says_what_it_left_unopened(self, stored):
+        harness, _ = stored
+        tree = wire.TreeResponse.model_validate(self._tree(harness, max_depth=1).json())
+
+        assert [e.path for e in tree.entries] == ["uploads", "a.md"]
+        assert tree.truncated is True
+
+    def test_the_entry_bound_truncates_only_when_more_remain(self, stored):
+        harness, _ = stored
+        cut = wire.TreeResponse.model_validate(self._tree(harness, max_entries=2).json())
+        whole = wire.TreeResponse.model_validate(self._tree(harness, max_entries=5).json())
+
+        assert [e.path for e in cut.entries] == ["uploads", "a.md"]
+        assert cut.truncated is True
+        assert len(whole.entries) == 5
+        assert whole.truncated is False
+
+    def test_a_subdirectory_that_cannot_be_read_marks_the_listing(self, stored, monkeypatch):
+        """The sandbox may delete or relink a directory between two listings."""
+        from pydantic_ai_backends.remote import _workspace
+
+        harness, _ = stored
+        real = _workspace.list_workspace
+
+        def flaky(root, path):
+            if path == "uploads":
+                raise _workspace.WorkspacePathError("uploads became a link")
+            return real(root, path)
+
+        monkeypatch.setattr(_workspace, "list_workspace", flaky)
+        tree = wire.TreeResponse.model_validate(self._tree(harness).json())
+
+        assert [e.path for e in tree.entries] == ["uploads", "a.md"]
+        assert tree.truncated is True
+
+    def test_the_start_is_checked_like_ls(self, stored):
+        harness, _ = stored
+
+        assert self._tree(harness, path="a.md").status_code == 404
+        assert self._tree(harness, path="../..").status_code == 400
+        assert self._tree(harness, path="elsewhere").status_code == 400
+
+    def test_the_bounds_are_validated(self, stored):
+        harness, _ = stored
+
+        assert self._tree(harness, max_depth=0).status_code == 422
+        assert self._tree(harness, max_entries=0).status_code == 422
+
+    def test_the_client_returns_a_workspace_tree(self, stored):
+        from pydantic_ai_backends.remote import WorkspaceArchive, WorkspaceTree
+
+        harness, _ = stored
+        with harness.client() as client:
+            tree = WorkspaceArchive(token=SERVICE_TOKEN, client=client).tree(
+                "cold", "uploads", max_depth=1
+            )
+
+        assert isinstance(tree, WorkspaceTree)
+        assert [e["path"] for e in tree.entries] == ["uploads/deep", "uploads/b.txt"]
+        assert tree.entries[1]["size"] == 1
+        assert tree.truncated is True
+
+
 class TestWorkspaceArchiveClient:
     """The typed client raises, because no model is waiting on it."""
 

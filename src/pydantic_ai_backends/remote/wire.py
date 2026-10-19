@@ -127,6 +127,26 @@ class FileEntry(BaseModel):
     service on either side of this release keep understanding each other."""
 
 
+class TreeRequest(BaseModel):
+    """List a directory and the directories under it, breadth first."""
+
+    path: str = "."
+    max_depth: int = Field(default=6, ge=1, le=64)
+    """Levels listed: 1 is the directory alone, as `ls` does."""
+
+    max_entries: int = Field(default=2000, ge=1, le=100_000)
+
+
+class TreeResponse(BaseModel):
+    """What a tree listing found, and whether a bound stopped it."""
+
+    entries: list[FileEntry]
+    truncated: bool
+    """True when a directory was left unopened at `max_depth` or the listing
+    reached `max_entries` with more to list - a listing shorter than the
+    workspace that did not say so would be read as complete."""
+
+
 class CreateSessionRequest(BaseModel):
     """Open a sandbox session.
 

@@ -23,11 +23,13 @@ if TYPE_CHECKING:
 
     from pydantic_ai_backends.types import CommandOutcome
 
-ALIVE_CACHE_SECONDS = 5.0
+ALIVE_CACHE_SECONDS = 30.0
 """How long a liveness answer is trusted before the daemon is asked again.
 
 `SessionManager.get_or_create` calls `is_alive()` on every request, so an
-uncached check bills a daemon round trip to each agent turn.
+uncached check bills a daemon round trip to each agent turn. A container that
+dies inside the window is not believed alive for the rest of it: the first
+command that finds it gone drops the cached answer.
 """
 
 DEFAULT_PIDS_LIMIT = 512
@@ -536,15 +538,19 @@ class DockerSandbox:
         await anyio.to_thread.run_sync(self._ensure_container)
         self._last_activity = time.time()
         assert self._container is not None
-        return await _exec.run_in_container(
-            self._container,
-            argv,
-            run_id=run_id,
-            env=env,
-            workdir=self._work_dir,
-            timeout=timeout,
-            output_limit=output_limit if output_limit is not None else MAX_RUN_OUTPUT_BYTES,
-        )
+        try:
+            return await _exec.run_in_container(
+                self._container,
+                argv,
+                run_id=run_id,
+                env=env,
+                workdir=self._work_dir,
+                timeout=timeout,
+                output_limit=output_limit if output_limit is not None else MAX_RUN_OUTPUT_BYTES,
+            )
+        except SandboxUnavailableError:
+            self._alive_checked_at = None
+            raise
 
     async def stop_command(self, run_id: str) -> None:
         """Stop a command :meth:`run_command` started, and everything it started.

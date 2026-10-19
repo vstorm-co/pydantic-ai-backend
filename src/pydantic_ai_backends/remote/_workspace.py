@@ -117,6 +117,58 @@ def list_workspace(root: Path, path: str) -> list[FileInfo]:
     return sorted(entries, key=lambda item: (not item["is_dir"], item["name"]))
 
 
+def walk_workspace(
+    root: Path, path: str, *, max_depth: int, max_entries: int
+) -> tuple[list[FileInfo], bool]:
+    """List a directory and the directories under it, breadth first.
+
+    One request for what a file browser otherwise asks for one directory at a
+    time - each of those a round trip, and a workspace three deep is the usual
+    shape. Each directory is listed by :func:`list_workspace`, so links are left
+    out here exactly as they are there.
+
+    Args:
+        root: The session's workspace directory.
+        path: Directory to start from, relative to `root`.
+        max_depth: Levels to list; 1 is `path` alone.
+        max_entries: Most entries to return.
+
+    Returns:
+        The entries, each directory's before its children's, and whether the
+        listing is incomplete: a directory left unopened at `max_depth`, one
+        that could not be read, or `max_entries` reached with more to list.
+
+    Raises:
+        WorkspacePathError: If `path` escapes the workspace or runs through a link.
+        FileNotFoundError: If `path` is not a directory. Below it, a directory
+            that vanished or turned into a link marks the listing truncated
+            instead, since the sandbox may be changing the tree as it is read.
+    """
+    found: list[FileInfo] = []
+    truncated = False
+    queue = [(path, 1)]
+    while queue:
+        directory, depth = queue.pop(0)
+        try:
+            entries = list_workspace(root, directory)
+        except (WorkspacePathError, FileNotFoundError, PermissionError):
+            if depth == 1:
+                raise
+            truncated = True
+            continue
+        for entry in entries:
+            if len(found) == max_entries:
+                return found, True
+            found.append(entry)
+            if not entry["is_dir"]:
+                continue
+            if depth < max_depth:
+                queue.append((entry["path"], depth + 1))
+            else:
+                truncated = True
+    return found, truncated
+
+
 def read_workspace(root: Path, path: str, offset: int, limit: int, max_bytes: int) -> str:
     """Read a slice of a workspace file as text.
 

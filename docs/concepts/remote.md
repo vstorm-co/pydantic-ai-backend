@@ -652,9 +652,9 @@ not cost a container start. Opening a conversation from last week just to see wh
 the agent produced would otherwise boot a container, wait for it, and reap it
 minutes later.
 
-`/workspaces/{session_id}/ls` and `/workspaces/{session_id}/read` serve the host
-volume directly. They work for a session reaped long ago, and there is a typed
-client for them:
+`/workspaces/{session_id}/ls`, `/tree` and `/read` serve the host volume
+directly. They work for a session reaped long ago, and there is a typed client
+for them:
 
 ```python
 from pydantic_ai_backends.remote import WorkspaceArchive
@@ -663,7 +663,16 @@ archive = WorkspaceArchive("http://sandboxd:8080", token=service_token)
 for entry in archive.ls(session_id):
     print(entry["path"], entry["size"])
 print(archive.read(session_id, "report.md"))
+
+tree = archive.tree(session_id, max_depth=6, max_entries=2000)
+print(len(tree.entries), "entries", "(truncated)" if tree.truncated else "")
 ```
+
+**`tree` is the call for a file browser.** `ls` lists one directory, so showing
+a workspace whose files sit under `uploads/` took one request per directory.
+`tree` walks breadth first on the host in one request, bounded by depth and by
+entry count, and says when either bound or a directory it could not read left
+something out. It needs a service from 0.2.35; an older one answers `404`.
 
 Four things to know:
 

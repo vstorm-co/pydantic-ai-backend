@@ -14,6 +14,9 @@ from pydantic_ai_backends.remote.archive import (
 from pydantic_ai_backends.remote.archive import (
     WorkspaceArchiveError as WorkspaceArchiveError,
 )
+from pydantic_ai_backends.remote.archive import (
+    WorkspaceTree as WorkspaceTree,
+)
 from pydantic_ai_backends.remote.wire import (
     SESSION_ID_PATTERN as SESSION_ID_PATTERN,
 )
@@ -26,4 +29,5 @@ __all__ = [
     "TOKEN_HEADER",
     "WorkspaceArchive",
     "WorkspaceArchiveError",
+    "WorkspaceTree",
 ]

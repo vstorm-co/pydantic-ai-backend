@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `ServicePolicy.native_files` and `native_writes` say which; an older service
     says neither, so an older pairing keeps working.
   - `SANDBOXD_NATIVE_FILES=0` turns it off.
+- **`WorkspaceArchive.tree()` and `/workspaces/{id}/tree`.** A stored
+  workspace's directories, listed breadth first in one request, bounded by
+  `max_depth` and `max_entries`, with `truncated` set when a bound or an
+  unreadable directory left something out. A file browser walking with `ls`
+  made one request per directory.
 - **`max_running_commands`** (`SANDBOXD_MAX_RUNNING_COMMANDS`, default 256). A
   running command holds a thread while it runs, and anyio's default of 40 made the
   forty-first command on the whole service wait.
@@ -33,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no cache mounts, so every runtime change downloaded its pip and npm packages
   again.
 - **The `sandboxd` image runs Python 3.15**, as does the docs build.
+- **A Docker sandbox's liveness is trusted for 30 seconds**, up from 5, so a
+  busy session asks the daemon six times less often. A command that finds the
+  container gone drops the cached answer, so a container that died inside the
+  window is noticed on the next request rather than at its end.
 - ruff 0.17.1 and `astral-sh/setup-uv` 10.3.0.
 
 ### Security

@@ -83,6 +83,7 @@ from pydantic_ai_backends.remote._workspace import (
     read_workspace,
     read_workspace_bytes,
     relative_request_path,
+    walk_workspace,
     workspace_root_for,
 )
 from pydantic_ai_backends.types import RuntimeConfig, SandboxUsage
@@ -2093,6 +2094,28 @@ class _Service:
         rows = await self._off_loop(list_workspace, workspace, relative)
         return [wire.FileEntry(**row) for row in rows]
 
+    async def archive_tree(self, session_id: str, body: wire.TreeRequest) -> wire.TreeResponse:
+        """List a stored workspace directory and what is under it, in one call.
+
+        Raises:
+            HTTPException: 400 for a path outside the workspace, 404 when it is
+                not a directory.
+        """
+        workspace = self.workspace_of(session_id)
+        relative = relative_request_path(body.path, self.config.work_dir)
+        rows, truncated = await self._off_loop(
+            functools.partial(
+                walk_workspace,
+                max_depth=body.max_depth,
+                max_entries=body.max_entries,
+            ),
+            workspace,
+            relative,
+        )
+        return wire.TreeResponse(
+            entries=[wire.FileEntry(**row) for row in rows], truncated=truncated
+        )
+
     async def archive_read(self, session_id: str, body: wire.ReadRequest) -> wire.ReadResponse:
         """Read a stored workspace file without starting a sandbox.
 
@@ -2397,6 +2420,18 @@ def _register_workspace_routes(app: FastAPI, service: _Service) -> None:
     ) -> list[wire.FileEntry]:
         """List one directory of a stored workspace."""
         return await service.archive_ls(session_id, body.path)
+
+    @app.post(
+        "/workspaces/{session_id}/tree",
+        response_model=wire.TreeResponse,
+        dependencies=[ServiceAuth],
+    )
+    async def tree_archived(
+        session_id: Annotated[str, PathParam(pattern=wire.SESSION_ID_PATTERN)],
+        body: wire.TreeRequest,
+    ) -> wire.TreeResponse:
+        """List a stored workspace directory and the directories under it."""
+        return await service.archive_tree(session_id, body)
 
     @app.post(
         "/workspaces/{session_id}/read",
