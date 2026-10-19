@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from pydantic_ai_backends._optional import load
@@ -35,6 +36,18 @@ class WorkspaceArchiveError(Exception):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         self.status_code = status_code
         super().__init__(message)
+
+
+@dataclass(frozen=True)
+class WorkspaceTree:
+    """A directory and what is under it, from :meth:`WorkspaceArchive.tree`."""
+
+    entries: list[FileInfo]
+    """Each directory's entries before its children's."""
+
+    truncated: bool
+    """Whether a bound or an unreadable directory left something out. A
+    listing shorter than the workspace that did not say so reads as complete."""
 
 
 class WorkspaceArchive:
@@ -114,6 +127,48 @@ class WorkspaceArchive:
             )
             for e in entries
         ]
+
+    def tree(
+        self,
+        session_id: str,
+        path: str = ".",
+        *,
+        max_depth: int = 6,
+        max_entries: int = 2000,
+    ) -> WorkspaceTree:
+        """List a directory of a stored workspace and the directories under it.
+
+        One request where walking with :meth:`ls` takes one per directory. Needs
+        a service from 0.2.35; an older one answers 404.
+
+        Args:
+            session_id: Session whose files are wanted.
+            path: Directory to start from, as for :meth:`ls`.
+            max_depth: Levels to list; 1 is `path` alone, as :meth:`ls` lists it.
+            max_entries: Most entries to return.
+
+        Raises:
+            WorkspaceArchiveError: If the workspace or directory is absent, the
+                path escapes the workspace, or the service cannot be reached.
+        """
+        payload = wire.TreeRequest(
+            path=path, max_depth=max_depth, max_entries=max_entries
+        ).model_dump(mode="json")
+        response = self._post(f"/workspaces/{session_id}/tree", payload)
+        tree = wire.TreeResponse.model_validate(response.json())
+        return WorkspaceTree(
+            entries=[
+                FileInfo(
+                    name=e.name,
+                    path=e.path,
+                    is_dir=e.is_dir,
+                    size=e.size,
+                    modified_at=e.modified_at,
+                )
+                for e in tree.entries
+            ],
+            truncated=tree.truncated,
+        )
 
     def read(self, session_id: str, path: str, offset: int = 0, limit: int = 2000) -> str:
         """Read a slice of a stored workspace file.

@@ -97,6 +97,18 @@ class ReadBytesResponse(BaseModel):
     content_b64: str
 
 
+class FilePathRequest(BaseModel):
+    """One path in a live session's work directory, for a native file operation."""
+
+    path: str
+
+
+NOT_NATIVE_STATUS = 409
+"""What a native file route answers for a path the sandbox has to resolve: a
+symlink, a special file, one outside the work directory. The client then takes
+the shell path for that one call."""
+
+
 class LsRequest(BaseModel):
     """List one directory."""
 
@@ -113,6 +125,26 @@ class FileEntry(BaseModel):
     modified_at: str | None = None
     """ISO 8601, when the backend reports one. Defaults absent so a client and a
     service on either side of this release keep understanding each other."""
+
+
+class TreeRequest(BaseModel):
+    """List a directory and the directories under it, breadth first."""
+
+    path: str = "."
+    max_depth: int = Field(default=6, ge=1, le=64)
+    """Levels listed: 1 is the directory alone, as `ls` does."""
+
+    max_entries: int = Field(default=2000, ge=1, le=100_000)
+
+
+class TreeResponse(BaseModel):
+    """What a tree listing found, and whether a bound stopped it."""
+
+    entries: list[FileEntry]
+    truncated: bool
+    """True when a directory was left unopened at `max_depth` or the listing
+    reached `max_entries` with more to list - a listing shorter than the
+    workspace that did not say so would be read as complete."""
 
 
 class CreateSessionRequest(BaseModel):
@@ -320,6 +352,13 @@ class ServicePolicy(BaseModel):
     """Whether the allowlist is pulled and built at startup rather than on demand."""
     buildkit: bool = False
     """Whether image builds use BuildKit, and so keep package caches between them."""
+    native_files: bool = False
+    """Whether a session's file operations are served off the host, not by its sandbox.
+
+    Defaults off, so a client talking to a service older than this falls back to
+    the shell path rather than calling routes that are not there."""
+    native_writes: bool = False
+    """Whether writes are served that way too, and not only reads."""
 
 
 class RuntimeLimitsUpdate(BaseModel):

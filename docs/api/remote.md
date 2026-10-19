@@ -15,9 +15,14 @@ the `remote` extra.
       members:
         - __init__
         - ls
+        - tree
         - read
         - read_bytes
         - close
+
+::: pydantic_ai_backends.remote.archive.WorkspaceTree
+    options:
+      show_root_heading: true
 
 ::: pydantic_ai_backends.remote.archive.WorkspaceArchiveError
     options:

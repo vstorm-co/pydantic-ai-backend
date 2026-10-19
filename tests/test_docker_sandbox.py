@@ -389,6 +389,26 @@ class TestDockerSandboxLiveness:
         assert sandbox.is_alive() is True
         assert container.reloads == 2
 
+    async def test_a_command_that_finds_it_gone_drops_the_cache(self, monkeypatch):
+        """A container that died inside the window is asked about again at once."""
+        from pydantic_ai_backends.backends.docker import _exec
+
+        sandbox = _sandbox()
+        container = self._Container()
+        sandbox._container = container
+        assert sandbox.is_alive() is True
+
+        async def gone(*args, **kwargs):
+            raise SandboxUnavailableError("container is not running")
+
+        monkeypatch.setattr(_exec, "run_in_container", gone)
+        with pytest.raises(SandboxUnavailableError):
+            await sandbox.run_command(["true"], run_id="0" * 32)
+
+        container.status = "exited"
+        assert sandbox.is_alive() is False
+        assert container.reloads == 2
+
     def test_non_running_status_is_not_alive(self):
         sandbox = _sandbox()
         sandbox._container = self._Container(status="exited")

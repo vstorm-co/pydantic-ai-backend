@@ -7,22 +7,27 @@ it again minutes later.
 
 Everything here reads the host filesystem directly, which makes path containment
 the only thing standing between a caller and the rest of the machine. Two ways in
-have to be closed, and both are closed by resolving first and checking after:
+have to be closed:
 
-- `..` in a requested path.
+- `..` in a requested path, refused before anything is opened.
 - A **symlink the sandbox itself created**. Untrusted code inside a container can
   run `ln -s /etc/shadow notes.txt`; in the container that points at the
   container's own file, but read from the host side it would resolve to the
-  host's. So a resolved path outside the workspace is refused even when the link
-  lives inside it.
+  host's. Resolving a path and then opening it is not enough: a live sandbox can
+  swap a directory for a link between the two. So nothing is opened by name -
+  every component is opened from its parent's descriptor with `O_NOFOLLOW`
+  (`_hostfs`), a link is never followed, and a listing leaves links out.
 """
 
 from __future__ import annotations
 
+import os
+import stat as stat_module
 from pathlib import Path, PurePosixPath
 
 from pydantic_ai_backends._text import bytes_to_text
 from pydantic_ai_backends._time import iso_mtime
+from pydantic_ai_backends.remote import _hostfs as hostfs
 from pydantic_ai_backends.types import FileInfo
 
 
@@ -63,65 +68,112 @@ def relative_request_path(path: str, work_dir: str) -> str:
         return str(requested).lstrip("/")
 
 
-def resolve_within(root: Path, path: str) -> Path:
-    """Resolve `path` inside `root`, refusing anything that escapes.
-
-    Raises:
-        WorkspacePathError: If the resolved path is not the root or under it —
-            whether it got there through `..` or through a symlink.
-    """
-    resolved_root = root.resolve()
-    candidate = (resolved_root / path).resolve()
-    if candidate != resolved_root and resolved_root not in candidate.parents:
+def _parts(path: str) -> list[str]:
+    """The components of a relative workspace path, refusing a climb out of it."""
+    parts = [part for part in PurePosixPath(path).parts if part not in (".", "/")]
+    if ".." in parts:
         raise WorkspacePathError(f"Path '{path}' is outside the workspace")
-    return candidate
+    return parts
 
 
 def list_workspace(root: Path, path: str) -> list[FileInfo]:
     """List one directory of a workspace.
 
-    An entry the sandbox left in a state we cannot describe is omitted rather
-    than reported — a symlink out of the workspace, or one pointing at nothing.
-    Either would otherwise turn one planted link into a failure for the whole
-    directory, and untrusted code inside the container can plant both.
+    A link is left out rather than described - one out of the workspace, one
+    pointing at nothing, and one pointing inside it alike. Describing it would
+    mean following it on the host, which is the one thing a link planted by the
+    sandbox must not get.
 
     Args:
         root: The session's workspace directory.
         path: Directory to list, relative to `root`.
 
     Raises:
-        WorkspacePathError: If `path` escapes the workspace.
+        WorkspacePathError: If `path` escapes the workspace or runs through a link.
         FileNotFoundError: If it is not a directory.
     """
-    directory = resolve_within(root, path)
-    if not directory.is_dir():
-        raise FileNotFoundError(f"No such directory: {path}")
-
-    resolved_root = root.resolve()
-    entries: list[FileInfo] = []
-    for entry in directory.iterdir():
-        try:
-            relative = str(entry.relative_to(resolved_root))
-            target = resolve_within(root, relative)
-            is_dir = target.is_dir()
-            stat = target.stat()
-            size = None if is_dir else stat.st_size
-            modified_at = None if is_dir else iso_mtime(stat.st_mtime)
-        except (WorkspacePathError, ValueError, OSError):
-            continue
-        entries.append(
-            FileInfo(
-                name=entry.name, path=relative, is_dir=is_dir, size=size, modified_at=modified_at
-            )
-        )
+    parts = _parts(path)
+    try:
+        with hostfs.opened_dir(root, parts) as fd, os.scandir(fd) as scanned:
+            entries: list[FileInfo] = []
+            for item in scanned:
+                info = item.stat(follow_symlinks=False)
+                if stat_module.S_ISLNK(info.st_mode):
+                    continue
+                is_dir = stat_module.S_ISDIR(info.st_mode)
+                entries.append(
+                    FileInfo(
+                        name=item.name,
+                        path="/".join([*parts, item.name]),
+                        is_dir=is_dir,
+                        size=None if is_dir else info.st_size,
+                        modified_at=None if is_dir else iso_mtime(info.st_mtime),
+                    )
+                )
+    except hostfs.NotNative as exc:
+        raise WorkspacePathError(f"Path '{path}' is outside the workspace") from exc
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise FileNotFoundError(f"No such directory: {path}") from exc
     return sorted(entries, key=lambda item: (not item["is_dir"], item["name"]))
+
+
+def walk_workspace(
+    root: Path, path: str, *, max_depth: int, max_entries: int
+) -> tuple[list[FileInfo], bool]:
+    """List a directory and the directories under it, breadth first.
+
+    One request for what a file browser otherwise asks for one directory at a
+    time - each of those a round trip, and a workspace three deep is the usual
+    shape. Each directory is listed by :func:`list_workspace`, so links are left
+    out here exactly as they are there.
+
+    Args:
+        root: The session's workspace directory.
+        path: Directory to start from, relative to `root`.
+        max_depth: Levels to list; 1 is `path` alone.
+        max_entries: Most entries to return.
+
+    Returns:
+        The entries, each directory's before its children's, and whether the
+        listing is incomplete: a directory left unopened at `max_depth`, one
+        that could not be read, or `max_entries` reached with more to list.
+
+    Raises:
+        WorkspacePathError: If `path` escapes the workspace or runs through a link.
+        FileNotFoundError: If `path` is not a directory. Below it, a directory
+            that vanished or turned into a link marks the listing truncated
+            instead, since the sandbox may be changing the tree as it is read.
+    """
+    found: list[FileInfo] = []
+    truncated = False
+    queue = [(path, 1)]
+    while queue:
+        directory, depth = queue.pop(0)
+        try:
+            entries = list_workspace(root, directory)
+        except (WorkspacePathError, FileNotFoundError, PermissionError):
+            if depth == 1:
+                raise
+            truncated = True
+            continue
+        for entry in entries:
+            if len(found) == max_entries:
+                return found, True
+            found.append(entry)
+            if not entry["is_dir"]:
+                continue
+            if depth < max_depth:
+                queue.append((entry["path"], depth + 1))
+            else:
+                truncated = True
+    return found, truncated
 
 
 def read_workspace(root: Path, path: str, offset: int, limit: int, max_bytes: int) -> str:
     """Read a slice of a workspace file as text.
 
     Decoded the same way a live session would decode it, so the archive and the
-    sandbox do not disagree about what a file says — encoding detection included,
+    sandbox do not disagree about what a file says - encoding detection included,
     and a PDF is extracted rather than returned as noise.
 
     Args:
@@ -132,20 +184,13 @@ def read_workspace(root: Path, path: str, offset: int, limit: int, max_bytes: in
         max_bytes: Largest file to read into memory.
 
     Raises:
-        WorkspacePathError: If `path` escapes the workspace.
+        WorkspacePathError: If `path` escapes the workspace or is a link.
         FileNotFoundError: If it is not a regular file.
         ValueError: If the file is over `max_bytes`, or holds no readable text.
     """
-    target = resolve_within(root, path)
-    if not target.is_file():
-        raise FileNotFoundError(f"No such file: {path}")
-
-    size = target.stat().st_size
-    if size > max_bytes:
-        raise ValueError(f"File is {size} bytes, over the {max_bytes}-byte read limit")
-
-    extension = target.suffix.lower().lstrip(".")
-    lines = bytes_to_text(extension, target.read_bytes()).splitlines()
+    raw = read_workspace_bytes(root, path, max_bytes)
+    extension = PurePosixPath(path).suffix.lower().lstrip(".")
+    lines = bytes_to_text(extension, raw).splitlines()
 
     if offset >= len(lines):
         return "[End of file]"
@@ -163,7 +208,7 @@ def read_workspace_bytes(root: Path, path: str, max_bytes: int) -> bytes:
 
     The sibling of :func:`read_workspace`, and the reason it exists is that
     decoding is not always wanted. A chart, a rendered PDF, an image an agent
-    fetched — the most common things it actually produces — are not text, and
+    fetched - the most common things it actually produces - are not text, and
     reading them as text then re-encoding yields a corrupt file that downloads
     successfully. That is the worst available outcome, so a consumer with only
     `read` had to refuse the whole class of file instead.
@@ -178,16 +223,15 @@ def read_workspace_bytes(root: Path, path: str, max_bytes: int) -> bytes:
         max_bytes: Largest file to read into memory.
 
     Raises:
-        WorkspacePathError: If `path` escapes the workspace.
+        WorkspacePathError: If `path` escapes the workspace or is a link.
         FileNotFoundError: If it is not a regular file.
         ValueError: If the file is over `max_bytes`.
     """
-    target = resolve_within(root, path)
-    if not target.is_file():
-        raise FileNotFoundError(f"No such file: {path}")
-
-    size = target.stat().st_size
-    if size > max_bytes:
-        raise ValueError(f"File is {size} bytes, over the {max_bytes}-byte read limit")
-
-    return target.read_bytes()
+    try:
+        return hostfs.read(root, _parts(path), max_bytes=max_bytes)
+    except hostfs.TooLarge as exc:
+        raise ValueError(f"File is {exc.size} bytes, over the {exc.limit}-byte read limit") from exc
+    except hostfs.NotNative as exc:
+        raise WorkspacePathError(f"Path '{path}' is outside the workspace") from exc
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
+        raise FileNotFoundError(f"No such file: {path}") from exc

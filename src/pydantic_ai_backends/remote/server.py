@@ -60,9 +60,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar
 
+import anyio.to_thread
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from pydantic_ai_backends._limits import MAX_RUN_OUTPUT_BYTES
 from pydantic_ai_backends.backends.docker._image import buildkit_available
@@ -74,6 +75,7 @@ from pydantic_ai_backends.backends.docker.session import (
     last_activity_of,
 )
 from pydantic_ai_backends.protocol import CommandRunner, SandboxUnavailableError
+from pydantic_ai_backends.remote import _hostfs as hostfs
 from pydantic_ai_backends.remote import wire
 from pydantic_ai_backends.remote._workspace import (
     WorkspacePathError,
@@ -81,6 +83,7 @@ from pydantic_ai_backends.remote._workspace import (
     read_workspace,
     read_workspace_bytes,
     relative_request_path,
+    walk_workspace,
     workspace_root_for,
 )
 from pydantic_ai_backends.types import RuntimeConfig, SandboxUsage
@@ -469,6 +472,17 @@ class SandboxdConfig:
         max_workers: Threads dedicated to blocking sandbox calls. Sandbox
             commands are long, so this pool is kept separate from asyncio's
             shared default one.
+        max_running_commands: Commands that may run at once across every
+            session. Each running command holds a thread for as long as it runs,
+            reading its output, and the thread pool behind them defaulted to 40:
+            the forty-first command - an `ls`, in somebody else's session - waited
+            for one of them to finish.
+        native_files: Serve a session's file operations from its directory on
+            the host instead of a command in its container, where the service
+            keeps workspaces on disk. A read or a write is then a millisecond
+            rather than one or more `docker exec`s. Writes are native only when
+            the sandbox runs as this service's own user or as root, or the files
+            the service created would not be the sandbox's to change.
         ui_enabled: Serve the bundled dashboard at `/ui`. Off by default: the
             page asks a human for the service token, and that token can start
             containers on the host, so it belongs on localhost or a private
@@ -505,6 +519,8 @@ class SandboxdConfig:
     max_read_bytes: int = 8 * 1024 * 1024
     execute_timeout: int = 300
     max_workers: int = 32
+    max_running_commands: int = 256
+    native_files: bool = True
     ui_enabled: bool = False
     policy_overrides: str | None = None
     """JSON file holding a `PolicyUpdate`, re-read while the service runs.
@@ -1280,6 +1296,12 @@ class _Service:
 
     def startup(self) -> None:
         """Create the worker pool and begin reaping idle sessions and workspaces."""
+        # A running command holds a thread from this limiter for as long as it
+        # runs, reading its output. Its default of 40 made the forty-first command
+        # on the whole service wait - whoever's session it was in.
+        anyio.to_thread.current_default_thread_limiter().total_tokens = (
+            self.config.max_running_commands
+        )
         self._executor = ThreadPoolExecutor(
             max_workers=self.config.max_workers, thread_name_prefix="sandboxd"
         )
@@ -1680,6 +1702,8 @@ class _Service:
             tmpfs_size=config.tmpfs_size,
             prewarm=config.prewarm,
             buildkit=buildkit_available(),
+            native_files=self.native_reads,
+            native_writes=self.native_writes,
         )
 
     def _runtime_policy(self, alias: str) -> wire.RuntimePolicy:
@@ -2070,6 +2094,28 @@ class _Service:
         rows = await self._off_loop(list_workspace, workspace, relative)
         return [wire.FileEntry(**row) for row in rows]
 
+    async def archive_tree(self, session_id: str, body: wire.TreeRequest) -> wire.TreeResponse:
+        """List a stored workspace directory and what is under it, in one call.
+
+        Raises:
+            HTTPException: 400 for a path outside the workspace, 404 when it is
+                not a directory.
+        """
+        workspace = self.workspace_of(session_id)
+        relative = relative_request_path(body.path, self.config.work_dir)
+        rows, truncated = await self._off_loop(
+            functools.partial(
+                walk_workspace,
+                max_depth=body.max_depth,
+                max_entries=body.max_entries,
+            ),
+            workspace,
+            relative,
+        )
+        return wire.TreeResponse(
+            entries=[wire.FileEntry(**row) for row in rows], truncated=truncated
+        )
+
     async def archive_read(self, session_id: str, body: wire.ReadRequest) -> wire.ReadResponse:
         """Read a stored workspace file without starting a sandbox.
 
@@ -2110,6 +2156,70 @@ class _Service:
             read_workspace_bytes, workspace, relative, self.config.max_read_bytes
         )
         return wire.ReadBytesResponse(content_b64=base64.b64encode(raw).decode("ascii"))
+
+    @property
+    def native_reads(self) -> bool:
+        """Whether a live session's file reads are served off its host directory."""
+        return self.config.native_files and self.config.workspace_root is not None
+
+    @property
+    def native_writes(self) -> bool:
+        """Whether writes are, too: only where the sandbox can change what is written.
+
+        A file this service creates is owned by this service's user. A sandbox
+        running as another, unprivileged user could read it and not write it, so
+        writes stay in the sandbox unless it runs as this user or as root.
+        """
+        uid = self.config.sandbox_uid
+        return self.native_reads and (uid is None or uid == os.geteuid())
+
+    async def native_file(self, session_id: str, op: str, path: str, call: Callable[..., _T]) -> _T:
+        """Run one native file operation for an authorized live session.
+
+        `call` gets the session's host directory and the path's components below
+        the work directory. The operation is recorded in the session's activity
+        log like a command, and counts as activity, so a run that only edits
+        files is not reaped as idle.
+
+        Raises:
+            HTTPException: `NOT_NATIVE_STATUS` for anything the sandbox has to
+                resolve, 404 for a missing path and 400 for the other path
+                errors the workspace protocol names, with the error's type.
+        """
+        if not self.native_reads:
+            raise HTTPException(status_code=wire.NOT_NATIVE_STATUS, detail="native files are off")
+        resident = self.manager.sessions.get(session_id)
+        if resident is not None and hasattr(resident, "touch"):
+            resident.touch()
+        workspace = workspace_root_for(Path(self.config.workspace_root or ""), session_id)
+        with self.observe(session_id, op, path) as outcome:
+            try:
+                parts = hostfs.parts_of(path, self.config.work_dir)
+                result = await asyncio.get_running_loop().run_in_executor(
+                    self._executor, functools.partial(call, workspace, parts)
+                )
+            except (hostfs.NotNative, PermissionError) as exc:
+                # A file this service may not open can still be the sandbox's to
+                # read, so it is handed back rather than refused.
+                outcome.detail = "via the sandbox"
+                raise HTTPException(status_code=wire.NOT_NATIVE_STATUS, detail=str(exc)) from exc
+            except FileNotFoundError as exc:
+                outcome.detail = "not found"
+                raise HTTPException(
+                    status_code=404, detail={"error": "FileNotFoundError", "message": str(exc)}
+                ) from exc
+            except (
+                IsADirectoryError,
+                NotADirectoryError,
+                FileExistsError,
+                ValueError,
+            ) as exc:
+                outcome.detail = type(exc).__name__
+                raise HTTPException(
+                    status_code=400, detail={"error": type(exc).__name__, "message": str(exc)}
+                ) from exc
+            outcome.ok = True
+            return result
 
     async def _in_thread(self, call: Callable[[], Any]) -> Any:
         """Run one blocking call on the service's worker pool."""
@@ -2312,6 +2422,18 @@ def _register_workspace_routes(app: FastAPI, service: _Service) -> None:
         return await service.archive_ls(session_id, body.path)
 
     @app.post(
+        "/workspaces/{session_id}/tree",
+        response_model=wire.TreeResponse,
+        dependencies=[ServiceAuth],
+    )
+    async def tree_archived(
+        session_id: Annotated[str, PathParam(pattern=wire.SESSION_ID_PATTERN)],
+        body: wire.TreeRequest,
+    ) -> wire.TreeResponse:
+        """List a stored workspace directory and the directories under it."""
+        return await service.archive_tree(session_id, body)
+
+    @app.post(
         "/workspaces/{session_id}/read",
         response_model=wire.ReadResponse,
         dependencies=[ServiceAuth],
@@ -2343,6 +2465,82 @@ def _register_workspace_routes(app: FastAPI, service: _Service) -> None:
 
 def _register_run_routes(app: FastAPI, service: _Service) -> None:
     """Commands for a Pydantic AI workspace, under its failure contract."""
+
+    @app.post("/sessions/{session_id}/files/read", response_class=Response)
+    async def read_file(session_id: AuthorizedSession, body: wire.FilePathRequest) -> Response:
+        """A file's bytes, read off the session's host directory (see `_hostfs`)."""
+        data = await service.native_file(
+            session_id,
+            "read",
+            body.path,
+            functools.partial(hostfs.read, max_bytes=service.config.max_read_bytes),
+        )
+        return Response(content=data, media_type="application/octet-stream")
+
+    @app.post("/sessions/{session_id}/files/write", status_code=204)
+    async def write_file(
+        session_id: AuthorizedSession, path: Annotated[str, Query()], request: Request
+    ) -> None:
+        """Write the request body to a file, creating its parents.
+
+        Over `max_read_bytes`, or where writes are not native, it is the
+        sandbox's to write, and the client writes it there.
+        """
+        if not service.native_writes:
+            raise HTTPException(status_code=wire.NOT_NATIVE_STATUS, detail="native writes are off")
+        length = int(request.headers.get("content-length") or 0)
+        if length > service.config.max_read_bytes:
+            raise HTTPException(
+                status_code=wire.NOT_NATIVE_STATUS, detail="larger than a native write"
+            )
+        data = await request.body()
+        await service.native_file(
+            session_id, "write", path, lambda root, parts: hostfs.write(root, parts, data)
+        )
+
+    @app.post("/sessions/{session_id}/files/stat", response_model=wire.FileEntry)
+    async def stat_file(
+        session_id: AuthorizedSession, body: wire.FilePathRequest
+    ) -> wire.FileEntry:
+        """What a path is, without following a link."""
+        entry = await service.native_file(
+            session_id,
+            "stat",
+            body.path,
+            lambda root, parts: hostfs.stat(root, parts, body.path),
+        )
+        return wire.FileEntry(
+            name=entry.name, path=entry.path, is_dir=entry.is_dir, size=entry.size
+        )
+
+    @app.post("/sessions/{session_id}/files/list", response_model=list[wire.FileEntry])
+    async def list_files(
+        session_id: AuthorizedSession, body: wire.FilePathRequest
+    ) -> list[wire.FileEntry]:
+        """A directory's entries, not recursive."""
+        entries = await service.native_file(
+            session_id,
+            "ls",
+            body.path,
+            lambda root, parts: hostfs.list_dir(root, parts, body.path),
+        )
+        return [
+            wire.FileEntry(name=e.name, path=e.path, is_dir=e.is_dir, size=e.size) for e in entries
+        ]
+
+    @app.post("/sessions/{session_id}/files/mkdir", status_code=204)
+    async def make_directory(session_id: AuthorizedSession, body: wire.FilePathRequest) -> None:
+        """`mkdir -p`."""
+        if not service.native_writes:
+            raise HTTPException(status_code=wire.NOT_NATIVE_STATUS, detail="native writes are off")
+        await service.native_file(session_id, "mkdir", body.path, hostfs.make_dir)
+
+    @app.post("/sessions/{session_id}/files/remove", status_code=204)
+    async def remove_path(session_id: AuthorizedSession, body: wire.FilePathRequest) -> None:
+        """Remove a file, a link itself, or a directory with what is in it."""
+        if not service.native_writes:
+            raise HTTPException(status_code=wire.NOT_NATIVE_STATUS, detail="native writes are off")
+        await service.native_file(session_id, "remove", body.path, hostfs.remove)
 
     @app.post("/sessions/{session_id}/run", response_model=wire.RunResponse)
     async def run_command(session_id: AuthorizedSession, body: wire.RunRequest) -> wire.RunResponse:

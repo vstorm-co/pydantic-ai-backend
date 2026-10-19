@@ -68,7 +68,7 @@ if TYPE_CHECKING:
         PermissionRuleset,
         create_ruleset,
     )
-    from pydantic_ai_backends.remote import WorkspaceArchive, WorkspaceArchiveError
+    from pydantic_ai_backends.remote import WorkspaceArchive, WorkspaceArchiveError, WorkspaceTree
     from pydantic_ai_backends.toolsets.console import (
         DEFAULT_MAX_DOCUMENT_BYTES,
         DEFAULT_MAX_IMAGE_BYTES,
@@ -153,7 +153,11 @@ _LAZY_MODULES: dict[str, tuple[str, ...]] = {
     "pydantic_ai_backends.backends.docker.session": ("SandboxFactory", "SessionManager"),
     "pydantic_ai_backends.backends.docker.runtimes": ("BUILTIN_RUNTIMES", "get_runtime"),
     "pydantic_ai_backends.backends.kubernetes": ("KubernetesPodSandbox",),
-    "pydantic_ai_backends.remote.archive": ("WorkspaceArchive", "WorkspaceArchiveError"),
+    "pydantic_ai_backends.remote.archive": (
+        "WorkspaceArchive",
+        "WorkspaceArchiveError",
+        "WorkspaceTree",
+    ),
     "pydantic_ai_backends.permissions": (
         "AskCallback",
         "AskFallback",
@@ -252,6 +256,7 @@ __all__ = [
     "WorkspaceArchive",
     "WorkspaceArchiveError",
     "WorkspacePathError",
+    "WorkspaceTree",
     "apply_hashline_edit",
     "apply_hashline_edit_with_summary",
     "create_console_toolset",

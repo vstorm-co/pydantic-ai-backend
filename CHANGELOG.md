@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A live session's file operations are served off the host.** With a
+  `workspace_root`, sandboxd answers read, write, stat, list, mkdir and remove for
+  a session itself, and `SandboxdWorkspaceBackend` implements `SupportsFilesystem`
+  over them. Pydantic AI derived each of those from shell commands in the
+  container, one to nine `docker exec`s at 50-500 ms. Natively each is ~4 ms.
+  - Links, special files, anything outside the work directory and files over
+    `max_read_bytes` are handed back (`409`), and the client takes the shell path
+    for that call.
+  - Writes are native only when the sandbox runs as the service's user or as root.
+  - `ServicePolicy.native_files` and `native_writes` say which; an older service
+    says neither, so an older pairing keeps working.
+  - `SANDBOXD_NATIVE_FILES=0` turns it off.
+- **`WorkspaceArchive.tree()` and `/workspaces/{id}/tree`.** A stored
+  workspace's directories, listed breadth first in one request, bounded by
+  `max_depth` and `max_entries`, with `truncated` set when a bound or an
+  unreadable directory left something out. A file browser walking with `ls`
+  made one request per directory.
+- **`max_running_commands`** (`SANDBOXD_MAX_RUNNING_COMMANDS`, default 256). A
+  running command holds a thread while it runs, and anyio's default of 40 made the
+  forty-first command on the whole service wait.
+
+### Changed
+
+- **The `sandboxd` image builds runtimes with BuildKit.** It now carries the
+  Docker CLI 29.9.1 and buildx 0.38.0, the plugin checked against its release
+  checksums. Without them the service fell back to the SDK's classic builder:
+  no cache mounts, so every runtime change downloaded its pip and npm packages
+  again.
+- **The `sandboxd` image runs Python 3.15**, as does the docs build.
+- **A Docker sandbox's liveness is trusted for 30 seconds**, up from 5, so a
+  busy session asks the daemon six times less often. A command that finds the
+  container gone drops the cached answer, so a container that died inside the
+  window is noticed on the next request rather than at its end.
+- ruff 0.17.1 and `astral-sh/setup-uv` 10.3.0.
+
+### Security
+
+- **The archive routes no longer follow links.** `/workspaces/{id}/read`,
+  `read_bytes` and `ls` resolved a path, checked it was inside the workspace and
+  then opened it by name. A live sandbox could swap a directory for a link in
+  between and have the host read a file of its choosing. Every component is now
+  opened from its parent's descriptor with `O_NOFOLLOW`. As a result a link is
+  neither read nor listed, including one that points inside the workspace.
+
 ## [0.2.34] - 2026-10-19
 
 ### Added

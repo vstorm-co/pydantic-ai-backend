@@ -6,7 +6,7 @@
 # Installed as a package rather than copied into place, so what runs here is the
 # wheel users get.
 
-FROM python:3.14-slim AS build
+FROM python:3.15-slim AS build
 
 WORKDIR /src
 COPY pyproject.toml README.md LICENSE ./
@@ -19,7 +19,7 @@ RUN python -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-cache-dir '.[server]'
 
 
-FROM python:3.14-slim
+FROM python:3.15-slim
 
 COPY --from=build /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH" \
@@ -28,6 +28,39 @@ ENV PATH="/opt/venv/bin:$PATH" \
     SANDBOXD_HOST=0.0.0.0 \
     SANDBOXD_PORT=8080 \
     SANDBOXD_WORKSPACE_ROOT=/workspaces
+
+# The Docker CLI and buildx, so runtime images are built with BuildKit. Without
+# them the service falls back to the SDK's classic builder, which has no cache
+# mounts: every change to a runtime downloads its pip and npm packages again.
+# Only the client binaries - the daemon is the host's, reached through the socket.
+# The buildx plugin is checked against its release checksums.
+ARG DOCKER_VERSION=29.9.1
+ARG BUILDX_VERSION=0.38.0
+ARG TARGETARCH
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl; \
+    arch="${TARGETARCH:-amd64}"; \
+    case "$arch" in \
+        amd64) static=x86_64 ;; \
+        arm64) static=aarch64 ;; \
+        *) echo "no Docker CLI build for $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://download.docker.com/linux/static/stable/${static}/docker-${DOCKER_VERSION}.tgz" \
+        | tar -xz -C /usr/local/bin --strip-components=1 docker/docker; \
+    plugins=/usr/local/lib/docker/cli-plugins; \
+    asset="buildx-v${BUILDX_VERSION}.linux-${arch}"; \
+    release="https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}"; \
+    mkdir -p "$plugins"; \
+    curl -fsSL -o "$plugins/docker-buildx" "$release/$asset"; \
+    expected="$(curl -fsSL "$release/checksums.txt" | awk -v a="*$asset" '$2 == a { print $1 }')"; \
+    test -n "$expected"; \
+    echo "$expected  $plugins/docker-buildx" | sha256sum -c -; \
+    chmod 0755 "$plugins/docker-buildx"; \
+    apt-get purge -y --auto-remove curl; \
+    rm -rf /var/lib/apt/lists/*; \
+    docker --version; \
+    docker buildx version
 
 # Unprivileged, and the workspace root owned by that user so a named volume
 # mounted there inherits the ownership on first use.
