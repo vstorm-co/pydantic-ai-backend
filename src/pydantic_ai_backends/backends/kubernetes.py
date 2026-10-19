@@ -110,13 +110,15 @@ class KubernetesPodSandbox:
 
         if in_cluster is None:
             in_cluster = _detect_in_cluster()
+        # kubernetes 37 ships its config loaders without annotations; they take
+        # a path and return nothing, so there is nothing to narrow.
         try:
             if in_cluster:
-                k8s_config.load_incluster_config()
+                k8s_config.load_incluster_config()  # type: ignore[no-untyped-call]
             elif kube_config_path:
-                k8s_config.load_kube_config(config_file=kube_config_path)
+                k8s_config.load_kube_config(config_file=kube_config_path)  # type: ignore[no-untyped-call]
             else:
-                k8s_config.load_kube_config()
+                k8s_config.load_kube_config()  # type: ignore[no-untyped-call]
         except Exception as exc:
             raise RuntimeError(f"failed to load kubernetes config: {exc}") from exc
         self._core: Any = k8s_client.CoreV1Api()
