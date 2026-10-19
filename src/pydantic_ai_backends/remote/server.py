@@ -1273,7 +1273,12 @@ class _Service:
             max_sessions=config.max_sessions,
             default_idle_timeout=config.idle_timeout,
             on_release=self._forget,
+            in_use=self._in_use,
         )
+
+    def _in_use(self, session_id: str) -> bool:
+        """Whether a command or a file operation is under way in the session."""
+        return self._inflight[session_id] > 0
 
     def _forget(self, session_id: str) -> None:
         """Drop the bookkeeping for a session whose sandbox has been stopped.
@@ -1383,6 +1388,7 @@ class _Service:
             for session_id, record in self._sessions.items()
             if record.hibernated_at is not None
             and now - record.hibernated_at >= self.config.idle_timeout
+            and not self._in_use(session_id)
         ]
         for session_id in stale:
             await self.close_session(session_id)
@@ -2210,6 +2216,12 @@ class _Service:
         resident = self.manager.sessions.get(session_id)
         if resident is not None and hasattr(resident, "touch"):
             resident.touch()
+        record = self._sessions.get(session_id)
+        if resident is None and record is not None and record.hibernated_at is not None:
+            # Asleep, and still being worked on: its files are served without
+            # waking it, and the work counts as activity all the same, so it is
+            # not ended as if nobody had touched it (AUD-1019-06).
+            record.hibernated_at = time.time()
         workspace = workspace_root_for(Path(self.config.workspace_root or ""), session_id)
         with self.observe(session_id, op, path) as outcome:
             try:

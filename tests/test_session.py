@@ -1287,3 +1287,45 @@ class TestStartsAreAccountedFor:
             await manager.get_or_create("a")
 
         assert "Session open failed" in caplog.text
+
+
+class TestIdleCleanupLeavesBusySessionsAlone:
+    """AUD-1019-06: a command longer than the idle timeout was reaped mid-run."""
+
+    class Quiet:
+        def __init__(self, session_id: str) -> None:
+            self.stopped = False
+            self.last_activity = 0.0  # Idle since the epoch.
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def is_alive(self) -> bool:
+            return not self.stopped
+
+    async def test_a_session_in_use_is_not_reaped(self):
+        busy = {"a"}
+        manager = SessionManager(sandbox_factory=self.Quiet, in_use=busy.__contains__)
+        sandbox = await manager.get_or_create("a")
+
+        assert await manager.cleanup_idle(max_idle=1) == 0
+        busy.clear()
+        assert await manager.cleanup_idle(max_idle=1) == 1
+        assert sandbox.stopped is True
+
+    async def test_one_that_got_busy_after_the_scan_is_kept(self):
+        """Checked again under the session's lock, just before it is stopped."""
+        answers = iter([False, True])
+        manager = SessionManager(sandbox_factory=self.Quiet, in_use=lambda _sid: next(answers))
+        sandbox = await manager.get_or_create("a")
+
+        assert await manager.cleanup_idle(max_idle=1) == 0
+        assert sandbox.stopped is False
+
+    async def test_one_released_meanwhile_is_not_counted(self):
+        manager = SessionManager(sandbox_factory=self.Quiet)
+        await manager.get_or_create("a")
+        assert await manager._release_if_idle("missing", None) is False

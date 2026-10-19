@@ -104,6 +104,7 @@ class SessionManager:
         max_sessions: int | None = None,
         on_release: Callable[[str], None] | None = None,
         executor: Executor | None = None,
+        in_use: Callable[[str], bool] | None = None,
     ):
         """Initialize the manager.
 
@@ -133,6 +134,10 @@ class SessionManager:
                 every other `to_thread` caller in the process — a service
                 handing out sandboxes wants its own. Assignable afterwards, for
                 a caller whose pool outlives fewer things than its manager does.
+            in_use: Whether a session has an operation under way, for a caller
+                that tracks them. Idle cleanup never stops such a session: its
+                last activity is when the operation began, and a command longer
+                than the idle timeout is not idle.
         """
         self._sessions: dict[str, Any] = {}
         self._sandbox_factory = sandbox_factory
@@ -143,6 +148,7 @@ class SessionManager:
         self._max_sessions = max_sessions
         self._on_release = on_release
         self.executor = executor
+        self._in_use = in_use
         # Per-session locks serialize every lifecycle change for one id —
         # `get_or_create` and `release` both — so two awaits cannot each create
         # and start a sandbox (one of which would be overwritten in the dict and
@@ -342,21 +348,43 @@ class SessionManager:
             Number of sessions cleaned up.
         """
         now = time.time()
-        # A custom factory may return a sandbox that never records activity.
-        # Treating that as "just used" keeps it alive instead of raising and
-        # taking the whole cleanup loop down with it.
         idle = [
             session_id
             for session_id, sandbox in self._sessions.items()
-            if now - last_activity_of(sandbox, now)
-            > (max_idle if max_idle is not None else self._idle_limit_for(sandbox))
+            if self._idle(session_id, sandbox, now, max_idle)
         ]
 
+        released = 0
         for session_id in idle:
-            await self.release(session_id)
+            released += await self._release_if_idle(session_id, max_idle)
 
         self._prune_locks()
-        return len(idle)
+        return released
+
+    def _idle(self, session_id: str, sandbox: Any, now: float, max_idle: int | None) -> bool:
+        if self._in_use is not None and self._in_use(session_id):
+            return False
+        # A custom factory may return a sandbox that never records activity.
+        # Treating that as "just used" keeps it alive instead of raising and
+        # taking the whole cleanup loop down with it.
+        limit = max_idle if max_idle is not None else self._idle_limit_for(sandbox)
+        return now - last_activity_of(sandbox, now) > limit
+
+    async def _release_if_idle(self, session_id: str, max_idle: int | None) -> bool:
+        """`release`, if the session is still idle once its lock is held.
+
+        Checked again under the lock: between the scan and here, a request may
+        have used the session or started an operation in it (AUD-1019-06).
+        """
+        async with self._session_lock(session_id):
+            sandbox = self._sessions.get(session_id)
+            if sandbox is None or not self._idle(session_id, sandbox, time.time(), max_idle):
+                return False
+            self._sessions.pop(session_id)
+            await self._lifecycle(sandbox.stop)
+        if self._on_release is not None:
+            self._on_release(session_id)
+        return True
 
     def _idle_limit_for(self, sandbox: Any) -> int:
         """Idle ceiling for one sandbox, preferring its own configured timeout.

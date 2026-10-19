@@ -2659,6 +2659,38 @@ class TestHibernation:
 
             assert "forgotten" not in service._sessions
 
+    async def test_one_asleep_with_an_operation_under_way_is_kept(self, tmp_path):
+        """AUD-1019-06: a native read of a sleeping session was ended under it."""
+        harness = self._harness(tmp_path, idle_timeout=0)
+        with harness.client() as client:
+            _open_session(client, session_id="busy")
+            service = harness.app.state.service
+            await service.hibernate("busy")
+
+            with service.observe("busy", "read", "/workspace/a"):
+                await service._reap_hibernated()
+
+            assert "busy" in service._sessions
+
+    async def test_a_native_file_operation_on_one_asleep_counts_as_activity(self, tmp_path):
+        harness = self._harness(tmp_path)
+        with harness.client() as client:
+            _, token = _open_session(client, session_id="asleep")
+            service = harness.app.state.service
+            await service.hibernate("asleep")
+            service._sessions["asleep"].hibernated_at = time.time() - 500
+
+            response = client.post(
+                "/sessions/asleep/files/stat",
+                json={"path": "/workspace"},
+                headers={wire.TOKEN_HEADER: token},
+            )
+
+            assert response.status_code == 200
+            assert time.time() - service._sessions["asleep"].hibernated_at < 5
+            # Served without waking it.
+            assert "asleep" not in service.manager
+
     async def test_closing_one_forgets_it(self, tmp_path):
         """The manager has nothing to release, so nothing fires `on_release`."""
         harness = self._harness(tmp_path)
