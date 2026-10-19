@@ -97,6 +97,12 @@ class ReadBytesResponse(BaseModel):
     content_b64: str
 
 
+class RealpathResponse(BaseModel):
+    """A path with every link in it resolved, in the sandbox's view."""
+
+    path: str
+
+
 class FilePathRequest(BaseModel):
     """One path in a live session's work directory, for a native file operation."""
 
@@ -359,6 +365,11 @@ class ServicePolicy(BaseModel):
     the shell path rather than calling routes that are not there."""
     native_writes: bool = False
     """Whether writes are served that way too, and not only reads."""
+    native_realpath: bool = False
+    """Whether `realpath` is answered off the host for a path with no link in it.
+
+    The console's path checks ask it before every read and write, so without it
+    each of those cost a `docker exec` of its own."""
 
 
 class RuntimeLimitsUpdate(BaseModel):

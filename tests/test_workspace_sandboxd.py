@@ -24,6 +24,7 @@ from pydantic_ai.exceptions import UserError
 from pydantic_ai.workspaces import (
     LocalWorkspaceBackend,
     SupportsFilesystem,
+    SupportsRealpath,
     Workspace,
     WorkspaceBackend,
     WorkspaceOutputLimitError,
@@ -654,10 +655,14 @@ class TestPurgeRaces:
             await SandboxdWorkspaceBackend("http://sandboxd", token="t", client=client).purge()
 
 
-def _native(request: httpx.Request, *, writes: bool = True) -> httpx.Response | None:
+def _native(
+    request: httpx.Request, *, writes: bool = True, realpath: bool = True
+) -> httpx.Response | None:
     """`_opened`, from a service that serves file operations off the host."""
     if request.url.path == "/policy":
-        policy = wire.ServicePolicy(execute_timeout=60, native_files=True, native_writes=writes)
+        policy = wire.ServicePolicy(
+            execute_timeout=60, native_files=True, native_writes=writes, native_realpath=realpath
+        )
         return httpx.Response(200, content=policy.model_dump_json())
     return _opened(request)
 
@@ -734,6 +739,46 @@ class TestNativeFileOperations:
             "make_dir",
             "remove",
         ]
+
+    async def test_realpath_is_one_request_for_a_path_with_no_link(self) -> None:
+        """AUD-1019-10: the console's path guard asks this before every read."""
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if (opened := _native(request)) is not None:
+                return opened
+            seen.append(request.url.path)
+            resolved = wire.RealpathResponse(path="/workspace/a.txt")
+            return httpx.Response(200, content=resolved.model_dump_json())
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend("http://x", token="t", client=client)
+            assert isinstance(backend, SupportsRealpath)
+            assert await backend.realpath("/workspace/a.txt") == "/workspace/a.txt"
+        assert seen == ["/sessions/s-1/files/realpath"]
+
+    @pytest.mark.parametrize("offered", [True, False])
+    async def test_a_link_or_an_older_service_resolves_in_the_sandbox(
+        self, monkeypatch: pytest.MonkeyPatch, offered: bool
+    ) -> None:
+        asked: list[str] = []
+
+        class Shell:
+            async def realpath(self, path: str) -> str:
+                asked.append(path)
+                return "/workspace/target"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if (opened := _native(request, realpath=offered)) is not None:
+                return opened
+            assert offered, "an older service is never asked"
+            return httpx.Response(wire.NOT_NATIVE_STATUS, json={"detail": "a link"})
+
+        async with _answering(handler) as client:
+            backend = SandboxdWorkspaceBackend("http://x", token="t", client=client)
+            monkeypatch.setattr(backend, "_shell", Shell)
+            assert await backend.realpath("/workspace/link") == "/workspace/target"
+        assert asked == ["/workspace/link"]
 
     async def test_the_shell_path_is_a_workspace_over_its_commands(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:

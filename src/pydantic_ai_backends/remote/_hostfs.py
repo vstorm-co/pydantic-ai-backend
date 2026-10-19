@@ -266,6 +266,38 @@ def list_dir(root: Path, parts: list[str], path: str) -> list[Entry]:
     return sorted(entries, key=lambda entry: entry.name)
 
 
+def realpath(root: Path, parts: list[str], work_dir: str) -> str:
+    """The path with every link resolved, as `os.path.realpath(strict=False)` in the sandbox.
+
+    Answered here only when no component is a link: then the path already is
+    its own real path, and saying so takes a few `stat`s instead of a `docker
+    exec`. A link is the sandbox's to resolve - its target means something in
+    the container's view, not the host's. A missing component, or anything below
+    a file, is kept as written, as `realpath` keeps it.
+
+    Raises:
+        NotNative: A component is a link.
+        PermissionError: A directory on the way cannot be searched by this service.
+    """
+    fd = os.open(root, _DIR_FLAGS)
+    try:
+        for part in parts:
+            try:
+                info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                break
+            if stat_module.S_ISLNK(info.st_mode):
+                raise NotNative(f"{part} is a symbolic link")
+            if not stat_module.S_ISDIR(info.st_mode):
+                break
+            child = _open_child_dir(part, fd)
+            os.close(fd)
+            fd = child
+    finally:
+        os.close(fd)
+    return str(PurePosixPath(work_dir, *parts))
+
+
 def make_dir(root: Path, parts: list[str]) -> None:
     """`mkdir -p`. A file in the way raises, as it would in the shell.
 

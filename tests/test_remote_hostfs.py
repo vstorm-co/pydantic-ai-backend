@@ -261,6 +261,54 @@ class TestDescribing:
             hostfs.list_dir(root, [], "/workspace")
 
 
+class TestRealpath:
+    """AUD-1019-10: a path with no link in it is its own real path."""
+
+    def test_a_plain_path_is_itself(self, root: Path) -> None:
+        (root / "src").mkdir()
+        (root / "src" / "app.py").write_text("x")
+        assert hostfs.realpath(root, ["src", "app.py"], WORK) == "/workspace/src/app.py"
+
+    def test_the_work_directory(self, root: Path) -> None:
+        assert hostfs.realpath(root, [], WORK) == "/workspace"
+
+    def test_a_missing_tail_is_kept_as_written(self, root: Path) -> None:
+        (root / "src").mkdir()
+        assert hostfs.realpath(root, ["src", "new", "file.py"], WORK) == (
+            "/workspace/src/new/file.py"
+        )
+
+    def test_below_a_file_is_kept_as_written(self, root: Path) -> None:
+        (root / "file").write_text("x")
+        assert hostfs.realpath(root, ["file", "child"], WORK) == "/workspace/file/child"
+
+    def test_a_link_anywhere_is_the_sandboxs(self, root: Path, secret: Path) -> None:
+        (root / "dir").mkdir()
+        (root / "dir" / "link").symlink_to(secret)
+        (root / "up").symlink_to(root / "dir")
+        with pytest.raises(NotNative):
+            hostfs.realpath(root, ["dir", "link"], WORK)
+        with pytest.raises(NotNative):
+            hostfs.realpath(root, ["up", "x"], WORK)
+
+    def test_a_directory_swapped_for_a_link_mid_walk_is_the_sandboxs(
+        self, root: Path, secret: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (root / "dir").mkdir()
+        real_stat = os.stat
+
+        def swap(name: object, **kwargs: object) -> os.stat_result:
+            info = real_stat(name, **kwargs)  # type: ignore[arg-type]
+            if name == "dir" and not (root / "dir").is_symlink():
+                (root / "dir").rmdir()
+                (root / "dir").symlink_to(secret.parent)
+            return info
+
+        monkeypatch.setattr(hostfs.os, "stat", swap)
+        with pytest.raises(NotNative):
+            hostfs.realpath(root, ["dir", "x"], WORK)
+
+
 class TestMakingDirectories:
     def test_every_missing_parent_is_made(self, root: Path) -> None:
         hostfs.make_dir(root, ["a", "b", "c"])

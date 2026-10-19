@@ -1704,6 +1704,7 @@ class _Service:
             buildkit=buildkit_available(),
             native_files=self.native_reads,
             native_writes=self.native_writes,
+            native_realpath=self.native_reads,
         )
 
     def _runtime_policy(self, alias: str) -> wire.RuntimePolicy:
@@ -2530,6 +2531,19 @@ def _register_run_routes(app: FastAPI, service: _Service) -> None:
         return wire.FileEntry(
             name=entry.name, path=entry.path, is_dir=entry.is_dir, size=entry.size
         )
+
+    @app.post("/sessions/{session_id}/files/realpath", response_model=wire.RealpathResponse)
+    async def realpath_of(
+        session_id: AuthorizedSession, body: wire.FilePathRequest
+    ) -> wire.RealpathResponse:
+        """A path with no link in it, as its own real path; a link is the sandbox's."""
+        resolved = await service.native_file(
+            session_id,
+            "realpath",
+            body.path,
+            lambda root, parts: hostfs.realpath(root, parts, service.config.work_dir),
+        )
+        return wire.RealpathResponse(path=resolved)
 
     @app.post("/sessions/{session_id}/files/list", response_model=list[wire.FileEntry])
     async def list_files(

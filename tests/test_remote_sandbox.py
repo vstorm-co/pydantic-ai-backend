@@ -3752,9 +3752,21 @@ class TestNativeFiles:
             )
         assert response.status_code == wire.NOT_NATIVE_STATUS
 
-    def test_a_chunked_write_over_the_ceiling_is_counted_not_trusted(
-        self, tmp_path: Path
-    ) -> None:
+    def test_realpath_of_a_plain_path_and_of_a_link(self, tmp_path: Path) -> None:
+        harness = Harness(workspace_root=str(tmp_path))
+        with harness.client() as client:
+            sid, token = _open_session(client)
+            workspace = self._workspace(harness, sid)
+            (workspace / "a.txt").write_text("x")
+            (workspace / "l").symlink_to(workspace / "a.txt")
+            plain = self._call(client, sid, token, "realpath", "/workspace/a.txt")
+            linked = self._call(client, sid, token, "realpath", "/workspace/l")
+            policy = client.get("/policy", headers=_service_headers()).json()
+        assert plain.json() == {"path": "/workspace/a.txt"}
+        assert linked.status_code == wire.NOT_NATIVE_STATUS
+        assert policy["native_realpath"] is True
+
+    def test_a_chunked_write_over_the_ceiling_is_counted_not_trusted(self, tmp_path: Path) -> None:
         """AUD-1019-02: a body with no length used to be written whole."""
 
         def chunks():
