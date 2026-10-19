@@ -459,6 +459,28 @@ class TestTheCallerHearsThatOpeningIsSlow:
         assert backend._on_wait is on_wait
 
 
+class TestOwningAClient:
+    """AUD-1019-09: with no client, every request opened and closed one of its own."""
+
+    async def test_inside_the_context_every_backend_shares_one_client(self) -> None:
+        capability = SandboxdWorkspace(service_url="http://x", token="t")
+        async with capability as entered:
+            assert entered is capability
+            first, second = capability.backend(), capability.backend()
+            assert first._client is not None
+            assert first._client is second._client
+            owned = first._client
+        assert owned.is_closed
+        assert capability.backend()._client is None
+
+    async def test_a_client_passed_in_stays_the_callers(self) -> None:
+        async with httpx.AsyncClient() as client:
+            capability = SandboxdWorkspace(service_url="http://x", token="t", client=client)
+            async with capability:
+                assert capability.backend()._client is client
+            assert not client.is_closed
+
+
 class TestSandboxdWorkspaceCapability:
     def test_a_foreign_ref_is_left_to_another_capability(self, service: Service) -> None:
         capability = service.capability(provider="sandboxd:eu")

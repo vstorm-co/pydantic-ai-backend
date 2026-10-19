@@ -619,7 +619,12 @@ class SandboxdWorkspace(AbstractCapability[object]):
     """Variables every command gets. Nothing is read from the host's environment."""
 
     client: httpx.AsyncClient | None = field(default=None, repr=False, compare=False)
-    """An `httpx.AsyncClient` to share across runs, owned and closed by the caller."""
+    """An `httpx.AsyncClient` to share across runs, owned and closed by the caller.
+
+    Without one, use the capability as an async context manager so it owns a
+    client for its lifetime. Otherwise each request opens a client of its own -
+    a new connection every time, which costs a native file operation four times
+    its own duration (AUD-1019-09)."""
 
     opening_timeout: float = DEFAULT_OPENING_TIMEOUT
     """Seconds opening a session may take; it can include building the runtime's image."""
@@ -637,12 +642,26 @@ class SandboxdWorkspace(AbstractCapability[object]):
     to another capability.
     """
 
+    _owned: httpx.AsyncClient | None = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         if self.defer_loading:
             raise UserError(
                 "`SandboxdWorkspace` does not support `defer_loading=True`: "
                 "the workspace is selected before deferred capabilities load."
             )
+
+    async def __aenter__(self) -> SandboxdWorkspace:
+        """Own one client for every backend made inside, unless `client` was given."""
+        if self.client is None and self._owned is None:
+            self._owned = httpx.AsyncClient()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Close the client entering opened; a `client` passed in stays the caller's."""
+        owned, self._owned = self._owned, None
+        if owned is not None:
+            await owned.aclose()
 
     def backend(self, ref: WorkspaceRef | None = None) -> SandboxdWorkspaceBackend:
         """A backend for `ref`, or for a new session; no I/O until its first operation."""
@@ -654,7 +673,7 @@ class SandboxdWorkspace(AbstractCapability[object]):
             runtime=self.runtime,
             tenant=self.tenant,
             env=self.env,
-            client=self.client,
+            client=self.client or self._owned,
             session_name=self.session_name,
             opening_timeout=self.opening_timeout,
             on_wait=self.on_wait,
