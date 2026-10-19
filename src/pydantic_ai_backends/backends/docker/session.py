@@ -425,8 +425,15 @@ async def alive_of(sandbox: Any) -> bool:
     An async sandbox's `is_alive()` returns a coroutine, and a coroutine object
     is truthy — so a caller that only checked the return value would treat a
     dead sandbox as alive for the rest of the process's life.
+
+    A sync one is asked on a worker thread. `DockerSandbox.is_alive` reloads the
+    container once its cached answer expires, a daemon round trip that held the
+    event loop - and every other session on it - for as long as Docker took.
     """
-    alive = sandbox.is_alive()
+    probe = sandbox.is_alive
+    if inspect.iscoroutinefunction(probe):
+        return bool(await probe())
+    alive = await asyncio.to_thread(probe)
     if inspect.isawaitable(alive):
         alive = await alive
     return bool(alive)

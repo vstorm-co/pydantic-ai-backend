@@ -1033,14 +1033,33 @@ class TestAsyncSandboxLifecycle:
 class TestAliveOf:
     """The helper both the manager and the service resolve liveness with."""
 
-    async def test_a_sync_sandbox_is_read_directly(self):
+    async def test_a_sync_sandbox_is_asked_off_the_event_loop(self):
+        """AUD-1019-07: a slow `container.reload()` held every session's loop."""
+        import threading
+
         from pydantic_ai_backends.backends.docker.session import alive_of
+
+        asked_on: list[str] = []
 
         class Sync:
             def is_alive(self) -> bool:
+                asked_on.append(threading.current_thread().name)
                 return True
 
         assert await alive_of(Sync()) is True
+        assert asked_on != [threading.main_thread().name]
+
+    async def test_a_sync_method_returning_an_awaitable_is_awaited(self):
+        from pydantic_ai_backends.backends.docker.session import alive_of
+
+        async def answer() -> bool:
+            return False
+
+        class Deferred:
+            def is_alive(self):
+                return answer()
+
+        assert await alive_of(Deferred()) is False
 
     async def test_an_async_sandbox_is_awaited(self):
         from pydantic_ai_backends.backends.docker.session import alive_of
