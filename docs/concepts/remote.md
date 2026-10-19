@@ -710,8 +710,8 @@ between a caller and the rest of the machine. Two ways in are closed:
 ## A live session's files, off the host
 
 With a `workspace_root`, the service also answers a live session's file operations
-itself: `/sessions/{id}/files/read`, `write`, `stat`, `list`, `mkdir` and `remove`,
-under the session's token. They work the way the archive routes above do, from the
+itself: `/sessions/{id}/files/read`, `write`, `stat`, `list`, `realpath`, `mkdir`
+and `remove`, under the session's token. They work the way the archive routes above do, from the
 session's directory on the host, through descriptors that follow no link.
 `SandboxdWorkspace` uses them whenever `/policy` says `native_files`.
 
@@ -737,9 +737,42 @@ one call:
 
 Those are the sandbox's to resolve in its own view.
 
-Writes are native only when the sandbox runs as the service's own user, or as
-root. Otherwise a file the service created would be one the sandbox could read
-and not change. `SANDBOXD_NATIVE_FILES=0` turns all of it off.
+**`realpath` matters as much as the reads.** The console's path guard and a
+confined workspace resolve every path before they read or write it. Through the
+shell that is a `docker exec` of its own, so a 1 KiB read with both checks cost
+two execs and ~100 ms even with native reads. A path with no link in it is its
+own real path, and the service answers that from a few `stat`s. A link still
+resolves in the sandbox (`ServicePolicy.native_realpath`).
+
+**A write is atomic.** The bytes go to a temporary file beside the target, which
+then replaces it with one `rename`. A write that fails part-way, on a full disk
+say, leaves the old file whole, and a reader sees the old content or the new. An
+existing file keeps its permission bits. There is no `fsync` after the rename, so
+a power cut can lose the new content but not the old file's integrity.
+
+**The read ceiling counts bytes, not headers.** A read stops past
+`max_read_bytes` even when the file grew after its size was checked. A write
+body is counted as it arrives, so a chunked body with no `Content-Length` is
+bounded too.
+
+Writes are native only when the session's sandbox runs as the service's own user,
+or as root. The service checks the session's own identity: `sandbox_uid`, the
+runtime's `run_as_uid` and the user Docker reports for its container. Otherwise a
+file the service created would be one the sandbox could read and not change. A
+named user, whose uid only the container knows, writes through the sandbox.
+`SANDBOXD_NATIVE_FILES=0` turns all of it off.
+
+**Pass a client, or enter the capability.** `SandboxdWorkspace` without a
+`client` opens a new connection per request. That is about 5 ms on every native
+operation against 1 ms on a reused connection, before any network latency. Share
+an `httpx.AsyncClient` with `client=`, or use the capability as a context manager
+and it owns one for as long as it is entered:
+
+```python
+async with SandboxdWorkspace(service_url=url, token=token) as sandbox:
+    agent = Agent(model, capabilities=[sandbox, ConsoleCapability()])
+    await agent.run("...")
+```
 
 ### Never hand a session token to a browser
 
@@ -793,6 +826,17 @@ sees `WorkspaceUnavailableError` instead of carrying on in an empty directory.
   many may run at once across every session. It was anyio's default of 40, so the
   forty-first command on the service - an `ls` in somebody else's session - waited
   for one of them to finish.
+- Commands have that pool to themselves. Stopping a command, inspecting its exit
+  and asking whether a container is alive run on a separate pool of 32 threads,
+  so a service full of running commands can still stop one. anyio's own default
+  limiter is left as it is.
+- A command's `timeout` counts from the moment it is asked for. Waiting for a
+  thread and creating the exec are inside it, so a slow daemon cannot stretch it.
+- `max_sessions` counts the sessions being started as well as the open ones.
+  Cancelling an open does not abandon its sandbox: the start finishes and the
+  sandbox is held for `release` or idle cleanup, and `shutdown` waits for it.
+- Idle cleanup never stops a session with a command or file operation under way,
+  and checks again under the session's lock just before it stops one.
 
 ## Observability
 

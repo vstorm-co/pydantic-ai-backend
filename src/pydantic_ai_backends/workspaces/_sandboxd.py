@@ -20,6 +20,7 @@ from pydantic_ai.workspaces import (
     FileEntry,
     SupportsCommands,
     SupportsFilesystem,
+    SupportsRealpath,
     Workspace,
     WorkspaceBackend,
     WorkspaceCommand,
@@ -76,6 +77,7 @@ class _Session:
     execute_timeout: float
     native_reads: bool = False
     native_writes: bool = False
+    native_realpath: bool = False
 
 
 _PATH_ERRORS: dict[str, type[Exception]] = {
@@ -138,7 +140,9 @@ class _CommandsOnly:
         return await self._backend.run(command, shell=shell, env=env, timeout=timeout)
 
 
-class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem):
+class SandboxdWorkspaceBackend(
+    WorkspaceBackend, SupportsCommands, SupportsFilesystem, SupportsRealpath
+):
     """One `sandboxd` session, as the environment an agent run works in.
 
     Commands go through the service's `/run`, which keeps stdout and stderr
@@ -332,6 +336,7 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands, SupportsFiles
             execute_timeout=float(policy.execute_timeout),
             native_reads=policy.native_files,
             native_writes=policy.native_writes,
+            native_realpath=policy.native_realpath,
         )
 
     async def _connect(self) -> _Session:
@@ -467,6 +472,21 @@ class SandboxdWorkspaceBackend(WorkspaceBackend, SupportsCommands, SupportsFiles
             return False
         return True
 
+    async def realpath(self, path: str) -> str:
+        """`path` with its links resolved; see `SupportsRealpath.realpath`.
+
+        A path check - the console's guard, a confined workspace - asks this
+        before every read and write. Answered by the service for a path with no
+        link in it; a link, and a service that does not offer this, resolve in
+        the sandbox as before.
+        """
+        session = await self._connect()
+        if session.native_realpath:
+            response = await self._native("realpath", path, writes=False)
+            if response is not None:
+                return wire.RealpathResponse.model_validate_json(response.content).path
+        return await self._shell().realpath(path)
+
     def _shell(self) -> Workspace:
         """The shell-derived file operations, for what the service hands back."""
         return Workspace(_CommandsOnly(self))
@@ -599,7 +619,12 @@ class SandboxdWorkspace(AbstractCapability[object]):
     """Variables every command gets. Nothing is read from the host's environment."""
 
     client: httpx.AsyncClient | None = field(default=None, repr=False, compare=False)
-    """An `httpx.AsyncClient` to share across runs, owned and closed by the caller."""
+    """An `httpx.AsyncClient` to share across runs, owned and closed by the caller.
+
+    Without one, use the capability as an async context manager so it owns a
+    client for its lifetime. Otherwise each request opens a client of its own -
+    a new connection every time, which costs a native file operation four times
+    its own duration (AUD-1019-09)."""
 
     opening_timeout: float = DEFAULT_OPENING_TIMEOUT
     """Seconds opening a session may take; it can include building the runtime's image."""
@@ -617,12 +642,26 @@ class SandboxdWorkspace(AbstractCapability[object]):
     to another capability.
     """
 
+    _owned: httpx.AsyncClient | None = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         if self.defer_loading:
             raise UserError(
                 "`SandboxdWorkspace` does not support `defer_loading=True`: "
                 "the workspace is selected before deferred capabilities load."
             )
+
+    async def __aenter__(self) -> SandboxdWorkspace:
+        """Own one client for every backend made inside, unless `client` was given."""
+        if self.client is None and self._owned is None:
+            self._owned = httpx.AsyncClient()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Close the client entering opened; a `client` passed in stays the caller's."""
+        owned, self._owned = self._owned, None
+        if owned is not None:
+            await owned.aclose()
 
     def backend(self, ref: WorkspaceRef | None = None) -> SandboxdWorkspaceBackend:
         """A backend for `ref`, or for a new session; no I/O until its first operation."""
@@ -634,7 +673,7 @@ class SandboxdWorkspace(AbstractCapability[object]):
             runtime=self.runtime,
             tenant=self.tenant,
             env=self.env,
-            client=self.client,
+            client=self.client or self._owned,
             session_name=self.session_name,
             opening_timeout=self.opening_timeout,
             on_wait=self.on_wait,

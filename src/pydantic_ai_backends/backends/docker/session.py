@@ -104,6 +104,7 @@ class SessionManager:
         max_sessions: int | None = None,
         on_release: Callable[[str], None] | None = None,
         executor: Executor | None = None,
+        in_use: Callable[[str], bool] | None = None,
     ):
         """Initialize the manager.
 
@@ -133,6 +134,10 @@ class SessionManager:
                 every other `to_thread` caller in the process — a service
                 handing out sandboxes wants its own. Assignable afterwards, for
                 a caller whose pool outlives fewer things than its manager does.
+            in_use: Whether a session has an operation under way, for a caller
+                that tracks them. Idle cleanup never stops such a session: its
+                last activity is when the operation began, and a command longer
+                than the idle timeout is not idle.
         """
         self._sessions: dict[str, Any] = {}
         self._sandbox_factory = sandbox_factory
@@ -143,11 +148,20 @@ class SessionManager:
         self._max_sessions = max_sessions
         self._on_release = on_release
         self.executor = executor
+        self._in_use = in_use
         # Per-session locks serialize every lifecycle change for one id —
         # `get_or_create` and `release` both — so two awaits cannot each create
         # and start a sandbox (one of which would be overwritten in the dict and
         # leaked), and a release cannot land in the middle of a creation.
         self._locks: dict[str, _SessionLock] = {}
+        # Sessions being started, counted against `max_sessions` with the open
+        # ones: a start suspends, and checking open ones alone let every start
+        # under way see room for itself (AUD-1019-03).
+        self._starting: set[str] = set()
+        # Every `get_or_create` runs as one of these, shielded from its caller:
+        # a start runs on a thread that cancelling the caller does not stop, so
+        # the task finishes and registers what it started instead (AUD-1019-05).
+        self._opening: set[asyncio.Task[Any]] = set()
 
     @property
     def sessions(self) -> dict[str, Any]:
@@ -170,10 +184,29 @@ class SessionManager:
             session_id: Unique identifier for the session.
             runtime: Runtime to use. Only applies on the default Docker path.
 
+        Cancelling the caller does not cancel a start under way. A sandbox's
+        `start` is a call on a worker thread that keeps going regardless, so a
+        start abandoned half-way used to leave a running container no session
+        named. The start finishes and the sandbox is registered like any other,
+        for `release` or idle cleanup to stop; `shutdown` waits for it.
+
         Raises:
             SessionLimitExceeded: If `max_sessions` is reached and `session_id`
                 is not an existing live session.
         """
+        opening = asyncio.ensure_future(self._get_or_create(session_id, runtime))
+        self._opening.add(opening)
+        opening.add_done_callback(self._opened)
+        return await asyncio.shield(opening)
+
+    def _opened(self, task: asyncio.Task[Any]) -> None:
+        self._opening.discard(task)
+        # Retrieved here so an open whose caller went away, and which then
+        # failed, is not reported as an exception nobody retrieved.
+        if not task.cancelled() and task.exception() is not None:
+            _logger.debug("Session open failed: %s", task.exception())
+
+    async def _get_or_create(self, session_id: str, runtime: RuntimeConfig | str | None) -> Any:
         async with self._session_lock(session_id):
             existing = self._sessions.get(session_id)
             if existing is not None:
@@ -193,25 +226,32 @@ class SessionManager:
                 with contextlib.suppress(Exception):
                     await self._lifecycle(existing.stop)
 
-            if self._max_sessions is not None and len(self._sessions) >= self._max_sessions:
+            # Checked and claimed with no await between them, so it is atomic.
+            if (
+                self._max_sessions is not None
+                and len(self._sessions) + len(self._starting) >= self._max_sessions
+            ):
                 raise SessionLimitExceeded(self._max_sessions)
-
-            if self._sandbox_factory is not None:
-                sandbox = self._sandbox_factory(session_id)
-            else:
-                sandbox = self._create_docker_sandbox(session_id, runtime)
-
+            self._starting.add(session_id)
             try:
-                await self._lifecycle(sandbox.start)
-            except Exception:
-                # An unregistered sandbox is one nothing else will ever stop, so
-                # a partial start would leak whatever it did manage to create.
-                with contextlib.suppress(Exception):
-                    await self._lifecycle(sandbox.stop)
-                raise
+                if self._sandbox_factory is not None:
+                    sandbox = self._sandbox_factory(session_id)
+                else:
+                    sandbox = self._create_docker_sandbox(session_id, runtime)
 
-            self._sessions[session_id] = sandbox
-            return sandbox
+                try:
+                    await self._lifecycle(sandbox.start)
+                except Exception:
+                    # An unregistered sandbox is one nothing else will ever stop,
+                    # so a partial start would leak whatever it did manage to create.
+                    with contextlib.suppress(Exception):
+                        await self._lifecycle(sandbox.stop)
+                    raise
+
+                self._sessions[session_id] = sandbox
+                return sandbox
+            finally:
+                self._starting.discard(session_id)
 
     async def _lifecycle(self, call: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Invoke a sandbox's `start` or `stop`, whether it is sync or async.
@@ -308,21 +348,43 @@ class SessionManager:
             Number of sessions cleaned up.
         """
         now = time.time()
-        # A custom factory may return a sandbox that never records activity.
-        # Treating that as "just used" keeps it alive instead of raising and
-        # taking the whole cleanup loop down with it.
         idle = [
             session_id
             for session_id, sandbox in self._sessions.items()
-            if now - last_activity_of(sandbox, now)
-            > (max_idle if max_idle is not None else self._idle_limit_for(sandbox))
+            if self._idle(session_id, sandbox, now, max_idle)
         ]
 
+        released = 0
         for session_id in idle:
-            await self.release(session_id)
+            released += await self._release_if_idle(session_id, max_idle)
 
         self._prune_locks()
-        return len(idle)
+        return released
+
+    def _idle(self, session_id: str, sandbox: Any, now: float, max_idle: int | None) -> bool:
+        if self._in_use is not None and self._in_use(session_id):
+            return False
+        # A custom factory may return a sandbox that never records activity.
+        # Treating that as "just used" keeps it alive instead of raising and
+        # taking the whole cleanup loop down with it.
+        limit = max_idle if max_idle is not None else self._idle_limit_for(sandbox)
+        return now - last_activity_of(sandbox, now) > limit
+
+    async def _release_if_idle(self, session_id: str, max_idle: int | None) -> bool:
+        """`release`, if the session is still idle once its lock is held.
+
+        Checked again under the lock: between the scan and here, a request may
+        have used the session or started an operation in it (AUD-1019-06).
+        """
+        async with self._session_lock(session_id):
+            sandbox = self._sessions.get(session_id)
+            if sandbox is None or not self._idle(session_id, sandbox, time.time(), max_idle):
+                return False
+            self._sessions.pop(session_id)
+            await self._lifecycle(sandbox.stop)
+        if self._on_release is not None:
+            self._on_release(session_id)
+        return True
 
     def _idle_limit_for(self, sandbox: Any) -> int:
         """Idle ceiling for one sandbox, preferring its own configured timeout.
@@ -397,6 +459,10 @@ class SessionManager:
             Number of sessions that were stopped.
         """
         self.stop_cleanup_loop()
+        # A start under way registers its sandbox when it finishes; stopped
+        # before then, that sandbox would outlive the shutdown.
+        if self._opening:
+            await asyncio.gather(*self._opening, return_exceptions=True)
 
         session_ids = list(self._sessions)
         # `return_exceptions`, so one uncooperative sandbox cannot leave the
@@ -425,8 +491,15 @@ async def alive_of(sandbox: Any) -> bool:
     An async sandbox's `is_alive()` returns a coroutine, and a coroutine object
     is truthy — so a caller that only checked the return value would treat a
     dead sandbox as alive for the rest of the process's life.
+
+    A sync one is asked on a worker thread. `DockerSandbox.is_alive` reloads the
+    container once its cached answer expires, a daemon round trip that held the
+    event loop - and every other session on it - for as long as Docker took.
     """
-    alive = sandbox.is_alive()
+    probe = sandbox.is_alive
+    if inspect.iscoroutinefunction(probe):
+        return bool(await probe())
+    alive = await asyncio.to_thread(probe)
     if inspect.isawaitable(alive):
         alive = await alive
     return bool(alive)

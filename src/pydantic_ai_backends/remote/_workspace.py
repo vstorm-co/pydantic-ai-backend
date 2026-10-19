@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import stat as stat_module
+from collections import deque
 from pathlib import Path, PurePosixPath
 
 from pydantic_ai_backends._text import bytes_to_text
@@ -92,11 +93,27 @@ def list_workspace(root: Path, path: str) -> list[FileInfo]:
         WorkspacePathError: If `path` escapes the workspace or runs through a link.
         FileNotFoundError: If it is not a directory.
     """
+    entries, _ = _scan(root, path, limit=None)
+    return entries
+
+
+def _scan(root: Path, path: str, *, limit: int | None) -> tuple[list[FileInfo], bool]:
+    """One directory's entries, sorted, reading at most `limit` of its names.
+
+    Returns:
+        The entries, and whether names were left unread. Which ones were read
+        is then the filesystem's order, not the sorted one - so a caller that
+        stops early has to say the listing is incomplete.
+    """
     parts = _parts(path)
+    entries: list[FileInfo] = []
+    more = False
     try:
         with hostfs.opened_dir(root, parts) as fd, os.scandir(fd) as scanned:
-            entries: list[FileInfo] = []
-            for item in scanned:
+            for read, item in enumerate(scanned):
+                if limit is not None and read == limit:
+                    more = True
+                    break
                 info = item.stat(follow_symlinks=False)
                 if stat_module.S_ISLNK(info.st_mode):
                     continue
@@ -114,7 +131,7 @@ def list_workspace(root: Path, path: str) -> list[FileInfo]:
         raise WorkspacePathError(f"Path '{path}' is outside the workspace") from exc
     except (FileNotFoundError, NotADirectoryError) as exc:
         raise FileNotFoundError(f"No such directory: {path}") from exc
-    return sorted(entries, key=lambda item: (not item["is_dir"], item["name"]))
+    return sorted(entries, key=lambda item: (not item["is_dir"], item["name"])), more
 
 
 def walk_workspace(
@@ -124,8 +141,14 @@ def walk_workspace(
 
     One request for what a file browser otherwise asks for one directory at a
     time - each of those a round trip, and a workspace three deep is the usual
-    shape. Each directory is listed by :func:`list_workspace`, so links are left
-    out here exactly as they are there.
+    shape. Links are left out, as :func:`list_workspace` leaves them.
+
+    The bound is on the work as well as on the answer: a directory is read only
+    as far as the entries still wanted, plus one to learn there are more, so a
+    directory of a million files under `max_entries=10` costs eleven `stat`s
+    rather than a million and a sort (AUD-1019-12). A directory cut short that
+    way contributes the entries it happened to read first, and the listing says
+    it is truncated.
 
     Args:
         root: The session's workspace directory.
@@ -146,11 +169,12 @@ def walk_workspace(
     """
     found: list[FileInfo] = []
     truncated = False
-    queue = [(path, 1)]
+    queue: deque[tuple[str, int]] = deque([(path, 1)])
     while queue:
-        directory, depth = queue.pop(0)
+        directory, depth = queue.popleft()
+        wanted = max_entries - len(found)
         try:
-            entries = list_workspace(root, directory)
+            entries, more = _scan(root, directory, limit=wanted + 1)
         except (WorkspacePathError, FileNotFoundError, PermissionError):
             if depth == 1:
                 raise
@@ -166,6 +190,8 @@ def walk_workspace(
                 queue.append((entry["path"], depth + 1))
             else:
                 truncated = True
+        if more:
+            return found, True
     return found, truncated
 
 

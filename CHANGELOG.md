@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Fixes from the 2026-10-19 audit of the Docker and sandboxd paths (AUD-1019-*).
+
+### Added
+
+- **`realpath` is answered off the host** for a path with no link in it
+  (`/sessions/{id}/files/realpath`, `ServicePolicy.native_realpath`), and
+  `SandboxdWorkspaceBackend` implements `SupportsRealpath`. The console's path
+  guard and `ConfinedWorkspace` resolve every path before a read or write, which
+  cost one `docker exec` each: a 1 KiB read with both went from ~100 ms to ~3 ms.
+  A link still resolves in the sandbox (AUD-1019-10).
+- **`SandboxdWorkspace` is an async context manager** that owns one
+  `httpx.AsyncClient` for every backend made inside it. Without `client=` or the
+  context, each request still opens a connection of its own (AUD-1019-09).
+- `DockerSandbox.container_user()`: the user Docker reports for the container.
+
+### Fixed
+
+- **A native write is atomic.** It went through `O_TRUNC`, so a write that
+  failed part-way left an empty file where the old one was. It now writes a
+  temporary sibling and renames it over the target, keeping the old file's mode
+  (AUD-1019-01).
+- **The native read and write ceilings count bytes.** A file grown after its
+  `fstat` was read whole. A chunked write body, or one larger than its
+  `Content-Length`, was buffered whole. Both stop past `max_read_bytes` now
+  (AUD-1019-02).
+- **`max_sessions` counts sessions still starting.** Two different ids could
+  both see room and both start (AUD-1019-03).
+- **Stopping a command no longer waits for a thread behind running ones.**
+  Commands have a pool of their own, sized by `max_running_commands`. Stops,
+  inspections and liveness probes have another. sandboxd no longer raises anyio's
+  global limiter (AUD-1019-04).
+- **A cancelled open no longer loses its sandbox.** The start runs on a thread
+  that cancellation does not stop. It now finishes and registers its sandbox for
+  release or idle cleanup, and `shutdown` waits for it. `open_session` frees its
+  claim on the id (AUD-1019-05).
+- **Idle cleanup leaves sessions with work under way alone,** rechecking under
+  the session's lock. Native file operations on a hibernated session count as
+  activity (AUD-1019-06).
+- **A sync sandbox's liveness is probed off the event loop.** A slow
+  `container.reload()` held every session's requests (AUD-1019-07).
+- **`prepare_runtimes` builds the image a session runs.** With `sandbox_uid` set
+  it prepared a variant no session asked for, so the first session still built
+  its own (AUD-1019-08).
+- **A command's timeout covers the whole exec,** including the wait for a
+  thread and `exec_create`. Before, a 200 ms create under a 100 ms timeout came
+  back as exit 0 (AUD-1019-11).
+- **`tree(max_entries=...)` bounds its work.** Each directory is read only as
+  far as the entries still wanted, and the queue is a deque. Before, a
+  directory of a thousand files was statted and sorted to return one
+  (AUD-1019-12).
+- **Native writes follow the session's own user.** The service checks the
+  runtime's `run_as_uid` and the container's reported user, not only
+  `sandbox_uid`. A user it cannot match writes through the sandbox
+  (AUD-1019-15).
+- A path with a `.` component, and a FIFO, socket or device met by `stat` or
+  `list`, are handed to the sandbox.
+- `scripts/bench_density.py` runs its first command through `run_command`;
+  `execute` no longer exists (AUD-1019-13).
+
+### Changed
+
+- CI tests on Python 3.14 and 3.15 under the same 100% gate. A
+  `docker-conformance` job runs the Docker and sandboxd conformance suites
+  against a real daemon (AUD-1019-14).
+
 ## [0.2.35] - 2026-10-19
 
 ### Added

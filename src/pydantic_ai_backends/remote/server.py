@@ -60,7 +60,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar
 
-import anyio.to_thread
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.responses import HTMLResponse, Response
@@ -861,6 +860,38 @@ class _Outcome:
     detail: str = ""
 
 
+def _writes_as_service(user: str) -> bool:
+    """Whether a container running as Docker's `user` can change what this service writes."""
+    uid = user.partition(":")[0]
+    if uid in ("", "root", "0"):
+        return True
+    return uid.isdigit() and int(uid) == os.geteuid()
+
+
+def _session_runtime(config: SandboxdConfig, runtime: SandboxRuntime) -> RuntimeConfig | None:
+    """The runtime a session of `runtime` builds and runs, after the service's overrides.
+
+    One function for the session and for `prepare_runtimes`, because an image's
+    tag hashes the whole configuration: preparing one that differs in any field
+    - the sandbox user, say - builds an image no session asks for, and the first
+    session builds its own anyway (AUD-1019-08).
+
+    One work directory service-wide: it is where the workspace volume is mounted
+    and what the archive endpoints read, so a runtime's own `work_dir` is
+    overridden rather than allowed to disagree. A ready-made image was not built
+    around the sandbox user and has no virtualenv it owns, so running it
+    unprivileged would leave an agent unable to install anything; only built
+    runtimes take the uid.
+    """
+    built = runtime.resolved_runtime()
+    if built is None:
+        return None
+    overrides: dict[str, Any] = {"work_dir": config.work_dir}
+    if config.sandbox_uid is not None:
+        overrides["run_as_uid"] = config.sandbox_uid
+    return built.model_copy(update=overrides)
+
+
 def _default_builder(config: SandboxdConfig, *, reattach_only: bool = False) -> SandboxBuilder:
     """Build the Docker-backed sandbox factory described by `config`.
 
@@ -871,18 +902,8 @@ def _default_builder(config: SandboxdConfig, *, reattach_only: bool = False) -> 
     def build(session_id: str, runtime: SandboxRuntime) -> Any:
         from pydantic_ai_backends.backends.docker.sandbox import DockerSandbox
 
-        built = runtime.resolved_runtime()
-        # A ready-made image was not built around the sandbox user and has no
-        # virtualenv it owns, so running it unprivileged would leave an agent
-        # unable to install anything. Only built runtimes take the uid.
-        overrides: dict[str, Any] = {"work_dir": config.work_dir}
-        if config.sandbox_uid is not None:
-            overrides["run_as_uid"] = config.sandbox_uid
         return DockerSandbox(
-            # One work directory service-wide: it is where the workspace volume
-            # is mounted and what the archive endpoints read, so a runtime's own
-            # `work_dir` is overridden rather than allowed to disagree.
-            runtime=built.model_copy(update=overrides) if built else None,
+            runtime=_session_runtime(config, runtime),
             image=runtime.image or "",
             session_id=session_id,
             work_dir=config.work_dir,
@@ -1139,14 +1160,13 @@ def prepare_runtimes(
             attempt += 1
             started = time.monotonic()
             try:
-                built = runtime.resolved_runtime()
-                if built is None:
+                session_runtime = _session_runtime(config, runtime)
+                if session_runtime is None:
                     assert runtime.image is not None
                     pulled = pull_if_absent(client, runtime.image)
                     action = "pulled" if pulled else "already local"
                 else:
-                    at_work_dir = built.model_copy(update={"work_dir": config.work_dir})
-                    resolve_image(client, at_work_dir, "")
+                    resolve_image(client, session_runtime, "")
                     action = "built"
             except Exception:
                 if attempt < attempts:
@@ -1261,7 +1281,12 @@ class _Service:
             max_sessions=config.max_sessions,
             default_idle_timeout=config.idle_timeout,
             on_release=self._forget,
+            in_use=self._in_use,
         )
+
+    def _in_use(self, session_id: str) -> bool:
+        """Whether a command or a file operation is under way in the session."""
+        return self._inflight[session_id] > 0
 
     def _forget(self, session_id: str) -> None:
         """Drop the bookkeeping for a session whose sandbox has been stopped.
@@ -1296,12 +1321,13 @@ class _Service:
 
     def startup(self) -> None:
         """Create the worker pool and begin reaping idle sessions and workspaces."""
-        # A running command holds a thread from this limiter for as long as it
-        # runs, reading its output. Its default of 40 made the forty-first command
-        # on the whole service wait - whoever's session it was in.
-        anyio.to_thread.current_default_thread_limiter().total_tokens = (
-            self.config.max_running_commands
-        )
+        # A running command holds a thread for as long as it runs, reading its
+        # output. On anyio's default limiter of 40 the forty-first command on the
+        # whole service waited; commands now have a pool of their own, and the
+        # stops that end them another (AUD-1019-04).
+        from pydantic_ai_backends.backends.docker import _exec
+
+        _exec.set_command_capacity(self.config.max_running_commands)
         self._executor = ThreadPoolExecutor(
             max_workers=self.config.max_workers, thread_name_prefix="sandboxd"
         )
@@ -1370,6 +1396,7 @@ class _Service:
             for session_id, record in self._sessions.items()
             if record.hibernated_at is not None
             and now - record.hibernated_at >= self.config.idle_timeout
+            and not self._in_use(session_id)
         ]
         for session_id in stale:
             await self.close_session(session_id)
@@ -1704,6 +1731,7 @@ class _Service:
             buildkit=buildkit_available(),
             native_files=self.native_reads,
             native_writes=self.native_writes,
+            native_realpath=self.native_reads,
         )
 
     def _runtime_policy(self, alias: str) -> wire.RuntimePolicy:
@@ -1813,6 +1841,11 @@ class _Service:
         except Exception as exc:
             self._pending.pop(session_id, None)
             raise HTTPException(status_code=502, detail=f"Could not start sandbox: {exc}") from exc
+        except BaseException:
+            # Cancelled: the manager still finishes the start and holds the
+            # sandbox for its reaper, but no session here will be handed out.
+            self._pending.pop(session_id, None)
+            raise
 
         self._sessions[session_id] = _Session(
             runtime=alias,
@@ -2173,6 +2206,29 @@ class _Service:
         uid = self.config.sandbox_uid
         return self.native_reads and (uid is None or uid == os.geteuid())
 
+    def writes_natively(self, session_id: str) -> bool:
+        """Whether this session's writes are served here, as its sandbox's user would make them.
+
+        `native_writes` judges the service-wide `sandbox_uid`. A runtime can set
+        its own `run_as_uid`, and a ready-made image its own `USER`, so the
+        session's own identity is checked too (AUD-1019-15): a file this service
+        writes is this service's, and a sandbox running as somebody else could
+        read it and not change it. Where the identity is unknown - a named user
+        only the container can resolve - the write goes through the sandbox.
+        """
+        if not self.native_writes:
+            return False
+        record = self._sessions.get(session_id)
+        entry = self.config.runtimes.get(record.runtime) if record is not None else None
+        if entry is not None:
+            session_runtime = _session_runtime(self.config, _as_runtime(entry))
+            uid = session_runtime.run_as_uid if session_runtime is not None else None
+            if uid is not None and uid != os.geteuid():
+                return False
+        reported = getattr(self.manager.sessions.get(session_id), "container_user", None)
+        user = reported() if callable(reported) else None
+        return not isinstance(user, str) or _writes_as_service(user)
+
     async def native_file(self, session_id: str, op: str, path: str, call: Callable[..., _T]) -> _T:
         """Run one native file operation for an authorized live session.
 
@@ -2191,6 +2247,12 @@ class _Service:
         resident = self.manager.sessions.get(session_id)
         if resident is not None and hasattr(resident, "touch"):
             resident.touch()
+        record = self._sessions.get(session_id)
+        if resident is None and record is not None and record.hibernated_at is not None:
+            # Asleep, and still being worked on: its files are served without
+            # waking it, and the work counts as activity all the same, so it is
+            # not ended as if nobody had touched it (AUD-1019-06).
+            record.hibernated_at = time.time()
         workspace = workspace_root_for(Path(self.config.workspace_root or ""), session_id)
         with self.observe(session_id, op, path) as outcome:
             try:
@@ -2463,6 +2525,29 @@ def _register_workspace_routes(app: FastAPI, service: _Service) -> None:
         return await service.archive_read_bytes(session_id, body)
 
 
+async def _bounded_body(request: Request, limit: int) -> bytes:
+    """A request body of at most `limit` bytes, counted as it arrives.
+
+    The declared length refuses early; the count is the check, since a chunked
+    body declares none and a client may send more than it declared.
+
+    Raises:
+        HTTPException: `NOT_NATIVE_STATUS` past `limit` - the sandbox writes it.
+    """
+    too_large = HTTPException(
+        status_code=wire.NOT_NATIVE_STATUS, detail="larger than a native write"
+    )
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        raise too_large
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > limit:
+            raise too_large
+    return bytes(body)
+
+
 def _register_run_routes(app: FastAPI, service: _Service) -> None:
     """Commands for a Pydantic AI workspace, under its failure contract."""
 
@@ -2486,14 +2571,9 @@ def _register_run_routes(app: FastAPI, service: _Service) -> None:
         Over `max_read_bytes`, or where writes are not native, it is the
         sandbox's to write, and the client writes it there.
         """
-        if not service.native_writes:
+        if not service.writes_natively(session_id):
             raise HTTPException(status_code=wire.NOT_NATIVE_STATUS, detail="native writes are off")
-        length = int(request.headers.get("content-length") or 0)
-        if length > service.config.max_read_bytes:
-            raise HTTPException(
-                status_code=wire.NOT_NATIVE_STATUS, detail="larger than a native write"
-            )
-        data = await request.body()
+        data = await _bounded_body(request, service.config.max_read_bytes)
         await service.native_file(
             session_id, "write", path, lambda root, parts: hostfs.write(root, parts, data)
         )
@@ -2513,6 +2593,19 @@ def _register_run_routes(app: FastAPI, service: _Service) -> None:
             name=entry.name, path=entry.path, is_dir=entry.is_dir, size=entry.size
         )
 
+    @app.post("/sessions/{session_id}/files/realpath", response_model=wire.RealpathResponse)
+    async def realpath_of(
+        session_id: AuthorizedSession, body: wire.FilePathRequest
+    ) -> wire.RealpathResponse:
+        """A path with no link in it, as its own real path; a link is the sandbox's."""
+        resolved = await service.native_file(
+            session_id,
+            "realpath",
+            body.path,
+            lambda root, parts: hostfs.realpath(root, parts, service.config.work_dir),
+        )
+        return wire.RealpathResponse(path=resolved)
+
     @app.post("/sessions/{session_id}/files/list", response_model=list[wire.FileEntry])
     async def list_files(
         session_id: AuthorizedSession, body: wire.FilePathRequest
@@ -2531,14 +2624,14 @@ def _register_run_routes(app: FastAPI, service: _Service) -> None:
     @app.post("/sessions/{session_id}/files/mkdir", status_code=204)
     async def make_directory(session_id: AuthorizedSession, body: wire.FilePathRequest) -> None:
         """`mkdir -p`."""
-        if not service.native_writes:
+        if not service.writes_natively(session_id):
             raise HTTPException(status_code=wire.NOT_NATIVE_STATUS, detail="native writes are off")
         await service.native_file(session_id, "mkdir", body.path, hostfs.make_dir)
 
     @app.post("/sessions/{session_id}/files/remove", status_code=204)
     async def remove_path(session_id: AuthorizedSession, body: wire.FilePathRequest) -> None:
         """Remove a file, a link itself, or a directory with what is in it."""
-        if not service.native_writes:
+        if not service.writes_natively(session_id):
             raise HTTPException(status_code=wire.NOT_NATIVE_STATUS, detail="native writes are off")
         await service.native_file(session_id, "remove", body.path, hostfs.remove)
 

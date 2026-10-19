@@ -409,6 +409,16 @@ class TestDockerSandboxLiveness:
         assert sandbox.is_alive() is False
         assert container.reloads == 2
 
+    def test_the_container_user_is_what_docker_reports(self):
+        sandbox = _sandbox()
+        assert sandbox.container_user() is None
+        container = self._Container()
+        container.attrs = {"Config": {"User": "10001"}}  # type: ignore[attr-defined]
+        sandbox._container = container
+        assert sandbox.container_user() == "10001"
+        container.attrs = {}  # type: ignore[attr-defined]
+        assert sandbox.container_user() is None
+
     def test_non_running_status_is_not_alive(self):
         sandbox = _sandbox()
         sandbox._container = self._Container(status="exited")

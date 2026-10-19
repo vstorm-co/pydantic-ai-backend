@@ -23,12 +23,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import statistics
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+import anyio
 
 from pydantic_ai_backends import DockerSandbox
 
@@ -106,10 +110,19 @@ def first_command(sandbox: DockerSandbox) -> None:
 
     Timing `start()` alone would miss the part an agent actually waits for: the
     daemon reports a container running well before an `exec` into it returns.
+    Through `run_command`, the path an agent's commands take since the move to
+    `CommandRunner`; `execute` no longer exists.
     """
-    result = sandbox.execute("echo ready", timeout=60)
-    if "ready" not in result.output:
-        raise RuntimeError(f"sandbox did not answer (exit {result.exit_code}): {result.output!r}")
+    outcome = anyio.run(
+        functools.partial(
+            sandbox.run_command, ["echo", "ready"], run_id=uuid.uuid4().hex, timeout=60
+        )
+    )
+    if outcome.timed_out or outcome.exit_code != 0 or "ready" not in outcome.stdout:
+        raise RuntimeError(
+            f"sandbox did not answer (exit {outcome.exit_code}, timed out "
+            f"{outcome.timed_out}): {outcome.stdout!r} {outcome.stderr!r}"
+        )
 
 
 def cgroup_mib(sandbox: DockerSandbox) -> float | None:
@@ -158,11 +171,13 @@ def run(args: argparse.Namespace) -> list[Sample]:
                 **({"image": args.image} if args.image is not None else {}),
             )
 
+            # Kept before it starts, so a start or a first command that fails
+            # is still torn down below rather than left running.
+            sandboxes.append(sandbox)
             started = time.perf_counter()
             sandbox.start()
             first_command(sandbox)
             boot = time.perf_counter() - started
-            sandboxes.append(sandbox)
 
             # The daemon writes back cgroup and network state after the exec
             # returns, so an immediate reading understates a session by a few
@@ -183,7 +198,10 @@ def run(args: argparse.Namespace) -> list[Sample]:
         print("\ninterrupted — tearing down", file=sys.stderr)
     finally:
         for sandbox in sandboxes:
-            sandbox.stop(remove=True)
+            try:
+                sandbox.stop(remove=True)
+            except Exception as error:  # one stuck container must not keep the rest
+                print(f"could not remove {sandbox.session_id}: {error}", file=sys.stderr)
     return samples
 
 
