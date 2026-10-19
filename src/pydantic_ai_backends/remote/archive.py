@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -155,20 +156,47 @@ class WorkspaceArchive:
             path=path, max_depth=max_depth, max_entries=max_entries
         ).model_dump(mode="json")
         response = self._post(f"/workspaces/{session_id}/tree", payload)
-        tree = wire.TreeResponse.model_validate(response.json())
-        return WorkspaceTree(
-            entries=[
-                FileInfo(
-                    name=e.name,
-                    path=e.path,
-                    is_dir=e.is_dir,
-                    size=e.size,
-                    modified_at=e.modified_at,
-                )
-                for e in tree.entries
-            ],
-            truncated=tree.truncated,
-        )
+        return _tree(wire.TreeResponse.model_validate(response.json()))
+
+    def trees(
+        self,
+        session_ids: Sequence[str],
+        path: str = ".",
+        *,
+        max_depth: int = 6,
+        max_entries: int = 2000,
+    ) -> dict[str, WorkspaceTree | WorkspaceArchiveError]:
+        """:meth:`tree` for several stored workspaces, in one request.
+
+        For a page that draws many workspaces at once: one round trip, where a
+        `tree` per workspace was a request each. Each workspace is answered on
+        its own - a tree, or the `WorkspaceArchiveError` that `tree` would have
+        raised for it alone. Needs a service from 0.2.37; an older one answers
+        404, raised here.
+
+        Args:
+            session_ids: Sessions whose files are wanted, at most 100.
+            path: Directory to start from in each, as for :meth:`ls`.
+            max_depth: Levels to list in each.
+            max_entries: Most entries to return for each.
+
+        Raises:
+            WorkspaceArchiveError: If the request as a whole is refused or the
+                service cannot be reached.
+        """
+        payload = wire.TreesRequest(
+            sessions=list(session_ids), path=path, max_depth=max_depth, max_entries=max_entries
+        ).model_dump(mode="json")
+        response = self._post("/workspaces/trees", payload)
+        answer = wire.TreesResponse.model_validate(response.json())
+        return {
+            result.session_id: (
+                _tree(result.tree)
+                if result.tree is not None
+                else WorkspaceArchiveError(result.error or "", status_code=result.status_code)
+            )
+            for result in answer.results
+        }
 
     def read(self, session_id: str, path: str, offset: int = 0, limit: int = 2000) -> str:
         """Read a slice of a stored workspace file.
@@ -228,3 +256,15 @@ class WorkspaceArchive:
         if response.status_code >= 400:
             raise WorkspaceArchiveError(response.text, status_code=response.status_code)
         return response
+
+
+def _tree(tree: wire.TreeResponse) -> WorkspaceTree:
+    return WorkspaceTree(
+        entries=[
+            FileInfo(
+                name=e.name, path=e.path, is_dir=e.is_dir, size=e.size, modified_at=e.modified_at
+            )
+            for e in tree.entries
+        ],
+        truncated=tree.truncated,
+    )
