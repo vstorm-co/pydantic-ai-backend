@@ -3752,6 +3752,44 @@ class TestNativeFiles:
             )
         assert response.status_code == wire.NOT_NATIVE_STATUS
 
+    def test_a_chunked_write_over_the_ceiling_is_counted_not_trusted(
+        self, tmp_path: Path
+    ) -> None:
+        """AUD-1019-02: a body with no length used to be written whole."""
+
+        def chunks():
+            yield b"1234"
+            yield b"5678"
+
+        harness = Harness(workspace_root=str(tmp_path), max_read_bytes=4)
+        with harness.client() as client:
+            sid, token = _open_session(client)
+            response = client.post(
+                f"/sessions/{sid}/files/write",
+                params={"path": "/workspace/big"},
+                content=chunks(),
+                headers={wire.TOKEN_HEADER: token},
+            )
+        assert response.status_code == wire.NOT_NATIVE_STATUS
+        assert not (self._workspace(harness, sid) / "big").exists()
+
+    def test_a_chunked_write_within_the_ceiling_lands(self, tmp_path: Path) -> None:
+        def chunks():
+            yield b"ab"
+            yield b"cd"
+
+        harness = Harness(workspace_root=str(tmp_path), max_read_bytes=4)
+        with harness.client() as client:
+            sid, token = _open_session(client)
+            response = client.post(
+                f"/sessions/{sid}/files/write",
+                params={"path": "/workspace/small"},
+                content=chunks(),
+                headers={wire.TOKEN_HEADER: token},
+            )
+        assert response.status_code == 204
+        assert (self._workspace(harness, sid) / "small").read_bytes() == b"abcd"
+
     def test_a_file_operation_counts_as_activity(self, tmp_path: Path) -> None:
         """A run that only edits files must not be reaped as idle."""
         harness = Harness(workspace_root=str(tmp_path))

@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import os
+import secrets
 import stat as stat_module
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -157,10 +158,14 @@ def read(root: Path, parts: list[str], *, max_bytes: int) -> bytes:
                 raise NotNative(f"{name} is not a regular file")
             if info.st_size > max_bytes:
                 raise TooLarge(name, info.st_size, max_bytes)
-            chunks: list[bytes] = []
-            while chunk := os.read(fd, 1 << 20):
-                chunks.append(chunk)
-            return b"".join(chunks)
+            # Counted as read, not trusted from the `fstat`: the sandbox can grow
+            # the file between the two, and the ceiling is the service's memory.
+            data = bytearray()
+            while chunk := os.read(fd, min(1 << 20, max_bytes + 1 - len(data))):
+                data += chunk
+                if len(data) > max_bytes:
+                    raise TooLarge(name, len(data), max_bytes)
+            return bytes(data)
         finally:
             os.close(fd)
 
@@ -168,9 +173,14 @@ def read(root: Path, parts: list[str], *, max_bytes: int) -> bytes:
 def write(root: Path, parts: list[str], data: bytes) -> None:
     """Write a regular file, creating it and its parents as `mkdir -p` would.
 
-    In place rather than through a temporary file and a rename, so an existing
-    file keeps its mode - an executable script stays executable - as it does when
-    the shell writes it.
+    Atomic: the bytes go to a temporary file beside the target, which then
+    replaces it with one `rename`. A write that fails part-way - the disk full,
+    the service stopped - leaves the old file as it was, and a reader sees the
+    old content or the new, never half of it. An existing file's permission
+    bits are carried over, so an executable script stays executable; a new one
+    gets the mode the service's umask gives it. The rename is not followed by an
+    `fsync`: a power cut can still lose the new content, never the old file's
+    integrity. A hard link to the old file keeps the old content.
 
     Raises:
         NotNative: The file is a link or a special file - written through by the
@@ -180,23 +190,47 @@ def write(root: Path, parts: list[str], data: bytes) -> None:
     directory, name = _leaf(parts)
     with opened_dir(root, directory, create=True) as parent:
         try:
+            existing = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            mode = None
+        else:
+            if stat_module.S_ISDIR(existing.st_mode):
+                raise IsADirectoryError(f"{name} is a directory")
+            if stat_module.S_ISLNK(existing.st_mode):
+                raise NotNative(f"{name} is a symbolic link")
+            if not stat_module.S_ISREG(existing.st_mode):
+                raise NotNative(f"{name} is not a regular file")
+            mode = stat_module.S_IMODE(existing.st_mode)
+        temporary = f".{name}.{secrets.token_hex(6)}.tmp"
+        try:
             fd = os.open(
-                name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _FILE_FLAGS, 0o666, dir_fd=parent
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o666,
+                dir_fd=parent,
             )
         except OSError as exc:
-            if exc.errno == errno.EISDIR:
-                raise IsADirectoryError(f"{name} is a directory") from exc
-            if exc.errno == errno.ENXIO:
-                raise NotNative(f"{name} is not a regular file") from exc
-            raise _translated(exc, name, parent) from exc
+            if exc.errno == errno.ENAMETOOLONG:
+                # The name fits and its temporary sibling does not.
+                raise NotNative(f"{name} is too long to write beside") from exc
+            raise
         try:
-            if not stat_module.S_ISREG(os.fstat(fd).st_mode):
-                raise NotNative(f"{name} is not a regular file")
-            view = memoryview(data)
-            while view:
-                view = view[os.write(fd, view) :]
-        finally:
-            os.close(fd)
+            try:
+                if mode is not None:
+                    os.fchmod(fd, mode)
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view) :]
+            finally:
+                os.close(fd)
+            # `rename` replaces whatever is at `name` now, link or not, without
+            # following it - so a link planted after the check above is itself
+            # replaced, and nothing outside the workspace is written.
+            os.rename(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary, dir_fd=parent)
+            raise
 
 
 def stat(root: Path, parts: list[str], path: str) -> Entry:

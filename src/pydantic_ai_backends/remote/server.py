@@ -2463,6 +2463,29 @@ def _register_workspace_routes(app: FastAPI, service: _Service) -> None:
         return await service.archive_read_bytes(session_id, body)
 
 
+async def _bounded_body(request: Request, limit: int) -> bytes:
+    """A request body of at most `limit` bytes, counted as it arrives.
+
+    The declared length refuses early; the count is the check, since a chunked
+    body declares none and a client may send more than it declared.
+
+    Raises:
+        HTTPException: `NOT_NATIVE_STATUS` past `limit` - the sandbox writes it.
+    """
+    too_large = HTTPException(
+        status_code=wire.NOT_NATIVE_STATUS, detail="larger than a native write"
+    )
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        raise too_large
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > limit:
+            raise too_large
+    return bytes(body)
+
+
 def _register_run_routes(app: FastAPI, service: _Service) -> None:
     """Commands for a Pydantic AI workspace, under its failure contract."""
 
@@ -2488,12 +2511,7 @@ def _register_run_routes(app: FastAPI, service: _Service) -> None:
         """
         if not service.native_writes:
             raise HTTPException(status_code=wire.NOT_NATIVE_STATUS, detail="native writes are off")
-        length = int(request.headers.get("content-length") or 0)
-        if length > service.config.max_read_bytes:
-            raise HTTPException(
-                status_code=wire.NOT_NATIVE_STATUS, detail="larger than a native write"
-            )
-        data = await request.body()
+        data = await _bounded_body(request, service.config.max_read_bytes)
         await service.native_file(
             session_id, "write", path, lambda root, parts: hostfs.write(root, parts, data)
         )

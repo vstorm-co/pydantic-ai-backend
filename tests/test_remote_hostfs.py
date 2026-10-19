@@ -8,6 +8,7 @@ nor removed, and the call says the sandbox has to resolve it instead.
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from pathlib import Path
@@ -72,6 +73,26 @@ class TestReading:
             hostfs.read(root, ["dir"], max_bytes=100)
         with pytest.raises(IsADirectoryError):
             hostfs.read(root, [], max_bytes=100)
+
+    def test_a_file_that_grows_after_its_stat_is_still_bounded(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AUD-1019-02: the sandbox can grow a file between the `fstat` and the read."""
+        (root / "grows.txt").write_bytes(b"x" * 17)
+        real_fstat = os.fstat
+
+        def small(fd: int) -> os.stat_result:
+            fields = list(real_fstat(fd))
+            fields[6] = 4  # st_size
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(hostfs.os, "fstat", small)
+        with pytest.raises(hostfs.TooLarge):
+            hostfs.read(root, ["grows.txt"], max_bytes=4)
+
+    def test_a_file_exactly_at_the_limit_reads(self, root: Path) -> None:
+        (root / "four.txt").write_bytes(b"four")
+        assert hostfs.read(root, ["four.txt"], max_bytes=4) == b"four"
 
     def test_a_file_over_the_limit_goes_through_the_sandbox(self, root: Path) -> None:
         (root / "big").write_bytes(b"x" * 101)
@@ -143,22 +164,66 @@ class TestWriting:
         with pytest.raises(NotADirectoryError):
             hostfs.write(root, ["file", "child"], b"x")
 
-    def test_a_special_file_opened_for_writing_is_refused(
+    def test_a_write_that_fails_leaves_the_old_file(
         self, root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A FIFO that has a reader opens; it is still not a file to write."""
-        (root / "pipe").write_text("x")
-        real_fstat = os.fstat
+        """AUD-1019-01: the disk filling mid-write used to leave an empty file."""
+        (root / "notes.md").write_text("original")
 
-        def as_fifo(fd: int) -> os.stat_result:
-            info = real_fstat(fd)
-            fields = list(info)
-            fields[0] = stat.S_IFIFO | 0o644
-            return os.stat_result(fields)
+        def full(fd: int, data: object) -> int:
+            raise OSError(errno.ENOSPC, "No space left on device")
 
-        monkeypatch.setattr(hostfs.os, "fstat", as_fifo)
-        with pytest.raises(NotNative, match="regular"):
-            hostfs.write(root, ["pipe"], b"x")
+        monkeypatch.setattr(hostfs.os, "write", full)
+        with pytest.raises(OSError, match="No space"):
+            hostfs.write(root, ["notes.md"], b"replacement")
+
+        assert (root / "notes.md").read_text() == "original"
+        # And the temporary file is gone with it.
+        assert sorted(item.name for item in root.iterdir()) == ["notes.md"]
+
+    def test_a_new_file_gets_the_umask_mode(self, root: Path) -> None:
+        mask = os.umask(0o022)
+        os.umask(mask)
+
+        hostfs.write(root, ["new.txt"], b"x")
+
+        assert stat.S_IMODE((root / "new.txt").stat().st_mode) == 0o666 & ~mask
+
+    def test_a_link_planted_after_the_check_is_replaced_not_followed(
+        self, root: Path, secret: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The race the rename closes: the target turns into a link between the
+        check and the write. The link itself is replaced; its target is untouched."""
+        real_stat = os.stat
+
+        def plant_then_stat(name: object, **kwargs: object) -> os.stat_result:
+            if name == "notes.md" and not (root / "notes.md").is_symlink():
+                (root / "notes.md").symlink_to(secret)
+                raise FileNotFoundError(name)
+            return real_stat(name, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(hostfs.os, "stat", plant_then_stat)
+        hostfs.write(root, ["notes.md"], b"mine")
+
+        assert secret.read_text() == "the host's own file"
+        assert not (root / "notes.md").is_symlink()
+        assert (root / "notes.md").read_bytes() == b"mine"
+
+    def test_a_name_whose_temporary_sibling_is_too_long_is_the_sandboxs(self, root: Path) -> None:
+        name = "n" * 250
+        with pytest.raises(NotNative, match="too long"):
+            hostfs.write(root, [name], b"x")
+
+    def test_any_other_failure_to_open_the_temporary_file_raises_as_is(self, root: Path) -> None:
+        (root / "locked").mkdir()
+        (root / "locked").chmod(0o500)
+        try:
+            if os.geteuid() == 0:
+                pytest.skip("root writes into a read-only directory")
+            with pytest.raises(PermissionError):
+                hostfs.write(root, ["locked", "file"], b"x")
+        finally:
+            (root / "locked").chmod(0o700)
 
 
 class TestDescribing:
