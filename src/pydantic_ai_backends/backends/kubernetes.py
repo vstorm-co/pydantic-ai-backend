@@ -200,7 +200,7 @@ class KubernetesPodSandbox:
         Raises:
             SandboxUnavailableError: The pod is gone or in a terminal phase.
         """
-        from kubernetes.client.rest import ApiException
+        from kubernetes.client.exceptions import ApiException
 
         try:
             pod: Any = self._core.read_namespaced_pod(self._pod_name, self._namespace)
@@ -348,7 +348,7 @@ class KubernetesPodSandbox:
 
     def _translate(self, error: BaseException) -> BaseException:
         """An API answer meaning the pod is gone, as that; anything else as is."""
-        from kubernetes.client.rest import ApiException
+        from kubernetes.client.exceptions import ApiException
 
         if isinstance(error, ApiException) and error.status in (404, 410):
             return SandboxUnavailableError(f"pod {self._pod_name} is gone: {error.reason}")
