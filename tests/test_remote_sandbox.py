@@ -2300,6 +2300,28 @@ class TestPrewarming:
         assert waited == [7]
         assert "attempt 1 of 2" in caplog.text
 
+    @pytest.mark.parametrize("sandbox_uid", [None, 10001])
+    def test_what_is_prepared_is_what_a_session_runs(self, monkeypatch, sandbox_uid):
+        """AUD-1019-08: prepare overrode the work directory and not the sandbox
+        user, so with `sandbox_uid` it built an image no session asked for."""
+        from pydantic_ai_backends.remote.server import (
+            SandboxRuntime,
+            _default_builder,
+            prepare_runtimes,
+        )
+
+        prepared: list[object] = []
+        self._fake_docker(monkeypatch, lambda _client, runtime, _fallback: prepared.append(runtime))
+        runtime = SandboxRuntime(runtime="python-datascience")
+        config = SandboxdConfig(
+            token="t", runtimes={"lab": runtime}, default_runtime="lab", sandbox_uid=sandbox_uid
+        )
+
+        prepare_runtimes(config, attempts=1)
+        session = _default_builder(config)("s-1", runtime)
+
+        assert prepared == [session._runtime]
+
     def test_a_runtime_that_never_builds_is_named(self, monkeypatch):
         from pydantic_ai_backends.remote.server import SandboxRuntime, prepare_runtimes
 

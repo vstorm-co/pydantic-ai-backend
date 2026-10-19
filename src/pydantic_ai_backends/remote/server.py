@@ -861,6 +861,30 @@ class _Outcome:
     detail: str = ""
 
 
+def _session_runtime(config: SandboxdConfig, runtime: SandboxRuntime) -> RuntimeConfig | None:
+    """The runtime a session of `runtime` builds and runs, after the service's overrides.
+
+    One function for the session and for `prepare_runtimes`, because an image's
+    tag hashes the whole configuration: preparing one that differs in any field
+    - the sandbox user, say - builds an image no session asks for, and the first
+    session builds its own anyway (AUD-1019-08).
+
+    One work directory service-wide: it is where the workspace volume is mounted
+    and what the archive endpoints read, so a runtime's own `work_dir` is
+    overridden rather than allowed to disagree. A ready-made image was not built
+    around the sandbox user and has no virtualenv it owns, so running it
+    unprivileged would leave an agent unable to install anything; only built
+    runtimes take the uid.
+    """
+    built = runtime.resolved_runtime()
+    if built is None:
+        return None
+    overrides: dict[str, Any] = {"work_dir": config.work_dir}
+    if config.sandbox_uid is not None:
+        overrides["run_as_uid"] = config.sandbox_uid
+    return built.model_copy(update=overrides)
+
+
 def _default_builder(config: SandboxdConfig, *, reattach_only: bool = False) -> SandboxBuilder:
     """Build the Docker-backed sandbox factory described by `config`.
 
@@ -871,18 +895,8 @@ def _default_builder(config: SandboxdConfig, *, reattach_only: bool = False) -> 
     def build(session_id: str, runtime: SandboxRuntime) -> Any:
         from pydantic_ai_backends.backends.docker.sandbox import DockerSandbox
 
-        built = runtime.resolved_runtime()
-        # A ready-made image was not built around the sandbox user and has no
-        # virtualenv it owns, so running it unprivileged would leave an agent
-        # unable to install anything. Only built runtimes take the uid.
-        overrides: dict[str, Any] = {"work_dir": config.work_dir}
-        if config.sandbox_uid is not None:
-            overrides["run_as_uid"] = config.sandbox_uid
         return DockerSandbox(
-            # One work directory service-wide: it is where the workspace volume
-            # is mounted and what the archive endpoints read, so a runtime's own
-            # `work_dir` is overridden rather than allowed to disagree.
-            runtime=built.model_copy(update=overrides) if built else None,
+            runtime=_session_runtime(config, runtime),
             image=runtime.image or "",
             session_id=session_id,
             work_dir=config.work_dir,
@@ -1139,14 +1153,13 @@ def prepare_runtimes(
             attempt += 1
             started = time.monotonic()
             try:
-                built = runtime.resolved_runtime()
-                if built is None:
+                session_runtime = _session_runtime(config, runtime)
+                if session_runtime is None:
                     assert runtime.image is not None
                     pulled = pull_if_absent(client, runtime.image)
                     action = "pulled" if pulled else "already local"
                 else:
-                    at_work_dir = built.model_copy(update={"work_dir": config.work_dir})
-                    resolve_image(client, at_work_dir, "")
+                    resolve_image(client, session_runtime, "")
                     action = "built"
             except Exception:
                 if attempt < attempts:
