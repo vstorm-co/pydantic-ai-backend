@@ -7,7 +7,9 @@ healthy daemon will not produce on request.
 
 from __future__ import annotations
 
+import functools
 import threading
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -80,8 +82,10 @@ class _Api:
     inspect_error: Exception | None = None
     created: list[dict[str, Any]] = field(default_factory=list)
     stream: _Stream | None = None
+    create_delay: float = 0.0
 
     def exec_create(self, container_id: str, cmd: list[str], **kwargs: Any) -> dict[str, str]:
+        time.sleep(self.create_delay)
         if self.create_error is not None:
             raise self.create_error
         self.created.append({"container": container_id, "cmd": cmd, **kwargs})
@@ -208,6 +212,45 @@ class TestRunInContainer:
             timeout=0.2,
         )
         assert (outcome.timed_out, outcome.stdout) == (True, "partial")
+        assert container.stops
+
+    async def test_a_slow_create_counts_against_the_deadline(
+        self, api: _Api, container: _Container
+    ) -> None:
+        """AUD-1019-11: a 200 ms create under a 100 ms timeout came back as exit 0."""
+        api.create_delay = 0.3
+        started = time.monotonic()
+        outcome = await _exec.run_in_container(
+            container,  # type: ignore[arg-type]
+            ["true"],
+            run_id="r1",
+            timeout=0.1,
+        )
+        assert outcome.timed_out is True
+        assert time.monotonic() - started < 0.3
+        # Never started, so there is nothing to stop.
+        assert container.stops == []
+
+    async def test_a_stop_is_not_queued_behind_running_commands(
+        self, api: _Api, container: _Container
+    ) -> None:
+        """AUD-1019-04: with every command thread busy, the stop waited for one."""
+        api.hold = True
+        _exec.set_command_capacity(1)
+        try:
+            async with anyio.create_task_group() as group:
+                group.start_soon(
+                    functools.partial(
+                        _exec.run_in_container, container, ["sleep", "9"], run_id="r1"
+                    )
+                )
+                while api.stream is None:
+                    await anyio.sleep(0.01)
+                with anyio.fail_after(1):
+                    await _exec.stop_in_container(container, "r1")  # type: ignore[arg-type]
+                group.cancel_scope.cancel()
+        finally:
+            _exec.set_command_capacity(_exec.DEFAULT_COMMAND_CAPACITY)
         assert container.stops
 
     async def test_cancellation_stops_the_command(self, api: _Api, container: _Container) -> None:

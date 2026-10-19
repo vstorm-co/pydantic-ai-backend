@@ -60,7 +60,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar
 
-import anyio.to_thread
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.responses import HTMLResponse, Response
@@ -1309,12 +1308,13 @@ class _Service:
 
     def startup(self) -> None:
         """Create the worker pool and begin reaping idle sessions and workspaces."""
-        # A running command holds a thread from this limiter for as long as it
-        # runs, reading its output. Its default of 40 made the forty-first command
-        # on the whole service wait - whoever's session it was in.
-        anyio.to_thread.current_default_thread_limiter().total_tokens = (
-            self.config.max_running_commands
-        )
+        # A running command holds a thread for as long as it runs, reading its
+        # output. On anyio's default limiter of 40 the forty-first command on the
+        # whole service waited; commands now have a pool of their own, and the
+        # stops that end them another (AUD-1019-04).
+        from pydantic_ai_backends.backends.docker import _exec
+
+        _exec.set_command_capacity(self.config.max_running_commands)
         self._executor = ThreadPoolExecutor(
             max_workers=self.config.max_workers, thread_name_prefix="sandboxd"
         )

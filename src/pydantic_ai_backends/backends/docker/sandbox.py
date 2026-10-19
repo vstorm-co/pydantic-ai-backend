@@ -535,7 +535,7 @@ class DockerSandbox:
 
         from pydantic_ai_backends.backends.docker import _exec
 
-        await anyio.to_thread.run_sync(self._ensure_container)
+        await anyio.to_thread.run_sync(self._ensure_container, limiter=_exec.control_limiter())
         self._last_activity = time.time()
         assert self._container is not None
         try:

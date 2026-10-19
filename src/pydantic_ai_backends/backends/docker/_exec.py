@@ -28,6 +28,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 import anyio
+import anyio.lowlevel
 import anyio.to_thread
 
 from pydantic_ai_backends._limits import MAX_RUN_OUTPUT_BYTES
@@ -47,6 +48,50 @@ if TYPE_CHECKING:
 
 STOP_GRACE_SECONDS = 5.0
 """Longest a stop may take, its TERM-then-KILL included, under cancellation."""
+
+DEFAULT_COMMAND_CAPACITY = 256
+"""Commands whose exec may be on a worker thread at once, per event loop."""
+
+CONTROL_CAPACITY = 32
+"""Threads kept for stopping, inspecting and probing, which commands never use.
+
+Its own pool because a command holds its thread for as long as it runs: on one
+shared pool, a full set of running commands left no thread for the stop that
+would have ended one of them (AUD-1019-04)."""
+
+_command_capacity = DEFAULT_COMMAND_CAPACITY
+_COMMANDS: anyio.lowlevel.RunVar[anyio.CapacityLimiter] = anyio.lowlevel.RunVar("sandbox_commands")
+_CONTROL: anyio.lowlevel.RunVar[anyio.CapacityLimiter] = anyio.lowlevel.RunVar("sandbox_control")
+
+
+def set_command_capacity(capacity: int) -> None:
+    """How many commands may be running at once, from here on in this process."""
+    global _command_capacity
+    _command_capacity = capacity
+    with contextlib.suppress(LookupError, RuntimeError):
+        _COMMANDS.get().total_tokens = capacity
+
+
+def _limiter(
+    var: anyio.lowlevel.RunVar[anyio.CapacityLimiter], capacity: int
+) -> anyio.CapacityLimiter:
+    """The event loop's limiter in `var`, made on first use: a limiter belongs to one loop."""
+    try:
+        return var.get()
+    except LookupError:
+        limiter = anyio.CapacityLimiter(capacity)
+        var.set(limiter)
+        return limiter
+
+
+def command_limiter() -> anyio.CapacityLimiter:
+    """The pool a command's create and output stream run on."""
+    return _limiter(_COMMANDS, _command_capacity)
+
+
+def control_limiter() -> anyio.CapacityLimiter:
+    """The pool stops, inspections and liveness probes run on."""
+    return _limiter(_CONTROL, CONTROL_CAPACITY)
 
 
 def _translate(error: BaseException) -> BaseException:
@@ -81,7 +126,7 @@ async def _running(container: Container) -> bool:
     import docker.errors
 
     try:
-        await anyio.to_thread.run_sync(container.reload)
+        await anyio.to_thread.run_sync(container.reload, limiter=control_limiter())
     except docker.errors.NotFound:
         return False
     status: str = container.status
@@ -104,7 +149,7 @@ async def stop_in_container(container: Container, run_id: str) -> None:
         anyio.move_on_after(STOP_GRACE_SECONDS),
         contextlib.suppress(Exception),
     ):
-        await anyio.to_thread.run_sync(stopper, abandon_on_cancel=True)
+        await anyio.to_thread.run_sync(stopper, abandon_on_cancel=True, limiter=control_limiter())
 
 
 async def run_in_container(
@@ -126,8 +171,9 @@ async def run_in_container(
             another request. Must be unique among the container's live runs.
         env: Variables layered over the container's own environment.
         workdir: Directory the command starts in; the container's own when `None`.
-        timeout: Seconds before the command is stopped. Measured from the start
-            of the exec, so a slow daemon counts against it.
+        timeout: Seconds before the command is stopped, from the moment it is
+            asked for: waiting for a thread and creating the exec count against
+            it, so a slow daemon or a full pool cannot stretch it (AUD-1019-11).
         output_limit: Combined bytes of output before the command is stopped.
 
     Returns:
@@ -152,18 +198,24 @@ async def run_in_container(
         stderr=True,
         stdin=False,
     )
-    try:
-        exec_id: str = (await anyio.to_thread.run_sync(create))["Id"]
-    except Exception as error:
-        raise _translate(error) from error
-
+    commands = command_limiter()
     sink = Sink(output_limit)
     stopped = threading.Event()
-    drain = functools.partial(_drain, api, exec_id, sink, stopped)
+    exec_id = ""
+    # Whether the command may be running. Only `exec_start`, in the drain,
+    # starts it: an exec created and then abandoned at the deadline never runs,
+    # and needs no stop.
+    may_run = False
     finished = False
     try:
         with anyio.move_on_after(timeout) as deadline:
-            await anyio.to_thread.run_sync(drain, abandon_on_cancel=True)
+            created = await anyio.to_thread.run_sync(
+                create, abandon_on_cancel=True, limiter=commands
+            )
+            exec_id = created["Id"]
+            drain = functools.partial(_drain, api, exec_id, sink, stopped)
+            may_run = True
+            await anyio.to_thread.run_sync(drain, abandon_on_cancel=True, limiter=commands)
         finished = not (deadline.cancelled_caught or sink.over_limit)
         if not finished:
             stdout, stderr = sink.text(partial=True)
@@ -181,10 +233,11 @@ async def run_in_container(
         # by a broken stream.
         if not finished:
             stopped.set()
-            await stop_in_container(container, run_id)
+            if may_run:
+                await stop_in_container(container, run_id)
 
     try:
-        info = await anyio.to_thread.run_sync(api.exec_inspect, exec_id)
+        info = await anyio.to_thread.run_sync(api.exec_inspect, exec_id, limiter=control_limiter())
     except Exception as error:
         raise _translate(error) from error
     exit_code = info.get("ExitCode")

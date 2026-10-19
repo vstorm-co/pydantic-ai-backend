@@ -3855,13 +3855,19 @@ class TestNativeFiles:
         assert touched == [True]
 
 
-async def test_the_service_raises_the_ceiling_on_running_commands() -> None:
-    """Forty, anyio's default, made the forty-first command wait for a slot."""
+async def test_the_service_sizes_the_command_pool_and_leaves_anyios_alone() -> None:
+    """Forty, anyio's default, made the forty-first command wait for a slot; the
+    commands now have a pool of their own (AUD-1019-04)."""
     import anyio.to_thread
 
+    from pydantic_ai_backends.backends.docker import _exec
+
+    default = anyio.to_thread.current_default_thread_limiter().total_tokens
     service = Harness(max_running_commands=123).app.state.service
     service.startup()
     try:
-        assert anyio.to_thread.current_default_thread_limiter().total_tokens == 123
+        assert _exec.command_limiter().total_tokens == 123
+        assert anyio.to_thread.current_default_thread_limiter().total_tokens == default
     finally:
         await service.shutdown()
+        _exec.set_command_capacity(_exec.DEFAULT_COMMAND_CAPACITY)
