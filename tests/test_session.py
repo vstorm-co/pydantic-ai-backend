@@ -1126,7 +1126,10 @@ class TestReleaseIsSerializedWithCreation:
         first._alive = False  # Dead, so the creator takes the replacement path.
 
         creating = asyncio.create_task(manager.get_or_create("X"))
-        await asyncio.sleep(0)  # Park the creator inside the critical section.
+        # Park the creator inside the critical section; it runs as a task of its
+        # own under `get_or_create`, so this takes more than one tick.
+        while not (manager._locks.get("X") and manager._locks["X"].lock.locked()):
+            await asyncio.sleep(0)
         released = await manager.release("X")
 
         sandbox = await creating
@@ -1175,3 +1178,112 @@ class TestReleaseIsSerializedWithCreation:
         await manager.release("X")
 
         assert manager._locks == {}
+
+
+class _GatedStart:
+    """A sandbox whose start blocks a worker thread until the test opens the gate."""
+
+    gate: threading.Event
+    entered: threading.Event
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        type(self).entered.set()
+        type(self).gate.wait(5)
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def is_alive(self) -> bool:
+        return self.started and not self.stopped
+
+
+@pytest.fixture
+def gated() -> type[_GatedStart]:
+    _GatedStart.gate = threading.Event()
+    _GatedStart.entered = threading.Event()
+    return _GatedStart
+
+
+class TestStartsAreAccountedFor:
+    async def test_starts_under_way_count_against_the_ceiling(self, gated):
+        """AUD-1019-03: two ids starting at once both saw room for themselves."""
+        manager = SessionManager(sandbox_factory=gated, max_sessions=1)
+
+        first = asyncio.create_task(manager.get_or_create("a"))
+        await asyncio.to_thread(gated.entered.wait, 5)
+        with pytest.raises(SessionLimitExceeded):
+            await manager.get_or_create("b")
+        gated.gate.set()
+        await first
+
+        assert manager.session_count == 1
+
+    async def test_a_failed_start_gives_its_slot_back(self):
+        class Fails:
+            def __init__(self, _session_id: str) -> None:
+                pass
+
+            def start(self) -> None:
+                raise RuntimeError("no image")
+
+            def stop(self) -> None:
+                pass
+
+        manager = SessionManager(sandbox_factory=Fails, max_sessions=1)
+        with pytest.raises(RuntimeError):
+            await manager.get_or_create("a")
+
+        assert manager._starting == set()
+
+    async def test_a_start_whose_caller_is_cancelled_is_kept_track_of(self, gated):
+        """AUD-1019-05: the start went on on its thread and nothing held the result."""
+        manager = SessionManager(sandbox_factory=gated)
+
+        caller = asyncio.create_task(manager.get_or_create("a"))
+        await asyncio.to_thread(gated.entered.wait, 5)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        gated.gate.set()
+        await asyncio.gather(*manager._opening)
+
+        assert manager.session_count == 1
+        assert manager.sessions["a"].started is True
+
+    async def test_shutdown_waits_for_a_start_and_stops_it(self, gated):
+        manager = SessionManager(sandbox_factory=gated)
+
+        caller = asyncio.create_task(manager.get_or_create("a"))
+        await asyncio.to_thread(gated.entered.wait, 5)
+        caller.cancel()
+        stopping = asyncio.create_task(manager.shutdown())
+        await asyncio.sleep(0)
+        gated.gate.set()
+        await stopping
+
+        assert manager.session_count == 0
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+    async def test_an_abandoned_open_that_fails_is_retrieved(self, caplog):
+        class Fails:
+            def __init__(self, _session_id: str) -> None:
+                pass
+
+            def start(self) -> None:
+                raise RuntimeError("no image")
+
+            def stop(self) -> None:
+                pass
+
+        manager = SessionManager(sandbox_factory=Fails)
+        with caplog.at_level("DEBUG"), pytest.raises(RuntimeError):
+            await manager.get_or_create("a")
+
+        assert "Session open failed" in caplog.text

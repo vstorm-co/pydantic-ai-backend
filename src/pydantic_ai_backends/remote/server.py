@@ -1827,6 +1827,11 @@ class _Service:
         except Exception as exc:
             self._pending.pop(session_id, None)
             raise HTTPException(status_code=502, detail=f"Could not start sandbox: {exc}") from exc
+        except BaseException:
+            # Cancelled: the manager still finishes the start and holds the
+            # sandbox for its reaper, but no session here will be handed out.
+            self._pending.pop(session_id, None)
+            raise
 
         self._sessions[session_id] = _Session(
             runtime=alias,

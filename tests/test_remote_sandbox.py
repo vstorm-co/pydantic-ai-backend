@@ -3126,6 +3126,26 @@ class TestSessionsThatVanishMidRequest:
 class TestConcurrentOpens:
     """Starting a sandbox suspends, so two requests can reach one id at once."""
 
+    async def test_an_open_whose_caller_is_cancelled_leaves_nothing_pending(self):
+        """AUD-1019-05: `except Exception` let a cancellation keep the id claimed."""
+        harness = Harness()
+        harness.next_start_gate = threading.Event()
+        with harness.client():
+            service = harness.app.state.service
+            body = wire.CreateSessionRequest(session_id="dropped")
+            opening = asyncio.create_task(service.open_session(body))
+            assert await _wait_until(lambda: "dropped" in service._pending)
+
+            opening.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await opening
+            harness.next_start_gate.set()
+            await asyncio.gather(*service.manager._opening)
+
+            assert "dropped" not in service._pending
+            # The start finished and its sandbox is the manager's to reap.
+            assert "dropped" in service.manager
+
     async def test_one_caller_wins_the_id_and_the_other_is_told(self):
         """The second request arrives while the id is claimed but not registered."""
         harness = Harness()

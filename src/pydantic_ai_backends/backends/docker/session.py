@@ -148,6 +148,14 @@ class SessionManager:
         # and start a sandbox (one of which would be overwritten in the dict and
         # leaked), and a release cannot land in the middle of a creation.
         self._locks: dict[str, _SessionLock] = {}
+        # Sessions being started, counted against `max_sessions` with the open
+        # ones: a start suspends, and checking open ones alone let every start
+        # under way see room for itself (AUD-1019-03).
+        self._starting: set[str] = set()
+        # Every `get_or_create` runs as one of these, shielded from its caller:
+        # a start runs on a thread that cancelling the caller does not stop, so
+        # the task finishes and registers what it started instead (AUD-1019-05).
+        self._opening: set[asyncio.Task[Any]] = set()
 
     @property
     def sessions(self) -> dict[str, Any]:
@@ -170,10 +178,29 @@ class SessionManager:
             session_id: Unique identifier for the session.
             runtime: Runtime to use. Only applies on the default Docker path.
 
+        Cancelling the caller does not cancel a start under way. A sandbox's
+        `start` is a call on a worker thread that keeps going regardless, so a
+        start abandoned half-way used to leave a running container no session
+        named. The start finishes and the sandbox is registered like any other,
+        for `release` or idle cleanup to stop; `shutdown` waits for it.
+
         Raises:
             SessionLimitExceeded: If `max_sessions` is reached and `session_id`
                 is not an existing live session.
         """
+        opening = asyncio.ensure_future(self._get_or_create(session_id, runtime))
+        self._opening.add(opening)
+        opening.add_done_callback(self._opened)
+        return await asyncio.shield(opening)
+
+    def _opened(self, task: asyncio.Task[Any]) -> None:
+        self._opening.discard(task)
+        # Retrieved here so an open whose caller went away, and which then
+        # failed, is not reported as an exception nobody retrieved.
+        if not task.cancelled() and task.exception() is not None:
+            _logger.debug("Session open failed: %s", task.exception())
+
+    async def _get_or_create(self, session_id: str, runtime: RuntimeConfig | str | None) -> Any:
         async with self._session_lock(session_id):
             existing = self._sessions.get(session_id)
             if existing is not None:
@@ -193,25 +220,32 @@ class SessionManager:
                 with contextlib.suppress(Exception):
                     await self._lifecycle(existing.stop)
 
-            if self._max_sessions is not None and len(self._sessions) >= self._max_sessions:
+            # Checked and claimed with no await between them, so it is atomic.
+            if (
+                self._max_sessions is not None
+                and len(self._sessions) + len(self._starting) >= self._max_sessions
+            ):
                 raise SessionLimitExceeded(self._max_sessions)
-
-            if self._sandbox_factory is not None:
-                sandbox = self._sandbox_factory(session_id)
-            else:
-                sandbox = self._create_docker_sandbox(session_id, runtime)
-
+            self._starting.add(session_id)
             try:
-                await self._lifecycle(sandbox.start)
-            except Exception:
-                # An unregistered sandbox is one nothing else will ever stop, so
-                # a partial start would leak whatever it did manage to create.
-                with contextlib.suppress(Exception):
-                    await self._lifecycle(sandbox.stop)
-                raise
+                if self._sandbox_factory is not None:
+                    sandbox = self._sandbox_factory(session_id)
+                else:
+                    sandbox = self._create_docker_sandbox(session_id, runtime)
 
-            self._sessions[session_id] = sandbox
-            return sandbox
+                try:
+                    await self._lifecycle(sandbox.start)
+                except Exception:
+                    # An unregistered sandbox is one nothing else will ever stop,
+                    # so a partial start would leak whatever it did manage to create.
+                    with contextlib.suppress(Exception):
+                        await self._lifecycle(sandbox.stop)
+                    raise
+
+                self._sessions[session_id] = sandbox
+                return sandbox
+            finally:
+                self._starting.discard(session_id)
 
     async def _lifecycle(self, call: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Invoke a sandbox's `start` or `stop`, whether it is sync or async.
@@ -397,6 +431,10 @@ class SessionManager:
             Number of sessions that were stopped.
         """
         self.stop_cleanup_loop()
+        # A start under way registers its sandbox when it finishes; stopped
+        # before then, that sandbox would outlive the shutdown.
+        if self._opening:
+            await asyncio.gather(*self._opening, return_exceptions=True)
 
         session_ids = list(self._sessions)
         # `return_exceptions`, so one uncooperative sandbox cannot leave the
