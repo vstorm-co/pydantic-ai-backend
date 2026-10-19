@@ -422,7 +422,10 @@ package cache survive between builds — editing one package in a runtime then
 re-downloads nothing. The Python SDK has no BuildKit support at all and its
 builder rejects cache mounts outright, so without the CLI the generated
 Dockerfile falls back to discarding the cache instead. `GET /policy` reports
-which builder is in force, so it is never a mystery.
+which builder is in force, so it is never a mystery. The published
+`ghcr.io/vstorm-co/sandboxd` image carries the Docker CLI and the buildx plugin
+(the client binaries only; the daemon is still the host's), so it builds with
+BuildKit as it comes.
 
 Images superseded by a build are removed as it finishes. The tag embeds a digest
 of the runtime, so every edit mints a new one and would otherwise leave a few

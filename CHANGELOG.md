@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   running command holds a thread while it runs, and anyio's default of 40 made the
   forty-first command on the whole service wait.
 
+### Changed
+
+- **The `sandboxd` image builds runtimes with BuildKit.** It now carries the
+  Docker CLI 29.9.1 and buildx 0.38.0, the plugin checked against its release
+  checksums. Without them the service fell back to the SDK's classic builder:
+  no cache mounts, so every runtime change downloaded its pip and npm packages
+  again.
+- **The `sandboxd` image runs Python 3.15**, as does the docs build.
+- ruff 0.17.1 and `astral-sh/setup-uv` 10.3.0.
+
 ### Security
 
 - **The archive routes no longer follow links.** `/workspaces/{id}/read`,
