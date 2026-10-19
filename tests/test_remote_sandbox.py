@@ -1740,6 +1740,76 @@ class TestWorkspaceArchiveTree:
         assert tree.truncated is True
 
 
+class TestWorkspaceArchiveTrees:
+    """Several workspaces in one request, each answered on its own."""
+
+    @pytest.fixture
+    def stored(self, tmp_path):
+        harness = Harness(workspace_root=str(tmp_path))
+        for name, files in {"one": ["a.md"], "two": ["b.txt", "c.txt"]}.items():
+            workspace = tmp_path / name / "workspace"
+            workspace.mkdir(parents=True)
+            for file in files:
+                (workspace / file).write_text(file)
+        return harness
+
+    def test_each_workspace_answers_in_the_order_asked(self, stored):
+        with stored.client() as client:
+            response = client.post(
+                "/workspaces/trees",
+                json={"sessions": ["two", "missing", "one"]},
+                headers=_service_headers(),
+            )
+
+        assert response.status_code == 200
+        results = wire.TreesResponse.model_validate(response.json()).results
+        assert [r.session_id for r in results] == ["two", "missing", "one"]
+        assert [e.path for e in results[0].tree.entries] == ["b.txt", "c.txt"]
+        # One workspace that is not there is its own error, not the request's.
+        assert (results[1].tree, results[1].status_code) == (None, 404)
+        assert [e.path for e in results[2].tree.entries] == ["a.md"]
+        assert stored.built == {}
+
+    def test_the_request_is_bounded_and_needs_the_service_token(self, stored):
+        with stored.client() as client:
+            assert (
+                client.post(
+                    "/workspaces/trees", json={"sessions": []}, headers=_service_headers()
+                ).status_code
+                == 422
+            )
+            many = {"sessions": [f"s{i}" for i in range(wire.MAX_TREES + 1)]}
+            assert (
+                client.post("/workspaces/trees", json=many, headers=_service_headers()).status_code
+                == 422
+            )
+            assert (
+                client.post(
+                    "/workspaces/trees", json={"sessions": ["../etc"]}, headers=_service_headers()
+                ).status_code
+                == 422
+            )
+            assert client.post("/workspaces/trees", json={"sessions": ["one"]}).status_code == 401
+
+    def test_the_client_returns_a_tree_or_the_error_per_workspace(self, stored):
+        from pydantic_ai_backends.remote import (
+            WorkspaceArchive,
+            WorkspaceArchiveError,
+            WorkspaceTree,
+        )
+
+        with stored.client() as client:
+            trees = WorkspaceArchive(token=SERVICE_TOKEN, client=client).trees(
+                ["one", "missing"], max_depth=1
+            )
+
+        assert isinstance(trees["one"], WorkspaceTree)
+        assert [e["path"] for e in trees["one"].entries] == ["a.md"]
+        missing = trees["missing"]
+        assert isinstance(missing, WorkspaceArchiveError)
+        assert missing.status_code == 404
+
+
 class TestWorkspaceArchiveClient:
     """The typed client raises, because no model is waiting on it."""
 

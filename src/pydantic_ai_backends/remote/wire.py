@@ -9,7 +9,7 @@ arbitrary bytes, and a workspace holds real files.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -151,6 +151,42 @@ class TreeResponse(BaseModel):
     """True when a directory was left unopened at `max_depth` or the listing
     reached `max_entries` with more to list - a listing shorter than the
     workspace that did not say so would be read as complete."""
+
+
+MAX_TREES = 100
+"""Workspaces one `trees` request may list."""
+
+
+class TreesRequest(BaseModel):
+    """List the same directory of several stored workspaces, in one request.
+
+    A file browser across a person's workspaces asked `tree` once per workspace:
+    a connection and a round trip each, which on a busy host was most of the
+    page's time.
+    """
+
+    sessions: list[Annotated[str, Field(pattern=SESSION_ID_PATTERN)]] = Field(
+        min_length=1, max_length=MAX_TREES
+    )
+    path: str = "."
+    max_depth: int = Field(default=6, ge=1, le=64)
+    max_entries: int = Field(default=2000, ge=1, le=100_000)
+    """Per workspace, as for `tree`."""
+
+
+class TreeResult(BaseModel):
+    """One workspace's answer in a `trees` response: its tree, or why there is none."""
+
+    session_id: str
+    tree: TreeResponse | None = None
+    error: str | None = None
+    status_code: int | None = None
+    """What `tree` would have answered for this workspace alone."""
+
+
+class TreesResponse(BaseModel):
+    results: list[TreeResult]
+    """One per requested session, in the order requested."""
 
 
 class CreateSessionRequest(BaseModel):

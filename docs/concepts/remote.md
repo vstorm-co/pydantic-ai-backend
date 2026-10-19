@@ -674,6 +674,20 @@ a workspace whose files sit under `uploads/` took one request per directory.
 entry count, and says when either bound or a directory it could not read left
 something out. It needs a service from 0.2.35; an older one answers `404`.
 
+**`trees` is the call for a page of many workspaces.** A browser across all of
+one person's workspaces asked `tree` once each, a request and a round trip per
+workspace. `POST /workspaces/trees` lists up to 100 in one request, walked side
+by side on the host, and answers each on its own: a missing workspace is that
+workspace's `404`, not the request's. It needs a service from 0.2.37.
+
+```python
+for session_id, tree in archive.trees(session_ids, max_depth=3).items():
+    if isinstance(tree, WorkspaceArchiveError):
+        print(session_id, "unreadable:", tree.status_code)
+    else:
+        print(session_id, len(tree.entries), "entries")
+```
+
 Four things to know:
 
 - **Requires `workspace_root`.** Without it there is nothing stored to read, and

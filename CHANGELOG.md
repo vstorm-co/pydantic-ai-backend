@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`POST /workspaces/trees` and `WorkspaceArchive.trees()`** list the same
+  directory of up to 100 stored workspaces in one request, walked side by side
+  on the host, each answered on its own - a tree, or the error `tree` would
+  have given for that workspace alone. AgenticOS's file browser asked `tree` once
+  per workspace: 18 requests and connections for one page, p50 2.3 s on its
+  production host.
+
 ## [0.2.36] - 2026-10-19
 
 Fixes from the 2026-10-19 audit of the Docker and sandboxd paths (AUD-1019-*).

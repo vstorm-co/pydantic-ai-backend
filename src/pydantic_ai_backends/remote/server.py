@@ -2149,6 +2149,28 @@ class _Service:
             entries=[wire.FileEntry(**row) for row in rows], truncated=truncated
         )
 
+    async def archive_trees(self, body: wire.TreesRequest) -> wire.TreesResponse:
+        """List several stored workspaces at once, each answered on its own.
+
+        One workspace that is missing or refuses the path is that workspace's
+        error, not the request's: the caller is a page drawing all of them.
+        """
+        one = wire.TreeRequest(
+            path=body.path, max_depth=body.max_depth, max_entries=body.max_entries
+        )
+
+        async def tree_of(session_id: str) -> wire.TreeResult:
+            try:
+                tree = await self.archive_tree(session_id, one)
+            except HTTPException as exc:
+                return wire.TreeResult(
+                    session_id=session_id, error=str(exc.detail), status_code=exc.status_code
+                )
+            return wire.TreeResult(session_id=session_id, tree=tree)
+
+        results = await asyncio.gather(*(tree_of(session) for session in body.sessions))
+        return wire.TreesResponse(results=list(results))
+
     async def archive_read(self, session_id: str, body: wire.ReadRequest) -> wire.ReadResponse:
         """Read a stored workspace file without starting a sandbox.
 
@@ -2482,6 +2504,15 @@ def _register_workspace_routes(app: FastAPI, service: _Service) -> None:
     ) -> list[wire.FileEntry]:
         """List one directory of a stored workspace."""
         return await service.archive_ls(session_id, body.path)
+
+    @app.post(
+        "/workspaces/trees",
+        response_model=wire.TreesResponse,
+        dependencies=[ServiceAuth],
+    )
+    async def trees_archived(body: wire.TreesRequest) -> wire.TreesResponse:
+        """List the same directory of several stored workspaces in one request."""
+        return await service.archive_trees(body)
 
     @app.post(
         "/workspaces/{session_id}/tree",
