@@ -85,6 +85,21 @@ no timeout. A timeout past that ceiling reports the sandbox's limit rather than 
 asked for. Without `client=` each request opens a connection; a host making many runs passes
 an `httpx.AsyncClient` it owns.
 
+**Opening a session can take minutes.** The service builds a runtime's image inside the
+first open that needs it, so opening waits up to `opening_timeout` (ten minutes by default)
+rather than `request_timeout`. A host that shows the run to a person can pass `on_wait`. It
+is awaited once when opening has taken more than a few seconds, so the person learns why
+nothing is happening yet:
+
+```python
+async def tell_the_person() -> None:
+    await chat.status("Preparing the sandbox")
+
+sandbox = SandboxdWorkspace(
+    service_url="http://sandboxd:8080", token=SANDBOXD_TOKEN, on_wait=tell_the_person
+)
+```
+
 ## State documents
 
 ```python
