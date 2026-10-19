@@ -383,8 +383,22 @@ session cheap once that split is in place.
 service starts, sequentially so several builds do not fight over one small host.
 Without it the first session on a built runtime pays for the image — measured at
 about eleven seconds for a pandas runtime — in the middle of somebody's request.
-A runtime that will not build is logged and skipped; one bad entry does not stop
-the others being ready.
+A runtime that will not build is tried once more, then logged and skipped; one
+bad entry does not stop the others being ready.
+
+A deploy can do the same work before the new service starts, so not even the
+first session after a release that changed a runtime waits on a build. Run it in
+a one-off container of the new image, with the service's own environment and
+Docker socket, while the old service keeps serving:
+
+```bash
+docker compose run --rm --no-deps sandboxd python -m pydantic_ai_backends.remote.prepare
+```
+
+It tries each runtime three times and exits `0` when every image is local, `1`
+naming the runtimes that are not (the service still builds those on demand), and
+`2` on a configuration it cannot read. The same work is a function,
+`prepare_runtimes(config, attempts=...)`, which returns the aliases left unprepared.
 
 **`tmpfs_size`** gives every sandbox an in-memory `/tmp`. Otherwise scratch files
 land in the container's write layer, which is slower and grows the disk. The

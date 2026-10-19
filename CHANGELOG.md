@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`python -m pydantic_ai_backends.remote.prepare`, and `prepare_runtimes()`
+  behind it.** Pulls and builds every runtime on a sandboxd allowlist, then exits.
+  A deploy runs it in a one-off container of the new image, so the first session
+  after a release that changed a runtime no longer waits minutes on a build, with
+  every `POST /sessions` for it answering 409 meanwhile. Each runtime is tried
+  three times. The exit status says whether every image is local.
+
+### Fixed
+
+- **A runtime build that fails once is tried again at start-up.** The first build
+  of a changed runtime on a production host died exporting a layer (`CreateDiff:
+  mount callback failed`) and the next one succeeded. The service's background
+  pass now retries each runtime once, rather than leaving the build to the first
+  session that asks.
+
 ## [0.2.33] - 2026-10-06
 
 ### Fixed

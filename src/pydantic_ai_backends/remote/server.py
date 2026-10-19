@@ -1077,23 +1077,50 @@ def _remove_sandbox(sandbox: Any) -> None:
         remover()
 
 
-def _default_prewarm(config: SandboxdConfig) -> Callable[[], None]:
-    """Pull and build everything on the allowlist, once, in the background.
+def prepare_runtimes(
+    config: SandboxdConfig,
+    *,
+    attempts: int = 1,
+    pause: float = 10.0,
+    sleep: Callable[[float], None] | None = None,
+) -> list[str]:
+    """Pull and build every image on the allowlist, and say which never became ready.
 
     Sequential on purpose: several image builds at once would fight over the CPU
     and the disk of exactly the small host this is most worth doing on. A runtime
-    that will not build is logged and skipped — one bad entry must not stop the
-    others being ready, and the failure will surface again when a client asks for
-    it.
+    that will not build is logged and skipped - one bad entry must not stop the
+    others being ready.
+
+    A failed build is tried again up to `attempts` times, `pause` seconds apart.
+    Builds fail for reasons that are not the runtime's: the first build of a
+    changed runtime on one production host died exporting a layer
+    (`CreateDiff: mount callback failed`) and the next attempt succeeded.
+
+    This is what the service runs in the background as it starts, and what
+    `python -m pydantic_ai_backends.remote.prepare` runs before a deploy switches
+    services, so a session never waits on a build either way.
+
+    Args:
+        config: The service configuration whose allowlist is prepared.
+        attempts: How many times one runtime is tried before it is given up on.
+        pause: Seconds between two attempts at the same runtime.
+        sleep: How to wait between attempts; `time.sleep` unless a test
+            passes something faster.
+
+    Returns:
+        The aliases that are still not ready, in allowlist order. Empty when
+        every image is local.
     """
+    from pydantic_ai_backends.backends.docker._client import docker_client
+    from pydantic_ai_backends.backends.docker._image import pull_if_absent, resolve_image
 
-    def warm() -> None:
-        from pydantic_ai_backends.backends.docker._client import docker_client
-        from pydantic_ai_backends.backends.docker._image import pull_if_absent, resolve_image
-
-        client = docker_client()
-        for alias in sorted(config.runtimes):
-            runtime = _as_runtime(config.runtimes[alias])
+    client = docker_client()
+    failed: list[str] = []
+    for alias in sorted(config.runtimes):
+        runtime = _as_runtime(config.runtimes[alias])
+        attempt = 0
+        while True:
+            attempt += 1
             started = time.monotonic()
             try:
                 built = runtime.resolved_runtime()
@@ -1106,9 +1133,34 @@ def _default_prewarm(config: SandboxdConfig) -> Callable[[], None]:
                     resolve_image(client, at_work_dir, "")
                     action = "built"
             except Exception:
+                if attempt < attempts:
+                    _logger.warning(
+                        "Preparing runtime %s failed (attempt %d of %d); trying again",
+                        alias,
+                        attempt,
+                        attempts,
+                        exc_info=True,
+                    )
+                    (sleep or time.sleep)(pause)
+                    continue
                 _logger.exception("Could not prepare runtime %s; it will be built on demand", alias)
-                continue
+                failed.append(alias)
+                break
             _logger.info("Runtime %s %s in %.1fs", alias, action, time.monotonic() - started)
+            break
+    return failed
+
+
+def _default_prewarm(config: SandboxdConfig) -> Callable[[], None]:
+    """`prepare_runtimes` once, in the background, with one retry per runtime.
+
+    One retry rather than several: the service is already serving, a session
+    that asks for a runtime still being prepared waits for it, and a build that
+    fails twice is worth a log line more than another few minutes of disk.
+    """
+
+    def warm() -> None:
+        prepare_runtimes(config, attempts=2)
 
     return warm
 
@@ -2432,6 +2484,7 @@ __all__ = [
     "SandboxRuntime",
     "SandboxdConfig",
     "create_app",
+    "prepare_runtimes",
     "run",
 ]
 
