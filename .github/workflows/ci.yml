@@ -69,7 +69,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        # Through 3.15, the interpreter the published sandboxd image runs on.
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
     steps:
       - uses: actions/checkout@v7
 
@@ -199,10 +200,40 @@ jobs:
           curl -fsS localhost:8080/healthz
           docker rm -f sandboxd-ci
 
+  docker-conformance:
+    # The `docker`-marked suites run every workspace operation against a real
+    # daemon: commands through `docker exec`, files through sandboxd's host fast
+    # path and its fallbacks, links planted in the workspace. The unit tests above
+    # fake the daemon, so this is the only job that would notice the two
+    # disagreeing.
+    name: Docker conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --python 3.13 --all-extras
+
+      - name: Pull the image the suites run
+        run: docker pull python:3.12-slim
+
+      - name: Run the Docker and sandboxd conformance suites
+        run: >-
+          uv run pytest -m docker -q
+          tests/test_workspace_docker_conformance.py
+          tests/test_workspace_sandboxd_conformance.py
+
   all-checks:
     name: All Checks Passed
     runs-on: ubuntu-latest
-    needs: [lint, typecheck, test, pydantic-ai-range, extras, image]
+    needs: [lint, typecheck, test, pydantic-ai-range, extras, image, docker-conformance]
     steps:
       - name: All checks passed
         run: echo "All CI checks passed successfully!"

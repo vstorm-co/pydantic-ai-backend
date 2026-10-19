@@ -233,7 +233,9 @@ async def run_in_container(
         # by a broken stream.
         if not finished:
             stopped.set()
-            if may_run:
+            # No branch on to the inspect below: an unfinished command has
+            # always left the `try` by its `return` or by raising.
+            if may_run:  # pragma: no branch
                 await stop_in_container(container, run_id)
 
     try:

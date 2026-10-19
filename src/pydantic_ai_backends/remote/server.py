@@ -2227,7 +2227,7 @@ class _Service:
                 return False
         reported = getattr(self.manager.sessions.get(session_id), "container_user", None)
         user = reported() if callable(reported) else None
-        return user is None or _writes_as_service(user)
+        return not isinstance(user, str) or _writes_as_service(user)
 
     async def native_file(self, session_id: str, op: str, path: str, call: Callable[..., _T]) -> _T:
         """Run one native file operation for an authorized live session.

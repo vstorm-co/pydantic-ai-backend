@@ -1696,6 +1696,22 @@ class TestWorkspaceArchiveTree:
         # that which says the bound was reached - not the thousand.
         assert len(read) == 3
 
+    def test_names_left_unread_mark_the_listing_even_short_of_the_bound(self, tmp_path):
+        """Links are read and left out, so a directory can be cut short while the
+        listing still holds fewer entries than it may."""
+        from pydantic_ai_backends.remote import _workspace
+
+        workspace = tmp_path / "linked" / "workspace"
+        workspace.mkdir(parents=True)
+        (workspace / "only.txt").write_text("x")
+        for index in range(3):
+            (workspace / f"link{index}").symlink_to("/etc")
+
+        entries, truncated = _workspace.walk_workspace(workspace, ".", max_depth=6, max_entries=2)
+
+        assert len(entries) <= 1
+        assert truncated is True
+
     def test_the_start_is_checked_like_ls(self, stored):
         harness, _ = stored
 
@@ -3764,6 +3780,9 @@ class TestNativeFiles:
             )
             monkeypatch.setattr(server_module, "_session_runtime", lambda _config, _runtime: other)
             assert service.writes_natively(sid) is False
+            # A session this service holds no record of is judged by the
+            # service-wide rule alone.
+            assert service.writes_natively("unknown") is True
 
     @pytest.mark.parametrize(
         ("user", "native"),
