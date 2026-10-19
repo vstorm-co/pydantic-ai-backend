@@ -95,6 +95,7 @@ nothing is happening yet:
 async def tell_the_person() -> None:
     await chat.status("Preparing the sandbox")
 
+
 sandbox = SandboxdWorkspace(
     service_url="http://sandboxd:8080", token=SANDBOXD_TOKEN, on_wait=tell_the_person
 )
