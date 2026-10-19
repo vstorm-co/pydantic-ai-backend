@@ -1646,18 +1646,55 @@ class TestWorkspaceArchiveTree:
         from pydantic_ai_backends.remote import _workspace
 
         harness, _ = stored
-        real = _workspace.list_workspace
+        real = _workspace._scan
 
-        def flaky(root, path):
+        def flaky(root, path, *, limit):
             if path == "uploads":
                 raise _workspace.WorkspacePathError("uploads became a link")
-            return real(root, path)
+            return real(root, path, limit=limit)
 
-        monkeypatch.setattr(_workspace, "list_workspace", flaky)
+        monkeypatch.setattr(_workspace, "_scan", flaky)
         tree = wire.TreeResponse.model_validate(self._tree(harness).json())
 
         assert [e.path for e in tree.entries] == ["uploads", "a.md"]
         assert tree.truncated is True
+
+    def test_a_wide_directory_is_read_only_as_far_as_the_bound(self, tmp_path, monkeypatch):
+        """AUD-1019-12: `max_entries=1` used to stat and sort a thousand files."""
+        import os as os_module
+
+        from pydantic_ai_backends.remote import _workspace
+
+        workspace = tmp_path / "wide" / "workspace"
+        workspace.mkdir(parents=True)
+        for index in range(1000):
+            (workspace / f"f{index:04}").write_text("x")
+        read: list[str] = []
+        real_scandir = os_module.scandir
+
+        class Counting:
+            def __init__(self, fd):
+                self._inner = real_scandir(fd)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._inner.close()
+
+            def __iter__(self):
+                for item in self._inner:
+                    read.append(item.name)
+                    yield item
+
+        monkeypatch.setattr(_workspace.os, "scandir", Counting)
+        entries, truncated = _workspace.walk_workspace(workspace, ".", max_depth=6, max_entries=1)
+
+        assert len(entries) == 1
+        assert truncated is True
+        # The entry wanted, one more to learn there are more, and the name past
+        # that which says the bound was reached - not the thousand.
+        assert len(read) == 3
 
     def test_the_start_is_checked_like_ls(self, stored):
         harness, _ = stored
