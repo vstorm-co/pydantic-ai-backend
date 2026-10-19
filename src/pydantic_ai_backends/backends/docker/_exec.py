@@ -133,6 +133,30 @@ async def _running(container: Container) -> bool:
     return status == "running"
 
 
+SIGNAL_SETTLE_SECONDS = 0.5
+"""How long a container may still read as running after the signal that ended it.
+
+Removing a container kills its processes first, and on Linux the killed
+command's exec reports its exit before the daemon reports the container going:
+for that moment it still reads `running`."""
+
+
+async def _survived(container: Container) -> bool:
+    """Whether the container outlived the signal that ended a command in it.
+
+    Asked again for `SIGNAL_SETTLE_SECONDS` while it still reads as running,
+    since a container being removed does at first. A signal exit is rare
+    enough - an OOM kill, a `kill` the agent ran - that the wait costs nothing
+    on the ordinary path.
+    """
+    deadline = anyio.current_time() + SIGNAL_SETTLE_SECONDS
+    while await _running(container):
+        if anyio.current_time() >= deadline:
+            return True
+        await anyio.sleep(0.05)
+    return False
+
+
 async def stop_in_container(container: Container, run_id: str) -> None:
     """Stop the command started under `run_id`, and every process it started.
 
@@ -247,7 +271,7 @@ async def run_in_container(
         # The stream ended without the command finishing: its container went
         # away underneath it.
         raise SandboxUnavailableError("the container stopped while the command was running")
-    if exit_code > SIGNAL_EXIT_BASE and not await _running(container):
+    if exit_code > SIGNAL_EXIT_BASE and not await _survived(container):
         # Killed by a signal, and the container with it: removing or stopping a
         # container kills its processes, so their exit is the container's end
         # rather than the command's own. A signal in a live container is a result.

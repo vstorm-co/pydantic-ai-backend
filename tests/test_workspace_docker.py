@@ -112,6 +112,7 @@ class _Container:
     reload_error: Exception | None = None
     stops: list[list[str]] = field(default_factory=list)
     removed: bool = False
+    statuses: list[str] = field(default_factory=list)
 
     def exec_run(self, cmd: list[str], **kwargs: Any) -> Any:
         self.stops.append(cmd)
@@ -122,6 +123,8 @@ class _Container:
     def reload(self) -> None:
         if self.reload_error is not None:
             raise self.reload_error
+        if self.statuses:
+            self.status = self.statuses.pop(0)
 
     def remove(self, *, force: bool) -> None:
         assert force
@@ -312,6 +315,15 @@ class TestRunInContainer:
         else:
             outcome = await _exec.run_in_container(container, ["sleep"], run_id="r1")  # type: ignore[arg-type]
             assert outcome.exit_code == 137
+
+    async def test_a_container_still_reading_running_as_it_is_removed_is_gone(
+        self, api: _Api, container: _Container
+    ) -> None:
+        """On Linux the killed command's exit arrives before the container reads as going."""
+        api.exit_code = 137
+        container.statuses = ["running", "running", "removing"]
+        with pytest.raises(SandboxUnavailableError):
+            await _exec.run_in_container(container, ["sleep"], run_id="r1")  # type: ignore[arg-type]
 
     async def test_an_empty_argv_is_refused(self, container: _Container) -> None:
         with pytest.raises(ValueError, match="name a program"):

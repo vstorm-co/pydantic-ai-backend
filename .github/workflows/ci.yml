@@ -224,35 +224,6 @@ jobs:
       - name: Pull the image the suites run
         run: docker pull python:3.12-slim
 
-      - name: Probe (temporary)
-        run: |
-          cat > /tmp/probe.py <<'PY'
-          import anyio, posixpath, uuid
-          from pydantic_ai.workspaces import Workspace
-          from pydantic_ai_backends.workspaces import DockerWorkspace
-          cap = DockerWorkspace(image="python:3.12-slim")
-          async def main():
-              backend = cap.backend()
-              ws = Workspace(backend)
-              root = await backend.working_dir()
-              started = posixpath.join(root, f".started-{uuid.uuid4().hex}")
-              result = {}
-              async def run():
-                  try:
-                      result["r"] = await backend.run(["sh", "-c", 'printf ready > "$1"; while [ -d "$2" ]; do sleep 0.1; done', "sh", started, root], timeout=30)
-                  except BaseException as e:
-                      result["e"] = repr(e)
-              async with anyio.create_task_group() as g:
-                  g.start_soon(run)
-                  while not await ws.exists(started):
-                      await anyio.sleep(0.05)
-                  print("root", root, "ref", backend.ref)
-                  await cap.destroy(backend.ref)
-              print("RESULT", result)
-          anyio.run(main)
-          PY
-          uv run python /tmp/probe.py
-
       - name: Run the Docker and sandboxd conformance suites
         run: >-
           uv run pytest -m docker -q
