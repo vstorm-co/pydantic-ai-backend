@@ -233,6 +233,9 @@ jobs:
       - name: Build run_as_uid images on node and ubuntu bases
         run: uv run pytest -m docker -q tests/test_docker_image.py
 
+      - name: Build the npm runtimes and run their tools
+        run: uv run pytest -m docker -q tests/test_runtimes.py
+
   all-checks:
     name: All Checks Passed
     runs-on: ubuntu-latest

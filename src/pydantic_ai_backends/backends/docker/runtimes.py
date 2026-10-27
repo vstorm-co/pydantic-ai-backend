@@ -127,14 +127,14 @@ BUILTIN_RUNTIMES: dict[str, RuntimeConfig] = {
     ),
     "node-minimal": RuntimeConfig(
         name="node-minimal",
-        description="Node.js 20, no extra packages",
-        image="node:20-slim",
+        description="Node.js 24, no extra packages",
+        image="node:24-slim",
         work_dir=NODE_WORK_DIR,
     ),
     "node-typescript": RuntimeConfig(
         name="node-typescript",
         description="TypeScript with tsx and Vitest",
-        base_image="node:20-slim",
+        base_image="node:24-slim",
         packages=["typescript", "tsx", "vitest"],
         package_manager="npm",
         work_dir=NODE_WORK_DIR,
@@ -142,7 +142,7 @@ BUILTIN_RUNTIMES: dict[str, RuntimeConfig] = {
     "node-react": RuntimeConfig(
         name="node-react",
         description="TypeScript, Vite and React",
-        base_image="node:20-slim",
+        base_image="node:24-slim",
         packages=["typescript", "vite", "react", "react-dom", "@types/react"],
         package_manager="npm",
         work_dir=NODE_WORK_DIR,

@@ -86,7 +86,7 @@ SANDBOX_ENV: dict[str, str] = {
     "NO_COLOR": "1",
     "PAGER": "cat",
     "GIT_PAGER": "cat",
-    # `python:3.12-slim` sets this; `node:20-slim` does not, so a Node runtime
+    # `python:3.12-slim` sets this; `node:24-slim` does not, so a Node runtime
     # otherwise starts in the POSIX locale where non-ASCII output is a coin flip.
     "LANG": "C.UTF-8",
 }

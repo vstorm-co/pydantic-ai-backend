@@ -1955,7 +1955,7 @@ class TestSandboxRuntimeEntries:
 
         entry = SandboxRuntime(runtime="node-minimal")
 
-        assert entry.image_label() == "node:20-slim"
+        assert entry.image_label() == "node:24-slim"
 
     def test_a_description_overrides_the_derived_one(self):
         from pydantic_ai_backends.remote.server import SandboxRuntime
