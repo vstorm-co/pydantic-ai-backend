@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`run_as_uid` builds on base images that are not `python:*`.** The
+  generated image always ran `python -m venv`, so an image without Python
+  (`node:22-slim`) failed with exit 127, and always ran `useradd`, so an image
+  with an account at that uid already (`node` and `ubuntu` images at 1000, a
+  Linux host's first user) failed with exit 4. An existing account is now kept,
+  and the virtualenv is made with `python3` only when the image has one.
+
 ## [0.2.37] - 2026-10-20
 
 ### Added

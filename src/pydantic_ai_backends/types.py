@@ -204,7 +204,8 @@ class RuntimeConfig(BaseModel):
     `None` — the default — runs as root, which is what a container does unless
     told otherwise. Naming a uid instead adds three things to the generated
     image: a real user with that id (so `whoami` and anything else calling
-    `getpwuid` works), a home directory it owns, and a virtualenv at
+    `getpwuid` works — the base image's own, if it has one at that id), a home
+    directory it owns, and, if the image has `python3`, a virtualenv at
     :data:`VENV_PATH` it owns, put first on `PATH`.
 
     The virtualenv is the part that makes this workable rather than merely

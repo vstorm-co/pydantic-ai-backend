@@ -230,6 +230,9 @@ jobs:
           tests/test_workspace_docker_conformance.py
           tests/test_workspace_sandboxd_conformance.py
 
+      - name: Build run_as_uid images on node and ubuntu bases
+        run: uv run pytest -m docker -q tests/test_docker_image.py
+
   all-checks:
     name: All Checks Passed
     runs-on: ubuntu-latest

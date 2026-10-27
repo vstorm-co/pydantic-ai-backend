@@ -1,5 +1,6 @@
 """Tests for resolving a RuntimeConfig to a Docker image (no Docker needed)."""
 
+import io
 import sys
 import types
 from pathlib import Path
@@ -465,15 +466,33 @@ class TestUnprivilegedRuntimes:
 
         assert f"useradd --uid 1000 --create-home --shell /bin/bash {SANDBOX_USER}" in dockerfile
 
+    def test_an_account_the_image_already_has_at_the_uid_is_kept(self):
+        """`node` and `ubuntu` images put one at 1000, and `useradd` fails on a taken uid."""
+        from pydantic_ai_backends.backends.docker._image import SANDBOX_USER, build_dockerfile
+
+        dockerfile = build_dockerfile(self._runtime(run_as_uid=1000))
+
+        assert "(getent passwd 1000 >/dev/null || useradd --uid 1000" in dockerfile
+        home = f"/home/{SANDBOX_USER}"
+        assert f"mkdir -p {home} && chown 1000:1000 {home}" in dockerfile
+
     def test_it_owns_a_virtualenv_that_comes_first_on_path(self):
         """Without one, pip installs somewhere off `PATH` and uv cannot install at all."""
         from pydantic_ai_backends.backends.docker._image import VENV_PATH, build_dockerfile
 
         dockerfile = build_dockerfile(self._runtime(run_as_uid=1000))
 
-        assert f"python -m venv --system-site-packages {VENV_PATH}" in dockerfile
+        assert f"python3 -m venv --system-site-packages {VENV_PATH}" in dockerfile
         assert f"chown -R 1000:1000 {VENV_PATH}" in dockerfile
         assert f"PATH={VENV_PATH}/bin:$PATH" in dockerfile
+
+    def test_the_venv_is_skipped_on_an_image_without_python(self):
+        """`node:22-slim` has no Python, and the build must not fail for want of one."""
+        from pydantic_ai_backends.backends.docker._image import build_dockerfile
+
+        dockerfile = build_dockerfile(self._runtime(run_as_uid=1000))
+
+        assert "if command -v python3 >/dev/null; then python3 -m venv" in dockerfile
 
     def test_the_venv_keeps_the_runtimes_own_packages_importable(self):
         """They were installed system-wide, before the user existed."""
@@ -481,7 +500,7 @@ class TestUnprivilegedRuntimes:
 
         dockerfile = build_dockerfile(self._runtime(packages=["six"], run_as_uid=1000))
         install = dockerfile.index("pip install")
-        venv = dockerfile.index("python -m venv")
+        venv = dockerfile.index("python3 -m venv")
 
         assert install < venv
         assert "--system-site-packages" in dockerfile
@@ -497,6 +516,36 @@ class TestUnprivilegedRuntimes:
         dockerfile = build_dockerfile(self._runtime(run_as_uid=1000, env_vars={"HOME": "/tmp"}))
 
         assert dockerfile.index("HOME=/home/agent") < dockerfile.index("ENV HOME=/tmp")
+
+    @pytest.mark.docker
+    @pytest.mark.parametrize(
+        ("base_image", "account", "has_venv"),
+        [
+            ("python:3.12-slim", "agent", True),
+            # No Python at all, and an account of its own at 1000.
+            ("node:22-slim", "node", False),
+            # An account of its own at 1000, and no Python until one is installed.
+            ("ubuntu:24.04", "ubuntu", False),
+        ],
+    )
+    def test_the_image_builds_and_runs_as_the_uid(self, base_image, account, has_venv):
+        docker = pytest.importorskip("docker")
+        from pydantic_ai_backends.backends.docker._image import VENV_PATH, build_dockerfile
+        from pydantic_ai_backends.types import RuntimeConfig
+
+        client = docker.from_env()
+        runtime = RuntimeConfig(name="nr", base_image=base_image, run_as_uid=1000)
+        dockerfile = build_dockerfile(runtime)
+        image, _ = client.images.build(fileobj=io.BytesIO(dockerfile.encode()), rm=True)
+        try:
+            script = f'whoami; touch "$HOME/x"; test -d {VENV_PATH} && echo venv || echo none'
+            output = client.containers.run(
+                image.id, ["sh", "-c", script], user="1000:1000", remove=True
+            )
+        finally:
+            client.images.remove(image.id, force=True)
+
+        assert output.decode().split() == [account, "venv" if has_venv else "none"]
 
     @pytest.mark.parametrize("uid", [0, -1])
     def test_a_uid_that_is_not_one_is_refused(self, uid: int):
