@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`run_as_uid` builds on base images that are not `python:*`.** The
+  generated image always ran `python -m venv`, so an image without Python
+  (`node:22-slim`) failed with exit 127, and always ran `useradd`, so an image
+  with an account at that uid already (`node` and `ubuntu` images at 1000, a
+  Linux host's first user) failed with exit 4. An existing account is now kept,
+  and the virtualenv is made with `python3` only when the image has one.
+- **`node-typescript` and `node-react` build again.** Both were on
+  `node:20-slim`, and npm installs the newest release of each package: vitest 5
+  and vite 8 dropped Node 20, and npm 10 there crashed with `Cannot read
+  properties of null (reading 'edgesOut')` instead of saying so. The Node
+  runtimes, `node-minimal` and sandboxd's default and suggested `node` included,
+  are now on `node:24-slim`. Node 20 reached end of life in April 2026.
+  `polyglot` still gets Debian's Node 20 alongside its Python, so a package
+  that dropped Node 20 does not install there.
+
 ## [0.2.37] - 2026-10-20
 
 ### Added

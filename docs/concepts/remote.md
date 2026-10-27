@@ -75,7 +75,7 @@ with one line naming the variable, rather than at the first request.
 `SANDBOXD_RUNTIMES` takes a compact form for what a compose file usually wants:
 
 ```bash
-SANDBOXD_RUNTIMES=python=python:3.12-slim,node=node:20-slim
+SANDBOXD_RUNTIMES=python=python:3.12-slim,node=node:24-slim
 ```
 
 `@name` builds one of the [shipped catalogues](#shipped-catalogues) instead of
@@ -111,7 +111,7 @@ app = create_app(
         token="a-long-random-secret",
         runtimes={
             "python": "python:3.12-slim",
-            "node": "node:20-slim",
+            "node": "node:24-slim",
         },
         default_runtime="python",
         max_sessions=20,
@@ -466,7 +466,7 @@ SandboxdConfig(token=token, mem_limit="384m", memswap_limit="512m")
 containers only when the layer is literally the same file. Runtimes built from
 one `python:3.12-slim` share the interpreter and the standard library; runtimes
 built from different bases share nothing. `SUGGESTED_RUNTIMES` is arranged this
-way — every Python entry on `python:3.12-slim`, every Node one on `node:20-slim`
+way — every Python entry on `python:3.12-slim`, every Node one on `node:24-slim`
 — and a custom allowlist is worth checking against the same rule. It is also the
 reason containers beat microVMs badly on a small host: a microVM caches those
 pages once per guest, so a hundred of them hold a hundred copies.

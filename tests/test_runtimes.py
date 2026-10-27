@@ -107,14 +107,14 @@ class TestBuiltinRuntimes:
         """Test node-minimal runtime."""
         runtime = BUILTIN_RUNTIMES["node-minimal"]
         assert runtime.name == "node-minimal"
-        assert runtime.image == "node:20-slim"
+        assert runtime.image == "node:24-slim"
         assert runtime.work_dir == "/app"
 
     def test_node_react(self):
         """Test node-react runtime."""
         runtime = BUILTIN_RUNTIMES["node-react"]
         assert runtime.name == "node-react"
-        assert runtime.base_image == "node:20-slim"
+        assert runtime.base_image == "node:24-slim"
         assert "typescript" in runtime.packages
         assert "react" in runtime.packages
         assert runtime.package_manager == "npm"
@@ -127,6 +127,32 @@ class TestBuiltinRuntimes:
             assert isinstance(runtime, RuntimeConfig)
             # Must have either image or base_image
             assert runtime.image or runtime.base_image
+
+
+@pytest.mark.docker
+@pytest.mark.parametrize(
+    ("name", "tools"),
+    [
+        ("node-typescript", ["tsc", "tsx", "vitest"]),
+        ("node-react", ["tsc", "vite"]),
+    ],
+)
+def test_an_npm_runtime_builds_and_its_tools_run(name: str, tools: list[str]):
+    """npm installs the newest release, so a base image's Node can fall behind it.
+
+    vitest 5 and vite 8 dropped Node 20, and npm 10 on `node:20-slim` crashed
+    building both runtimes instead of saying so.
+    """
+    docker = pytest.importorskip("docker")
+    from pydantic_ai_backends.backends.docker._image import build_image
+
+    client = docker.from_env()
+    image = build_image(client, BUILTIN_RUNTIMES[name])
+    try:
+        script = " && ".join(f"npx --no-install {tool} --version" for tool in tools)
+        client.containers.run(image, ["sh", "-c", script], remove=True)
+    finally:
+        client.images.remove(image, force=True)
 
 
 class TestGetRuntime:

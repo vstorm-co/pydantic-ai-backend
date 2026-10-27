@@ -205,8 +205,8 @@ DEFAULT_RUNTIMES: dict[str, SandboxRuntime] = {
         description="Python 3.12, standard library only",
     ),
     "node": SandboxRuntime(
-        image="node:20-slim",
-        description="Node.js 20, no extra packages",
+        image="node:24-slim",
+        description="Node.js 24, no extra packages",
     ),
 }
 """What a service allows when its operator names nothing.
@@ -273,8 +273,8 @@ SUGGESTED_RUNTIMES: dict[str, SandboxRuntime] = {
         network_mode="bridge",
     ),
     "node": SandboxRuntime(
-        image="node:20-slim",
-        description="Node.js 20, no extra packages",
+        image="node:24-slim",
+        description="Node.js 24, no extra packages",
         mem_limit="1g",
     ),
     "node-typescript": SandboxRuntime(

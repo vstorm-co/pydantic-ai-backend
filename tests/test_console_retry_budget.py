@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    TextPart,
+    ToolCallPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.workspaces import WorkspaceRef
 
@@ -32,6 +39,20 @@ def _wrong_twice_then_stop(messages: list[ModelMessage], info: AgentInfo) -> Mod
     return ModelResponse(parts=[TextPart("I could not make that edit uniquely.")])
 
 
+def _answer(part: ModelRequestPart | ModelResponsePart) -> str | None:
+    """`retried` or `returned` for a tool's answer to the model, `None` for anything else.
+
+    pydantic-ai 2.60 moved a `ModelRetry` from a `RetryPromptPart` of its own to a
+    `ToolReturnPart` with `outcome="retried"`, and the `console` extra supports both.
+    """
+    kind = getattr(part, "part_kind", None)
+    if kind == "retry-prompt":
+        return "retried"
+    if kind == "tool-return":
+        return "retried" if getattr(part, "outcome", None) == "retried" else "returned"
+    return None
+
+
 async def test_a_second_ambiguous_edit_is_answered_not_fatal():
     """`ModelRetry` past the budget raises `UnexpectedModelBehavior` and kills the run.
 
@@ -52,21 +73,12 @@ async def test_a_second_ambiguous_edit_is_answered_not_fatal():
 
     assert result.output == "I could not make that edit uniquely."
 
-    kinds = [
-        part.part_kind
-        for message in result.all_messages()
-        for part in message.parts
-        if getattr(part, "part_kind", None) in {"tool-return", "retry-prompt"}
-    ]
-    contents = [
-        str(part.content)
-        for message in result.all_messages()
-        for part in message.parts
-        if getattr(part, "part_kind", None) in {"tool-return", "retry-prompt"}
-    ]
+    parts = [part for message in result.all_messages() for part in message.parts]
+    answers = [answer for part in parts if (answer := _answer(part)) is not None]
+    contents = [str(getattr(part, "content", "")) for part in parts if _answer(part) is not None]
 
     # The first wrong edit steered the model; the second, out of budget, came
     # back as an ordinary result. Either half missing is a different bug: no
-    # retry prompt means nothing steers, and no tool return means the run died.
-    assert kinds == ["retry-prompt", "tool-return"]
+    # retry means nothing steers, and no plain return means the run died.
+    assert answers == ["retried", "returned"]
     assert all("found 2 times" in content for content in contents)

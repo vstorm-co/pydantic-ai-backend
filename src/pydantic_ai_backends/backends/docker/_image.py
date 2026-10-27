@@ -63,7 +63,9 @@ SANDBOX_USER = "agent"
 """Login name given to the uid a `run_as_uid` runtime runs as.
 
 A numeric uid with no `/etc/passwd` entry works for the kernel and confuses
-everything that calls `getpwuid`, `whoami` included.
+everything that calls `getpwuid`, `whoami` included. When the base image already
+has an account at that uid, that account is used and keeps its own name; the
+home directory is `/home/agent` either way.
 """
 
 SHELL_METACHARACTERS = frozenset(";&|`$()<>\n\r")
@@ -289,14 +291,20 @@ def unprivileged_instructions(uid: int) -> list[str]:
     Three things, and each is load-bearing:
 
     - **A real account** for `uid`, because a bare numeric id works for the
-      kernel and breaks everything that calls `getpwuid` — `whoami` first.
+      kernel and breaks everything that calls `getpwuid` — `whoami` first. An
+      account the base image already has at that uid is kept: `node` and
+      `ubuntu` images both put one at 1000, the uid a Linux host's first user
+      has, and adding a second fails the build.
     - **A home directory it owns**, since with `HOME` left at `/` an agent's
       first `pip install` fails on `Permission denied: '/.local'`.
-    - **A virtualenv it owns**, first on `PATH`. Without one a non-root user
-      cannot install anything: pip falls back to a user-site directory whose
-      console scripts are not on `PATH`, and `uv` — which has no `--user` mode —
-      fails outright. Created with `--system-site-packages`, so a runtime's own
-      `packages`, installed system-wide above, stay importable.
+    - **A virtualenv it owns**, first on `PATH`, when the image has a Python to
+      make one with. Without one a non-root user cannot install anything: pip
+      falls back to a user-site directory whose console scripts are not on
+      `PATH`, and `uv` — which has no `--user` mode — fails outright. Created
+      with `--system-site-packages`, so a runtime's own `packages`, installed
+      system-wide above, stay importable. `python3` rather than `python`,
+      because Debian's and Ubuntu's own Python has only the former, and an
+      image with neither — `node:22-slim` — simply goes without.
 
     `UV_SYSTEM_PYTHON` is switched off here rather than left to the sandbox's
     default: on it, uv aims at the interpreter the user cannot write to and
@@ -310,9 +318,12 @@ def unprivileged_instructions(uid: int) -> list[str]:
         raise ValueError(f"run_as_uid must be a positive uid, not {uid}")
 
     return [
-        f"RUN useradd --uid {uid} --create-home --shell /bin/bash {SANDBOX_USER} "
-        f"&& python -m venv --system-site-packages {VENV_PATH} "
-        f"&& chown -R {uid}:{uid} {VENV_PATH}",
+        f"RUN (getent passwd {uid} >/dev/null "
+        f"|| useradd --uid {uid} --create-home --shell /bin/bash {SANDBOX_USER}) "
+        f"&& mkdir -p /home/{SANDBOX_USER} && chown {uid}:{uid} /home/{SANDBOX_USER} "
+        f"&& if command -v python3 >/dev/null; then "
+        f"python3 -m venv --system-site-packages {VENV_PATH} "
+        f"&& chown -R {uid}:{uid} {VENV_PATH}; fi",
         f"ENV VIRTUAL_ENV={VENV_PATH} "
         f"HOME=/home/{SANDBOX_USER} "
         f"UV_SYSTEM_PYTHON=0 "

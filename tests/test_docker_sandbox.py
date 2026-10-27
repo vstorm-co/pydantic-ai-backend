@@ -297,7 +297,7 @@ class TestDockerSandboxResourceLimits:
         # uv's parallelism is memory: uncapped it is OOM-killed at 128 MB where
         # pip survives, and capped at two it fits and stays 6.6x faster.
         assert env["UV_CONCURRENT_DOWNLOADS"] == "2"
-        # node:20-slim ships no LANG, so a Node runtime would start in POSIX.
+        # node:24-slim ships no LANG, so a Node runtime would start in POSIX.
         assert env["LANG"] == "C.UTF-8"
 
     def test_a_runtime_may_override_any_of_it(self, fake_client):
