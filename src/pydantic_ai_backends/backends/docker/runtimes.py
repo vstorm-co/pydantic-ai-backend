@@ -78,10 +78,11 @@ BUILTIN_RUNTIMES: dict[str, RuntimeConfig] = {
             # in the image once the install is done.
             "apt-get update && apt-get install -y --no-install-recommends "
             "curl ca-certificates git nodejs npm && rm -rf /var/lib/apt/lists/*",
-            # Debian's Node is current (20.19.2 against node:20-slim's 20.20.2),
-            # but its npm is a major version behind at 9.2.0. Upgrading only npm
-            # costs a few megabytes and avoids a runtime that quietly behaves
-            # differently from the dedicated Node ones.
+            # Debian's Node is 20.19.2, behind the dedicated Node runtimes'
+            # node:24-slim: a package that dropped Node 20 (vitest 5, vite 8)
+            # does not install here, and npm 10 crashes on it rather than saying
+            # so. Its npm is a major version behind at 9.2.0; upgrading only npm
+            # costs a few megabytes.
             "npm install -g npm@10 && npm cache clean --force",
         ],
         # Deliberately without pandas: at 97 MB of import it would take a third of

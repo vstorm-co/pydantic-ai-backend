@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   properties of null (reading 'edgesOut')` instead of saying so. The Node
   runtimes, `node-minimal` and sandboxd's default and suggested `node` included,
   are now on `node:24-slim`. Node 20 reached end of life in April 2026.
+  `polyglot` still gets Debian's Node 20 alongside its Python, so a package
+  that dropped Node 20 does not install there.
 
 ## [0.2.37] - 2026-10-20
 
