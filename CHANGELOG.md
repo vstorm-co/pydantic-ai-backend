@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.38] - 2026-10-27
+
 ### Fixed
 
 - **`run_as_uid` builds on base images that are not `python:*`.** The
