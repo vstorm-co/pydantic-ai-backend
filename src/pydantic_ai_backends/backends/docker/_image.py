@@ -304,7 +304,11 @@ def unprivileged_instructions(uid: int) -> list[str]:
       with `--system-site-packages`, so a runtime's own `packages`, installed
       system-wide above, stay importable. `python3` rather than `python`,
       because Debian's and Ubuntu's own Python has only the former, and an
-      image with neither — `node:22-slim` — simply goes without.
+      image with neither — `node:22-slim` — simply goes without. Made
+      `--without-pip` when the interpreter has no `ensurepip`, which Debian and
+      Ubuntu split off into `python3-venv`: `python3 -m venv` fails outright
+      there, and a virtualenv without pip still serves uv and keeps `python`
+      pointed at a prefix the user owns.
 
     `UV_SYSTEM_PYTHON` is switched off here rather than left to the sandbox's
     default: on it, uv aims at the interpreter the user cannot write to and
@@ -322,7 +326,8 @@ def unprivileged_instructions(uid: int) -> list[str]:
         f"|| useradd --uid {uid} --create-home --shell /bin/bash {SANDBOX_USER}) "
         f"&& mkdir -p /home/{SANDBOX_USER} && chown {uid}:{uid} /home/{SANDBOX_USER} "
         f"&& if command -v python3 >/dev/null; then "
-        f"python3 -m venv --system-site-packages {VENV_PATH} "
+        f"python3 -m venv --system-site-packages "
+        f"$(python3 -c 'import ensurepip' 2>/dev/null || echo --without-pip) {VENV_PATH} "
         f"&& chown -R {uid}:{uid} {VENV_PATH}; fi",
         f"ENV VIRTUAL_ENV={VENV_PATH} "
         f"HOME=/home/{SANDBOX_USER} "

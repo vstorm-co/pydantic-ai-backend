@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`run_as_uid` builds on a Debian or Ubuntu Python without `python3-venv`.**
+  Those distributions split `ensurepip` off into that package, so on an image
+  that had `apt install python3` and nothing more, `python3 -m venv` failed the
+  build with exit 1. The virtualenv is now made `--without-pip` when the
+  interpreter has no `ensurepip`. It is still first on `PATH` and owned by the
+  sandbox user, so uv installs into it; `pip` itself needs `python3-venv` or
+  `python3-pip` in the image.
+
 ## [0.2.38] - 2026-10-27
 
 ### Fixed

@@ -482,7 +482,8 @@ class TestUnprivilegedRuntimes:
 
         dockerfile = build_dockerfile(self._runtime(run_as_uid=1000))
 
-        assert f"python3 -m venv --system-site-packages {VENV_PATH}" in dockerfile
+        assert "python3 -m venv --system-site-packages" in dockerfile
+        assert f"--without-pip) {VENV_PATH}" in dockerfile
         assert f"chown -R 1000:1000 {VENV_PATH}" in dockerfile
         assert f"PATH={VENV_PATH}/bin:$PATH" in dockerfile
 
@@ -493,6 +494,14 @@ class TestUnprivilegedRuntimes:
         dockerfile = build_dockerfile(self._runtime(run_as_uid=1000))
 
         assert "if command -v python3 >/dev/null; then python3 -m venv" in dockerfile
+
+    def test_the_venv_goes_without_pip_when_the_python_has_no_ensurepip(self):
+        """Debian's `python3` without `python3-venv` has `venv` but no `ensurepip`."""
+        from pydantic_ai_backends.backends.docker._image import build_dockerfile
+
+        dockerfile = build_dockerfile(self._runtime(run_as_uid=1000))
+
+        assert "$(python3 -c 'import ensurepip' 2>/dev/null || echo --without-pip)" in dockerfile
 
     def test_the_venv_keeps_the_runtimes_own_packages_importable(self):
         """They were installed system-wide, before the user existed."""
@@ -519,22 +528,33 @@ class TestUnprivilegedRuntimes:
 
     @pytest.mark.docker
     @pytest.mark.parametrize(
-        ("base_image", "account", "has_venv"),
+        ("base_image", "setup_commands", "account", "has_venv"),
         [
-            ("python:3.12-slim", "agent", True),
+            ("python:3.12-slim", [], "agent", True),
             # No Python at all, and an account of its own at 1000.
-            ("node:22-slim", "node", False),
+            ("node:22-slim", [], "node", False),
             # An account of its own at 1000, and no Python until one is installed.
-            ("ubuntu:24.04", "ubuntu", False),
+            ("ubuntu:24.04", [], "ubuntu", False),
+            # Debian's Python without `python3-venv`, so without `ensurepip`.
+            (
+                "debian:bookworm-slim",
+                ["apt-get update && apt-get install -y --no-install-recommends python3"],
+                "agent",
+                True,
+            ),
         ],
     )
-    def test_the_image_builds_and_runs_as_the_uid(self, base_image, account, has_venv):
+    def test_the_image_builds_and_runs_as_the_uid(
+        self, base_image, setup_commands, account, has_venv
+    ):
         docker = pytest.importorskip("docker")
         from pydantic_ai_backends.backends.docker._image import VENV_PATH, build_dockerfile
         from pydantic_ai_backends.types import RuntimeConfig
 
         client = docker.from_env()
-        runtime = RuntimeConfig(name="nr", base_image=base_image, run_as_uid=1000)
+        runtime = RuntimeConfig(
+            name="nr", base_image=base_image, setup_commands=setup_commands, run_as_uid=1000
+        )
         dockerfile = build_dockerfile(runtime)
         image, _ = client.images.build(fileobj=io.BytesIO(dockerfile.encode()), rm=True)
         try:
