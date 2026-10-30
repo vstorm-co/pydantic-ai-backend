@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.39] - 2026-10-30
+
 ### Fixed
 
 - **`run_as_uid` builds on a Debian or Ubuntu Python without `python3-venv`.**
