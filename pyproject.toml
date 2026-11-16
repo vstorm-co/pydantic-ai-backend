@@ -45,7 +45,7 @@ daytona = [
     # `daytona`, not `daytona-sdk`: the latter installs the module `daytona_sdk`,
     # and the code imports `daytona`. 0.220 is the release the session-command
     # API used here was read from.
-    "daytona>=0.220.0",
+    "daytona>=0.220.0,<1",
 ]
 docker = [
     "docker>=7.0",
