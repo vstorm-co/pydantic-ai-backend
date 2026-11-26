@@ -983,3 +983,58 @@ agent = Agent("anthropic:claude-opus-5-5", capabilities=[sandbox, ConsoleCapabil
 
 The harness's `Coder`, `Shell` and `FileSystem` work in the same workspace. See
 [Workspaces](workspaces.md#sandboxd) for refs, removal and the command ceiling.
+
+
+## Trusted live filesystem mounts
+
+A deployment may opt in to an additional live filesystem at `/project`. The
+agent keeps its own image, tools and `/workspace`; files under `/project` are
+served by a separate trusted NFS exporter rather than copied or synchronized.
+This feature is specific to sandboxd's default Docker builder. It does not add
+mount support to the other workspace providers.
+
+The operator configures both `filesystem_gateway_url` and
+`filesystem_export_image`, plus `workspace_root` and `persist_containers=True`.
+The environment equivalents are `SANDBOXD_FILESYSTEM_GATEWAY_URL` and
+`SANDBOXD_FILESYSTEM_EXPORT_IMAGE`. Pin the trusted exporter image by digest.
+The published sandboxd image includes `/usr/local/bin/projectfs-export`.
+The broker selects that entrypoint and a dedicated NFS readiness healthcheck on
+port 2049; the service's normal entrypoint remains sandboxd. The exporter
+implements the deployment's filesystem RPC and must be compatible with its gateway.
+
+The application passes `FilesystemBinding(id=..., token=SecretStr(...))` to a
+named `SandboxdWorkspace`. The SDK checks `/policy` before opening a session;
+an old or unconfigured service refuses the binding instead of silently omitting
+the mount. Clients cannot choose an image, gateway URL, host path or privileges.
+Before admission and execution, sandboxd verifies the binding through
+`GET <gateway>/bindings/<id>` using its bearer token. The response must contain
+matching `binding_id`, `session_name`, `tenant` and `mount_path: /project`.
+The exporter sends operations to `POST <gateway>/bindings/<id>/fs` using the
+same immutable credential. Authorization of individual files belongs to that
+gateway; immutable lease directories avoid retargeting existing NFS handles.
+
+Each binding has a private exporter bridge without published ports. The agent
+never joins it and receives only a Docker local NFS volume, without FUSE,
+`SYS_ADMIN`, devices or Docker access. The exporter needs HTTP access to the
+operator's gateway. Host and control-plane network sharing are refused.
+Binding metadata contains the credential in a private mode-0600 file under
+`workspace_root/.filesystem-bindings`, outside agent workspaces; protect this
+operator directory and backups like credentials. Responses and validation
+errors do not expose it. Binding IDs, tokens and runtime ownership cannot change on reattach. Built
+runtimes use their effective operator-selected `run_as_uid` (or root); a
+ready-made image requires the operator to set `sandbox_uid` to its numeric user
+identity. The exporter presents that identity without changing the agent's image.
+Gateway verification is serialized with broker lifecycle changes; slow gateways
+can therefore delay admission and command checks across sessions.
+
+Retained agent containers keep the same exporter alive, preserving installed
+tools and their workspace across idle stops. A missing, unhealthy or restarted
+exporter stops the agent and refuses execution: NFS file handles cannot safely
+survive an exporter epoch change. Explicitly recreate the sandbox filesystem
+before resuming; interrupted commands are never replayed automatically. Do not
+replace the helper beneath an active mount. Existing sessions without the mount
+also require explicit recreation; keep their workspace rather than deleting it.
+Purging a session removes its owned exporter, volume, bridge and binding record;
+the normal workspace TTL sweep removes orphaned records after their workspace is
+gone. The application gateway must fail closed when a binding or lease is
+revoked, including for already running commands.
