@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in live filesystems in sandboxd.** Named workspaces can carry an immutable
+  `FilesystemBinding`; an operator-configured gateway and bundled trusted NFS
+  exporter expose `/project` beside the agent's own workspace and toolchain.
+  Clients cannot select images, URLs, host paths or privileges. Binding proofs,
+  private control networks, credential redaction and fail-closed exporter epoch
+  checks protect admission and execution. Existing sessions need explicit
+  recreation before adding a mount. Other providers retain their current behavior.
+- The sandboxd image includes the locked Rust exporter, its third-party notice
+  and dependency manifest. Image CI exercises real Linux NFS operations, binary
+  files, exclusive create, live changes and explicit remount after restart;
+  release images publish an SBOM and provenance.
+
+### Fixed
+
+- Constrain the optional Daytona SDK to its compatible 0.x API line. Unbounded
+  resolution selected SDK 2.x, which removes the root exports used by the existing
+  workspace adapter and breaks fresh installations.
+
 ## [0.2.39] - 2026-10-30
 
 ### Fixed

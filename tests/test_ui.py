@@ -112,6 +112,7 @@ class TestOperatorGuidance:
             "tenant",
             "reuse",
             "attach",
+            "filesystem_binding",
         }
         assert "{ runtime: el.newRuntime.value }" in PAGE
         assert "body.session_id = id" in PAGE
@@ -120,6 +121,9 @@ class TestOperatorGuidance:
         # Deliberately not offered: `attach` is for a client continuing its own
         # earlier work, and someone opening a session by hand wants one either way.
         assert "body.attach" not in PAGE
+        # Binding credentials are minted by the application gateway, never pasted
+        # into the operator dashboard's general-purpose session creation form.
+        assert "body.filesystem_binding" not in PAGE
 
     def test_no_ceiling_is_offered_as_a_request_field(self):
         """A client naming its own memory would be a host takeover by another route."""

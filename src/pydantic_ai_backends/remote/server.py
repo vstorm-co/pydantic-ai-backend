@@ -62,7 +62,9 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
-from fastapi.responses import HTMLResponse, Response
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from pydantic_ai_backends._limits import MAX_RUN_OUTPUT_BYTES
 from pydantic_ai_backends.backends.docker._image import buildkit_available
@@ -76,6 +78,12 @@ from pydantic_ai_backends.backends.docker.session import (
 from pydantic_ai_backends.protocol import CommandRunner, SandboxUnavailableError
 from pydantic_ai_backends.remote import _hostfs as hostfs
 from pydantic_ai_backends.remote import wire
+from pydantic_ai_backends.remote._filesystem import (
+    MOUNT_PATH,
+    STATE_DIRECTORY,
+    FilesystemMountBroker,
+    FilesystemMountError,
+)
 from pydantic_ai_backends.remote._workspace import (
     WorkspacePathError,
     list_workspace,
@@ -521,6 +529,9 @@ class SandboxdConfig:
     max_running_commands: int = 256
     native_files: bool = True
     ui_enabled: bool = False
+    # Both operator-owned settings enable the optional additional /project mount.
+    filesystem_gateway_url: str | None = None
+    filesystem_export_image: str | None = None
     policy_overrides: str | None = None
     """JSON file holding a `PolicyUpdate`, re-read while the service runs.
 
@@ -531,6 +542,22 @@ class SandboxdConfig:
     """
 
     def __post_init__(self) -> None:
+        if bool(self.filesystem_gateway_url) != bool(self.filesystem_export_image):
+            raise ValueError(
+                "filesystem_gateway_url and filesystem_export_image must be configured together"
+            )
+        if self.filesystem_gateway_url and not self.persist_containers:
+            raise ValueError(
+                "Live filesystem mounts require persist_containers to preserve stopped sessions"
+            )
+        if self.filesystem_gateway_url and self.workspace_root is None:
+            raise ValueError(
+                "Live filesystem mounts require workspace_root for durable binding metadata"
+            )
+        if self.filesystem_gateway_url and (
+            self.work_dir == MOUNT_PATH or self.work_dir.startswith(f"{MOUNT_PATH}/")
+        ):
+            raise ValueError("The agent work_dir must be outside the additional /project mount")
         if not self.token:
             raise ValueError("SandboxdConfig.token must not be empty")
         if not self.runtimes:
@@ -892,7 +919,12 @@ def _session_runtime(config: SandboxdConfig, runtime: SandboxRuntime) -> Runtime
     return built.model_copy(update=overrides)
 
 
-def _default_builder(config: SandboxdConfig, *, reattach_only: bool = False) -> SandboxBuilder:
+def _default_builder(
+    config: SandboxdConfig,
+    *,
+    reattach_only: bool = False,
+    filesystem_volume: Callable[[str], str | None] | None = None,
+) -> SandboxBuilder:
     """Build the Docker-backed sandbox factory described by `config`.
 
     With `reattach_only` the sandboxes it builds start the session's persisted
@@ -902,12 +934,17 @@ def _default_builder(config: SandboxdConfig, *, reattach_only: bool = False) -> 
     def build(session_id: str, runtime: SandboxRuntime) -> Any:
         from pydantic_ai_backends.backends.docker.sandbox import DockerSandbox
 
+        volumes = _session_volumes(config, session_id)
+        if filesystem_volume is not None:
+            volume = filesystem_volume(session_id)
+            if volume is not None:
+                volumes = {**(volumes or {}), volume: MOUNT_PATH}
         return DockerSandbox(
             runtime=_session_runtime(config, runtime),
             image=runtime.image or "",
             session_id=session_id,
             work_dir=config.work_dir,
-            volumes=_session_volumes(config, session_id),
+            volumes=volumes,
             container_name=_container_name(config, session_id),
             idle_timeout=config.idle_timeout,
             tmpfs={"/tmp": f"size={config.tmpfs_size}"} if config.tmpfs_size else None,
@@ -1080,7 +1117,7 @@ def sweep_workspaces(config: SandboxdConfig, keep: Iterable[str], now: float) ->
     live = set(keep)
     swept: list[str] = []
     for entry in sorted(root.iterdir()):
-        if entry.name in live:
+        if entry.name in live or entry.name == STATE_DIRECTORY:
             continue
         try:
             # One stat rather than `is_dir()` followed by `stat()`. The two leave
@@ -1238,7 +1275,9 @@ class _Service:
         prewarm: Callable[[], None] | None = None,
         docker_client: Callable[[], Any] | None = None,
         reattach_sandbox: SandboxBuilder | None = None,
+        filesystem_mounts: FilesystemMountBroker | None = None,
     ) -> None:
+        self.filesystem_mounts = filesystem_mounts
         self.config = config
         self._build_sandbox = build_sandbox
         # Heals a session whose files live only in its persisted container: a
@@ -1413,12 +1452,14 @@ class _Service:
         now = time.time()
         # Hibernated sessions have no sandbox in the manager, and their
         # workspace is the only reason they are worth waking.
-        keep = self._sessions.keys() | self.manager.sessions.keys()
+        keep = self._sessions.keys() | self.manager.sessions.keys() | self._pending.keys()
         swept = sweep_workspaces(self.config, keep, now)
         if swept:
             _logger.info("Swept %d unused workspace(s)", len(swept))
         if self._docker_client is not None:
             sweep_containers(self.config, self._docker_client(), now)
+        if self.filesystem_mounts is not None:
+            self.filesystem_mounts.sweep(set(keep))
 
     async def shutdown(self) -> None:
         """Stop every sandbox and release the worker pool."""
@@ -1428,6 +1469,8 @@ class _Service:
         self._sweep_task = None
         self._prewarm_task = None
         await self.manager.shutdown()
+        if self.filesystem_mounts is not None:
+            await self._in_thread(functools.partial(self.filesystem_mounts.sweep, set()))
         self._sessions.clear()
         self._pending.clear()
         self._usage_cache.clear()
@@ -1488,6 +1531,11 @@ class _Service:
                 backpressure rather than an error: the work is still there, and
                 the caller is being asked to come back.
         """
+        if self.filesystem_mounts is not None:
+            try:
+                await self._in_thread(functools.partial(self.filesystem_mounts.check, session_id))
+            except FilesystemMountError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from None
         resident = self.manager.sessions.get(session_id)
         if (
             resident is not None
@@ -1729,6 +1777,8 @@ class _Service:
             tmpfs_size=config.tmpfs_size,
             prewarm=config.prewarm,
             buildkit=buildkit_available(),
+            filesystem_mounts=self.filesystem_mounts is not None,
+            filesystem_mount_path=MOUNT_PATH if self.filesystem_mounts is not None else None,
             native_files=self.native_reads,
             native_writes=self.native_writes,
             native_realpath=self.native_reads,
@@ -1812,10 +1862,17 @@ class _Service:
         if body.attach and body.session_id is None:
             raise HTTPException(status_code=400, detail="attach needs the session_id to attach to")
         session_id = body.session_id or f"s-{uuid.uuid4().hex[:16]}"
+        if body.filesystem_binding is not None and body.session_id is None:
+            raise HTTPException(
+                status_code=400, detail="A filesystem binding requires a named session"
+            )
+        if body.filesystem_binding is not None and self.filesystem_mounts is None:
+            raise HTTPException(status_code=400, detail="Live filesystem mounts are not enabled")
         open_already = self._sessions.get(session_id)
         if open_already is not None:
             if not (body.reuse or body.attach):
                 raise HTTPException(status_code=409, detail=f"Session exists: {session_id}")
+            await self._prepare_filesystem(body, session_id, existing=True)
             return await self._attach(session_id, open_already, body.runtime)
         if session_id in self._pending:
             raise HTTPException(status_code=409, detail=f"Session is opening: {session_id}")
@@ -1831,6 +1888,9 @@ class _Service:
         try:
             self._reject_tenant_at_capacity(body.tenant, session_id)
             await self.make_room()
+            await self._prepare_filesystem(
+                body, session_id, existing=self._holds_workspace(session_id)
+            )
             sandbox = await self.manager.get_or_create(session_id)
         except HTTPException:
             self._pending.pop(session_id, None)
@@ -1857,6 +1917,42 @@ class _Service:
             session=self.describe(session_id, sandbox, alive=await alive_of(sandbox)),
             token=self._sessions[session_id].token,
         )
+
+    async def _prepare_filesystem(
+        self, body: wire.CreateSessionRequest, session_id: str, *, existing: bool
+    ) -> None:
+        if self.filesystem_mounts is None:
+            return
+        uid = 0
+        if body.filesystem_binding is not None:
+            stored = self._sessions.get(session_id)
+            alias = stored.runtime if stored is not None else body.runtime
+            _, runtime = self.config.resolve_runtime(alias)
+            effective = _session_runtime(self.config, runtime)
+            if effective is not None:
+                uid = effective.run_as_uid if effective.run_as_uid is not None else 0
+            elif self.config.sandbox_uid is not None:
+                uid = self.config.sandbox_uid
+            else:
+                raise HTTPException(
+                    status_code=412,
+                    detail="A ready-made image with live files requires sandbox_uid set "
+                    "to its numeric runtime identity by the operator",
+                )
+        try:
+            await self._in_thread(
+                functools.partial(
+                    self.filesystem_mounts.prepare,
+                    session_id,
+                    body.tenant,
+                    body.filesystem_binding,
+                    existing=existing,
+                    uid=uid,
+                )
+            )
+        except FilesystemMountError as error:
+            # 409 is reserved for a concurrent open: named SDK clients retry it.
+            raise HTTPException(status_code=412, detail=str(error)) from None
 
     def _holds_workspace(self, session_id: str) -> bool:
         """Whether files from a closed session `session_id` are still on disk.
@@ -2066,6 +2162,10 @@ class _Service:
             # never fires. The records that outlive a sandbox end here instead.
             self._forget(session_id)
 
+        if self.filesystem_mounts is not None:
+            await self._in_thread(
+                functools.partial(self.filesystem_mounts.suspend, session_id, purge=purge)
+            )
         if purge:
             session_dir = _session_dir(self.config, session_id)
             if session_dir is not None:
@@ -2741,12 +2841,37 @@ def create_app(
     # Prewarming and the container sweep only make sense for the builder that
     # knows what an image is; an injected builder may have nothing to pull and no
     # daemon to ask.
+    filesystem_mounts = None
+    if config.filesystem_gateway_url is not None:
+        if sandbox_builder is not None:
+            raise ValueError("Live filesystem mounts require the default Docker builder")
+        assert config.filesystem_export_image is not None and config.workspace_root is not None
+        modes = [
+            config.network_mode,
+            *(_as_runtime(runtime).network_mode for runtime in config.runtimes.values()),
+        ]
+        if any(
+            mode == "host"
+            or (mode and (mode.startswith("container:") or mode.startswith("projectfs-")))
+            for mode in modes
+        ):
+            raise ValueError("Live filesystem mounts refuse host and control-plane network sharing")
+        filesystem_mounts = FilesystemMountBroker(
+            gateway_url=config.filesystem_gateway_url,
+            image=config.filesystem_export_image,
+            workspace_root=config.workspace_root,
+            client=_default_docker_client,
+        )
+    volume = filesystem_mounts.volume_for if filesystem_mounts is not None else None
     service = _Service(
         config,
-        sandbox_builder or _default_builder(config),
+        sandbox_builder or _default_builder(config, filesystem_volume=volume),
         prewarm=None if sandbox_builder else _default_prewarm(config),
         docker_client=None if sandbox_builder else _default_docker_client,
-        reattach_sandbox=None if sandbox_builder else _default_builder(config, reattach_only=True),
+        reattach_sandbox=None
+        if sandbox_builder
+        else _default_builder(config, reattach_only=True, filesystem_volume=volume),
+        filesystem_mounts=filesystem_mounts,
     )
 
     @asynccontextmanager
@@ -2762,6 +2887,15 @@ def create_app(
         summary="Sandbox execution service for AI agents",
         lifespan=lifespan,
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def binding_validation_error(
+        request: Request, error: RequestValidationError
+    ) -> JSONResponse:
+        if any("filesystem_binding" in item["loc"] for item in error.errors()):
+            return JSONResponse(status_code=422, content={"detail": "Invalid filesystem binding"})
+        return await request_validation_exception_handler(request, error)
+
     app.state.service = service
     _register_session_routes(app, service)
     _register_workspace_routes(app, service)

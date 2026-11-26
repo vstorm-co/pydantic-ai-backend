@@ -205,6 +205,7 @@ class SandboxdWorkspaceBackend(
         session_name: str | None = None,
         opening_timeout: float = DEFAULT_OPENING_TIMEOUT,
         on_wait: Callable[[], Awaitable[None]] | None = None,
+        filesystem_binding: wire.FilesystemBinding | None = None,
     ) -> None:
         if ref is not None and ref.provider != provider:
             raise ValueError(f"expected a {provider!r} workspace ref, got {ref.provider!r}")
@@ -212,6 +213,8 @@ class SandboxdWorkspaceBackend(
             raise ValueError(
                 f"session_name {session_name!r} is not a session id the service accepts"
             )
+        if filesystem_binding is not None and session_name is None and ref is None:
+            raise ValueError("A filesystem binding requires a named session")
         self._service_url = service_url.rstrip("/")
         self._token = token
         self._ref = ref
@@ -224,6 +227,7 @@ class SandboxdWorkspaceBackend(
         self._session_name = session_name
         self._opening_timeout = max(opening_timeout, request_timeout)
         self._on_wait = on_wait
+        self._filesystem_binding = filesystem_binding
         self._session: _Session | None = None
         self._working_dir: str | None = None
         self._lock = anyio.Lock()
@@ -249,10 +253,19 @@ class SandboxdWorkspaceBackend(
     async def _post(
         self, path: str, body: BaseModel | None, *, token: str, timeout: float
     ) -> httpx.Response:
+        payload = None if body is None else body.model_dump(mode="json")
+        if isinstance(body, wire.CreateSessionRequest) and payload is not None:
+            if body.filesystem_binding is None:
+                payload.pop("filesystem_binding", None)
+            else:
+                payload["filesystem_binding"] = {
+                    "id": str(body.filesystem_binding.id),
+                    "token": body.filesystem_binding.token.get_secret_value(),
+                }
         async with self._http() as client:
             return await client.post(
                 self._url(path),
-                json=None if body is None else body.model_dump(mode="json"),
+                json=payload,
                 headers={wire.TOKEN_HEADER: token},
                 timeout=timeout,
             )
@@ -263,6 +276,19 @@ class SandboxdWorkspaceBackend(
         The request itself gets `opening_timeout`, because the service builds a
         runtime's image inside the first open that needs it.
         """
+        if self._filesystem_binding is not None:
+            async with self._http() as client:
+                advertised = await client.get(
+                    self._url("/policy"),
+                    headers={wire.TOKEN_HEADER: self._token},
+                    timeout=self._request_timeout,
+                )
+            advertised.raise_for_status()
+            policy = wire.ServicePolicy.model_validate_json(advertised.content)
+            if not policy.filesystem_mounts or policy.filesystem_mount_path != "/project":
+                raise WorkspaceUnavailableError(
+                    "This sandbox service does not support live filesystem mounts"
+                )
         named = self._ref is None and self._session_name is not None
         request = wire.CreateSessionRequest(
             session_id=self._session_name if self._ref is None else self._ref.id,
@@ -270,6 +296,7 @@ class SandboxdWorkspaceBackend(
             tenant=self._tenant,
             reuse=named,
             attach=self._ref is not None,
+            filesystem_binding=self._filesystem_binding,
         )
         give_up = anyio.current_time() + self._opening_timeout
         response = await self._post(
@@ -633,6 +660,9 @@ class SandboxdWorkspace(AbstractCapability[object]):
     """Awaited once when opening a session takes more than a few seconds, so a caller
     can say why nothing is happening yet. A failure in it does not stop the open."""
 
+    filesystem_binding: wire.FilesystemBinding | None = field(default=None, repr=False)
+    """Application-authorized live filesystem mounted at the server's fixed `/project`."""
+
     session_name: str | None = None
     """One session for every run, named by you: opened on first use, attached after.
 
@@ -677,6 +707,7 @@ class SandboxdWorkspace(AbstractCapability[object]):
             session_name=self.session_name,
             opening_timeout=self.opening_timeout,
             on_wait=self.on_wait,
+            filesystem_binding=self.filesystem_binding,
         )
 
     def get_workspace(
