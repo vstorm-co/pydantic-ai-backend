@@ -26,12 +26,51 @@ prefix = "agenticos-rust-nfs-" + uuid.uuid4().hex[:8]
 root = Path(tempfile.mkdtemp(prefix=prefix + "-", dir=tempfile.gettempdir()))
 data = root / "data"
 data.mkdir()
+data = data.resolve()
 lease = str(uuid.uuid4())
 (data / lease).mkdir()
 (data / lease / "initial.txt").write_text("initial-live")
 verifiers = {}
 rpc_lock = threading.Lock()
 calls = []
+
+
+def local_path(value):
+    # The HTTP fixture is reachable from Docker. Keep all request paths inside
+    # its fresh synthetic directory even when exercising a malformed client.
+    base = os.path.realpath(data)
+    candidate = os.path.realpath(os.path.join(base, value))
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise OSError(errno.EACCES, "outside fixture")
+    if value != ".":
+        parts = value.split("/")
+        if parts[0] != lease or any(part in ("", ".", "..") for part in parts):
+            raise OSError(errno.EACCES, "outside lease")
+        cursor = data
+        for part in parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise OSError(errno.EACCES, "symlinks unsupported")
+    return Path(candidate)
+
+
+for invalid_path in ("../escape", "/etc/passwd", lease + "/../escape", lease + "/../../escape"):
+    try:
+        local_path(invalid_path)
+    except OSError as error:
+        assert error.errno == errno.EACCES
+    else:
+        raise AssertionError("fixture admitted an escaping path")
+link = data / lease / "escape-link"
+link.symlink_to(root.parent)
+try:
+    local_path(lease + "/escape-link/outside")
+except OSError as error:
+    assert error.errno == errno.EACCES
+else:
+    raise AssertionError("fixture followed an escaping symlink")
+finally:
+    link.unlink()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -70,10 +109,7 @@ class Handler(BaseHTTPRequestHandler):
         with rpc_lock:
             calls.append({k: v for k, v in req.items() if k != "data"})
             path = req["path"]
-            parts = path.split("/")
-            if path != "." and (parts[0] != lease or any(p in ("", "..", ".") for p in parts)):
-                raise OSError(errno.EACCES, "outside lease")
-            target = data if path == "." else data / path
+            target = local_path(path)
 
             def entry(p):
                 info = p.stat()
@@ -115,9 +151,10 @@ class Handler(BaseHTTPRequestHandler):
                 result["entry"] = entry(target)
             elif op == "rename":
                 destination = req["destination"]
-                if not destination.startswith(lease + "/"):
-                    raise OSError(errno.EACCES, "outside lease")
-                target.rename(data / destination)
+                destination_path = local_path(destination)
+                if destination_path == data:
+                    raise OSError(errno.EACCES, "cannot rename lease root")
+                target.rename(destination_path)
                 if path in verifiers:
                     verifiers[destination] = verifiers.pop(path)
             elif op == "remove":
@@ -159,7 +196,7 @@ result = {
     "reject_exclusive_verifier": os.environ.get("REJECT_EXCLUSIVE_VERIFIER") == "1",
     "prefix": prefix,
     "directory": str(root),
-    "checks": {},
+    "checks": {"path_containment": True},
     "commands": [],
 }
 
@@ -190,6 +227,16 @@ try:
             *host_args,
             "--entrypoint",
             args.exporter_entrypoint,
+            "--health-cmd",
+            args.exporter_entrypoint + " healthcheck",
+            "--health-interval",
+            "1s",
+            "--health-timeout",
+            "3s",
+            "--health-start-period",
+            "1s",
+            "--health-retries",
+            "5",
             "--network",
             network,
             "--cap-drop",
@@ -210,6 +257,7 @@ try:
         if info["State"]["Status"] == "exited":
             raise RuntimeError("exporter exited")
         time.sleep(0.3)
+    assert info["State"].get("Health", {}).get("Status") == "healthy", "NFS readiness failed"
     result["checks"]["health"] = info["State"].get("Health", {})
     ip = info["NetworkSettings"]["Networks"][network]["IPAddress"]
     result["checks"]["published_ports"] = info["NetworkSettings"]["Ports"]
