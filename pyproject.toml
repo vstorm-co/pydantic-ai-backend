@@ -46,7 +46,7 @@ daytona = [
     # and the code imports `daytona`. 0.220 is the release the session-command
     # API used here was read from. Later SDK majors remove those root exports;
     # retain compatible 0.x releases until the adapter is migrated deliberately.
-    "daytona>=0.220.0,<1",
+    "daytona>=2.3,<3",
 ]
 docker = [
     "docker>=7.0",
