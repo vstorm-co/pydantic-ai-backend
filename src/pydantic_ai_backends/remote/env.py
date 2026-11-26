@@ -110,6 +110,12 @@ def config_from_env(env: Mapping[str, str]) -> SandboxdConfig:
             oci_runtime=_optional(env, "OCI_RUNTIME", defaults.oci_runtime, str),
             work_dir=_required_text(env, "WORK_DIR", defaults.work_dir),
             workspace_root=_optional(env, "WORKSPACE_ROOT", defaults.workspace_root, str),
+            filesystem_gateway_url=_optional(
+                env, "FILESYSTEM_GATEWAY_URL", defaults.filesystem_gateway_url, str
+            ),
+            filesystem_export_image=_optional(
+                env, "FILESYSTEM_EXPORT_IMAGE", defaults.filesystem_export_image, str
+            ),
             persist_containers=_flag(env, "PERSIST_CONTAINERS", defaults.persist_containers),
             prewarm=_flag(env, "PREWARM", defaults.prewarm),
             idle_timeout=_value(env, "IDLE_TIMEOUT", defaults.idle_timeout, _as_int),

@@ -10,8 +10,9 @@ arbitrary bytes, and a workspace holds real files.
 from __future__ import annotations
 
 from typing import Annotated, Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 TOKEN_HEADER = "X-Sandbox-Token"
 """Header carrying either the service token or a session's own token."""
@@ -189,6 +190,15 @@ class TreesResponse(BaseModel):
     """One per requested session, in the order requested."""
 
 
+class FilesystemBinding(BaseModel):
+    """An application-authorized filesystem; never a host path or provider URL."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    token: SecretStr = Field(min_length=1, repr=False)
+
+
 class CreateSessionRequest(BaseModel):
     """Open a sandbox session.
 
@@ -200,6 +210,7 @@ class CreateSessionRequest(BaseModel):
     """
 
     session_id: str | None = Field(default=None, pattern=SESSION_ID_PATTERN)
+    filesystem_binding: FilesystemBinding | None = Field(default=None, repr=False)
     runtime: str | None = None
     """Alias of a server-allowed runtime. `None` selects the server default."""
 
@@ -394,6 +405,10 @@ class ServicePolicy(BaseModel):
     """Whether the allowlist is pulled and built at startup rather than on demand."""
     buildkit: bool = False
     """Whether image builds use BuildKit, and so keep package caches between them."""
+    filesystem_mounts: bool = False
+    """Whether application-authorized live filesystems can be mounted on new sessions."""
+    filesystem_mount_path: Literal["/project"] | None = None
+    """Fixed mount location; absent on services without this opt-in feature."""
     native_files: bool = False
     """Whether a session's file operations are served off the host, not by its sandbox.
 
