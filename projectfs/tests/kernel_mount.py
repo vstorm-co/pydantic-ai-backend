@@ -39,18 +39,15 @@ def local_path(value):
     # The HTTP fixture is reachable from Docker. Keep all request paths inside
     # its fresh synthetic directory even when exercising a malformed client.
     base = os.path.realpath(data)
-    candidate = os.path.realpath(os.path.join(base, value))
+    candidate = os.path.normpath(os.path.join(base, value))
     if candidate != base and not candidate.startswith(base + os.sep):
         raise OSError(errno.EACCES, "outside fixture")
     if value != ".":
         parts = value.split("/")
         if parts[0] != lease or any(part in ("", ".", "..") for part in parts):
             raise OSError(errno.EACCES, "outside lease")
-        cursor = data
-        for part in parts:
-            cursor = cursor / part
-            if cursor.is_symlink():
-                raise OSError(errno.EACCES, "symlinks unsupported")
+    if os.path.realpath(candidate) != candidate:
+        raise OSError(errno.EACCES, "symlinks unsupported")
     return Path(candidate)
 
 
