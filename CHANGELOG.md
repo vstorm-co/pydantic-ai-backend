@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.41] - 2026-11-27
+
+### Changed
+
+- Build the sandboxd filesystem exporter with Rust 1.100.0 and base64 0.23.1
+  ([#160](https://github.com/vstorm-co/pydantic-ai-backend/pull/160),
+  [#161](https://github.com/vstorm-co/pydantic-ai-backend/pull/161)).
+- Update Ruff to 0.17.6, the setup-uv GitHub Action to 10.4.0, and the
+  add-to-project GitHub Action to 2.0.1
+  ([#154](https://github.com/vstorm-co/pydantic-ai-backend/pull/154),
+  [#157](https://github.com/vstorm-co/pydantic-ai-backend/pull/157),
+  [#155](https://github.com/vstorm-co/pydantic-ai-backend/pull/155)).
+
 ## [0.2.40] - 2026-11-26
 
 ### Added
