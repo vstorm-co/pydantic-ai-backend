@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Update the sandboxd filesystem exporter's HTTP client to reqwest 0.13.5
+  and keep the bundled Mozilla certificate authorities for HTTPS gateway
+  verification ([#162](https://github.com/vstorm-co/pydantic-ai-backend/pull/162)).
+
 ## [0.2.41] - 2026-11-27
 
 ### Changed
