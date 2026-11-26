@@ -6,7 +6,7 @@
 # Installed as a package rather than copied into place, so what runs here is the
 # wheel users get.
 
-FROM rust:1.96.0-bookworm AS filesystem-build
+FROM rust:1.100.0-bookworm AS filesystem-build
 WORKDIR /build
 COPY projectfs/Cargo.toml projectfs/Cargo.lock ./
 COPY projectfs/src ./src
