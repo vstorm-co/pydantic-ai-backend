@@ -163,6 +163,22 @@ jobs:
       - name: Import every public name
         run: '"$RUNNER_TEMP/extras/bin/python" scripts/import_every_export.py'
 
+  filesystem-exporter:
+    name: Filesystem exporter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+      - name: Format, lint and test the locked exporter
+        working-directory: projectfs
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
   image:
     # A Dockerfile only built at release time is one that breaks at release time.
     # Single platform and no push: this answers "does it still build and start",
@@ -199,6 +215,9 @@ jobs:
           done
           curl -fsS localhost:8080/healthz
           docker rm -f sandboxd-ci
+
+      - name: The bundled exporter passes real kernel NFS operations
+        run: python3 projectfs/tests/kernel_mount.py --image sandboxd:ci --add-host-gateway
 
   docker-conformance:
     # The `docker`-marked suites run every workspace operation against a real

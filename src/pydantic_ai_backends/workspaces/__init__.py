@@ -21,6 +21,7 @@ Compose one with tools that use the workspace: this library's
 """
 
 from pydantic_ai_backends._confined import ConfinedWorkspace, WorkspacePathError
+from pydantic_ai_backends.remote.wire import FilesystemBinding
 from pydantic_ai_backends.workspaces._daytona import DaytonaWorkspace, DaytonaWorkspaceBackend
 from pydantic_ai_backends.workspaces._docker import DockerWorkspace, DockerWorkspaceBackend
 from pydantic_ai_backends.workspaces._kubernetes import (
@@ -36,6 +37,7 @@ __all__ = [
     "DaytonaWorkspaceBackend",
     "DockerWorkspace",
     "DockerWorkspaceBackend",
+    "FilesystemBinding",
     "KubernetesWorkspace",
     "KubernetesWorkspaceBackend",
     "SandboxdWorkspace",
