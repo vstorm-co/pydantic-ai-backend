@@ -1020,7 +1020,12 @@ operator's gateway. Host and control-plane network sharing are refused.
 Binding metadata contains the credential in a private mode-0600 file under
 `workspace_root/.filesystem-bindings`, outside agent workspaces; protect this
 operator directory and backups like credentials. Responses and validation
-errors do not expose it. Binding IDs and tokens cannot change on reattach.
+errors do not expose it. Binding IDs, tokens and runtime ownership cannot change on reattach. Built
+runtimes use their effective operator-selected `run_as_uid` (or root); a
+ready-made image requires the operator to set `sandbox_uid` to its numeric user
+identity. The exporter presents that identity without changing the agent's image.
+Gateway verification is serialized with broker lifecycle changes; slow gateways
+can therefore delay admission and command checks across sessions.
 
 Retained agent containers keep the same exporter alive, preserving installed
 tools and their workspace across idle stops. A missing, unhealthy or restarted

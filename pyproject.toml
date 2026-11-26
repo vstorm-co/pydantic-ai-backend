@@ -44,8 +44,9 @@ images = [
 daytona = [
     # `daytona`, not `daytona-sdk`: the latter installs the module `daytona_sdk`,
     # and the code imports `daytona`. 0.220 is the release the session-command
-    # API used here was read from.
-    "daytona>=0.220.0",
+    # API used here was read from. Later SDK majors remove those root exports;
+    # stay within the adapter's tested API line until it is migrated deliberately.
+    "daytona>=0.220.0,<0.221",
 ]
 docker = [
     "docker>=7.0",

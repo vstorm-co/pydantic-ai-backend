@@ -554,6 +554,10 @@ class SandboxdConfig:
             raise ValueError(
                 "Live filesystem mounts require workspace_root for durable binding metadata"
             )
+        if self.filesystem_gateway_url and (
+            self.work_dir == MOUNT_PATH or self.work_dir.startswith(f"{MOUNT_PATH}/")
+        ):
+            raise ValueError("The agent work_dir must be outside the additional /project mount")
         if not self.token:
             raise ValueError("SandboxdConfig.token must not be empty")
         if not self.runtimes:
@@ -1448,7 +1452,7 @@ class _Service:
         now = time.time()
         # Hibernated sessions have no sandbox in the manager, and their
         # workspace is the only reason they are worth waking.
-        keep = self._sessions.keys() | self.manager.sessions.keys()
+        keep = self._sessions.keys() | self.manager.sessions.keys() | self._pending.keys()
         swept = sweep_workspaces(self.config, keep, now)
         if swept:
             _logger.info("Swept %d unused workspace(s)", len(swept))
@@ -1919,6 +1923,22 @@ class _Service:
     ) -> None:
         if self.filesystem_mounts is None:
             return
+        uid = 0
+        if body.filesystem_binding is not None:
+            stored = self._sessions.get(session_id)
+            alias = stored.runtime if stored is not None else body.runtime
+            _, runtime = self.config.resolve_runtime(alias)
+            effective = _session_runtime(self.config, runtime)
+            if effective is not None:
+                uid = effective.run_as_uid if effective.run_as_uid is not None else 0
+            elif self.config.sandbox_uid is not None:
+                uid = self.config.sandbox_uid
+            else:
+                raise HTTPException(
+                    status_code=412,
+                    detail="A ready-made image with live files requires sandbox_uid set "
+                    "to its numeric runtime identity by the operator",
+                )
         try:
             await self._in_thread(
                 functools.partial(
@@ -1927,6 +1947,7 @@ class _Service:
                     body.tenant,
                     body.filesystem_binding,
                     existing=existing,
+                    uid=uid,
                 )
             )
         except FilesystemMountError as error:

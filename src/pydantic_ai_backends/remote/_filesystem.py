@@ -45,6 +45,7 @@ class _Record(BaseModel):
 
     session_name: str
     tenant: str
+    uid: int = Field(ge=0)
     binding: FilesystemBinding = Field(repr=False)
     gateway_url: str
     image: str
@@ -160,6 +161,11 @@ class FilesystemMountBroker:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
+            directory_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -192,6 +198,7 @@ class FilesystemMountBroker:
         binding: FilesystemBinding | None,
         *,
         existing: bool,
+        uid: int,
     ) -> None:
         """Verify before admission and establish a mount, refusing implicit migration."""
         from docker.errors import DockerException
@@ -209,6 +216,7 @@ class FilesystemMountBroker:
             record = _Record(
                 session_name=session_name,
                 tenant=tenant,
+                uid=uid,
                 binding=binding,
                 gateway_url=self.gateway_url,
                 image=self.image,
@@ -216,6 +224,7 @@ class FilesystemMountBroker:
             if stored is not None:
                 if (
                     stored.gateway_url != self.gateway_url
+                    or stored.uid != uid
                     or stored.image != self.image
                     or stored.tenant != tenant
                     or stored.binding.id != binding.id
@@ -315,6 +324,8 @@ class FilesystemMountBroker:
                 environment={
                     "PROJECTFS_RPC_URL": f"{self.gateway_url}/bindings/{record.binding.id}/fs",
                     "PROJECTFS_TOKEN": record.binding.token.get_secret_value(),
+                    "PROJECTFS_UID": str(record.uid),
+                    "PROJECTFS_GID": str(record.uid),
                 },
                 cap_drop=["ALL"],
                 security_opt=["no-new-privileges:true"],

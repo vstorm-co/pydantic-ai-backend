@@ -88,7 +88,7 @@ def binding(token=TOKEN, id=BINDING):
 
 
 def prepare(mount):
-    mount.prepare("session-one", "org-one", binding(), existing=False)
+    mount.prepare("session-one", "org-one", binding(), existing=False, uid=1000)
 
 
 def test_wire_refuses_arbitrary_mount_configuration_and_hides_tokens():
@@ -176,7 +176,7 @@ def test_prepare_mounts_only_owned_named_volume_without_agent_privileges(broker)
     assert client.containers.run.call_count == 1
 
 
-@pytest.mark.parametrize("change", ["token", "binding", "tenant", "gateway", "image"])
+@pytest.mark.parametrize("change", ["token", "binding", "tenant", "gateway", "image", "uid"])
 def test_attach_refuses_changed_identity_without_replacing_resources(broker, change):
     mount, client, _ = broker
     prepare(mount)
@@ -193,22 +193,26 @@ def test_attach_refuses_changed_identity_without_replacing_resources(broker, cha
         mount.image = "different"
     with pytest.raises(fs.FilesystemMountError, match="immutable"):
         mount.prepare(
-            "session-one", "other-org" if change == "tenant" else "org-one", selected, existing=True
+            "session-one",
+            "other-org" if change == "tenant" else "org-one",
+            selected,
+            existing=True,
+            uid=1001 if change == "uid" else 1000,
         )
     assert client.containers.run.call_count == 1
 
 
 def test_unbound_or_legacy_sessions_are_not_implicitly_migrated(broker):
     mount, client, _ = broker
-    mount.prepare("unbound", None, None, existing=True)
+    mount.prepare("unbound", None, None, existing=True, uid=1000)
     mount.check("unbound")
     with pytest.raises(fs.FilesystemMountError, match="named tenant"):
-        mount.prepare("session-one", None, binding(), existing=False)
+        mount.prepare("session-one", None, binding(), existing=False, uid=1000)
     with pytest.raises(fs.FilesystemMountError, match="no filesystem mount"):
-        mount.prepare("session-one", "org-one", binding(), existing=True)
+        mount.prepare("session-one", "org-one", binding(), existing=True, uid=1000)
     prepare(mount)
     with pytest.raises(fs.FilesystemMountError, match="requires its existing"):
-        mount.prepare("session-one", "org-one", None, existing=True)
+        mount.prepare("session-one", "org-one", None, existing=True, uid=1000)
 
 
 @pytest.mark.parametrize(
@@ -253,7 +257,7 @@ def test_idle_retained_container_keeps_same_export_and_purge_reclaims_resources(
     stores["containers"]["sandboxd-session-one"] = MagicMock()
     mount.suspend("session-one")
     helper.stop.assert_not_called()
-    mount.prepare("session-one", "org-one", binding(), existing=True)
+    mount.prepare("session-one", "org-one", binding(), existing=True, uid=1000)
     assert client.containers.run.call_count == 1
     del stores["containers"]["sandboxd-session-one"]
     mount.suspend("session-one", purge=True)
@@ -271,17 +275,18 @@ def test_restarted_broker_reattaches_only_same_helper_and_metadata(broker, monke
         client=lambda: client,
     )
     monkeypatch.setattr(restored, "_verify", lambda record: None)
-    restored.prepare("session-one", "org-one", binding(), existing=True)
+    restored.prepare("session-one", "org-one", binding(), existing=True, uid=1000)
     assert client.containers.run.call_count == 1
     assert restored.volume_for("session-one") == mount.volume_for("session-one")
 
 
 def test_gateway_proof_checks_all_identity_fields_and_does_not_leak_error_body(broker, monkeypatch):
     mount, _, _ = broker
-    del mount._verify
+    monkeypatch.setattr(mount, "_verify", fs.FilesystemMountBroker._verify.__get__(mount))
     record = fs._Record(
         session_name="session-one",
         tenant="org-one",
+        uid=1000,
         binding=binding(),
         gateway_url=mount.gateway_url,
         image=mount.image,
@@ -418,10 +423,11 @@ def test_corrupted_and_symlinked_records_are_not_followed(broker, tmp_path):
 )
 def test_gateway_transport_validation(broker, monkeypatch, reply):
     mount, _, _ = broker
-    del mount._verify
+    monkeypatch.setattr(mount, "_verify", fs.FilesystemMountBroker._verify.__get__(mount))
     record = fs._Record(
         session_name="session-one",
         tenant="org-one",
+        uid=1000,
         binding=binding(),
         gateway_url=mount.gateway_url,
         image=mount.image,
@@ -621,7 +627,13 @@ def test_enabled_service_admission_execution_and_purge_use_broker(tmp_path, monk
         closed = client.delete("/sessions/session-one?purge=true", headers=session_headers)
         assert closed.status_code == 204, closed.text
         mount.suspend.assert_called_with("session-one", purge=True)
+        unbound = client.post("/sessions", headers=headers, json={"session_id": "plain"})
+        assert unbound.status_code == 200
+        assert mount.prepare.call_args.args[2] is None
+        app.state.service._pending["opening"] = MagicMock()
         app.state.service._sweep_once()
+        assert "opening" in mount.sweep.call_args.args[0]
+        app.state.service._pending.clear()
     assert mount.sweep.called
 
 
@@ -715,3 +727,115 @@ def test_environment_enables_both_operator_owned_mount_settings(tmp_path):
     )
     assert config.filesystem_gateway_url == "https://gateway"
     assert config.filesystem_export_image == "sandboxd@sha256:abc"
+
+
+def test_binding_metadata_is_durable_before_mount_and_directory_sync_failure_refuses(
+    broker, monkeypatch
+):
+    mount, _, _ = broker
+    original = fs.os.fsync
+    synced = []
+
+    def sync(fd):
+        is_directory = stat.S_ISDIR(fs.os.fstat(fd).st_mode)
+        synced.append(is_directory)
+        if is_directory:
+            assert mount._read("session-one").binding.id == BINDING
+        original(fd)
+
+    monkeypatch.setattr(fs.os, "fsync", sync)
+    prepare(mount)
+    assert synced == [False, True, False, True]
+
+    def fail_directory(fd):
+        if stat.S_ISDIR(fs.os.fstat(fd).st_mode):
+            raise OSError("durability unavailable")
+        original(fd)
+
+    monkeypatch.setattr(fs.os, "fsync", fail_directory)
+    with pytest.raises(fs.FilesystemMountError, match="could not be prepared"):
+        prepare(mount)
+
+
+@pytest.mark.parametrize(
+    "runtime_uid,operator_uid,ready,expected",
+    [
+        (1234, None, False, 1234),
+        (1234, 2345, False, 2345),
+        (None, None, False, 0),
+        (None, 3456, True, 3456),
+        (None, None, True, None),
+    ],
+)
+def test_mount_ownership_comes_from_effective_operator_runtime(
+    tmp_path, monkeypatch, runtime_uid, operator_uid, ready, expected
+):
+    from pydantic_ai_backends.remote import server
+    from pydantic_ai_backends.types import RuntimeConfig
+    from tests.test_remote_sandbox import FakeSandbox
+
+    mount = MagicMock(spec=fs.FilesystemMountBroker)
+    monkeypatch.setattr(server, "FilesystemMountBroker", lambda **kwargs: mount)
+    monkeypatch.setattr(server, "_default_builder", lambda *args, **kwargs: FakeSandbox)
+    monkeypatch.setattr(server, "_default_prewarm", lambda config: None)
+    monkeypatch.setattr(server, "_default_docker_client", lambda: None)
+    runtime = (
+        server.SandboxRuntime(image="python:3.12-slim")
+        if ready
+        else server.SandboxRuntime(
+            runtime=RuntimeConfig(
+                name="controlled", base_image="python:3.12-slim", run_as_uid=runtime_uid
+            )
+        )
+    )
+    app = create_app(
+        SandboxdConfig(
+            token="service",
+            runtimes={"controlled": runtime},
+            sandbox_uid=operator_uid,
+            persist_containers=True,
+            workspace_root=str(tmp_path),
+            filesystem_gateway_url="https://gateway",
+            filesystem_export_image="trusted-export",
+            prewarm=False,
+        )
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/sessions",
+            headers={"X-Sandbox-Token": "service"},
+            json={
+                "session_id": "session-one",
+                "tenant": "org-one",
+                "filesystem_binding": {"id": str(BINDING), "token": TOKEN},
+            },
+        )
+        if expected is None:
+            assert response.status_code == 412
+            assert "numeric runtime identity" in response.text
+            mount.prepare.assert_not_called()
+        else:
+            assert response.status_code == 200, response.text
+            assert mount.prepare.call_args.kwargs["uid"] == expected
+
+
+def test_exporter_presents_the_admitted_runtime_identity(broker):
+    mount, client, _ = broker
+    mount.prepare("session-one", "org-one", binding(), existing=False, uid=2345)
+    environment = client.containers.run.call_args.kwargs["environment"]
+    assert environment["PROJECTFS_UID"] == "2345"
+    assert environment["PROJECTFS_GID"] == "2345"
+    assert mount._read("session-one").uid == 2345
+
+
+@pytest.mark.parametrize("work_dir", ["/project", "/project/nested"])
+def test_live_mount_cannot_replace_the_agents_own_workspace(tmp_path, work_dir):
+    with pytest.raises(ValueError, match="outside the additional"):
+        SandboxdConfig(
+            token="service",
+            work_dir=work_dir,
+            persist_containers=True,
+            workspace_root=str(tmp_path),
+            filesystem_gateway_url="https://gateway",
+            filesystem_export_image="trusted-export",
+        )

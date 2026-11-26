@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   files, exclusive create, live changes and explicit remount after restart;
   release images publish an SBOM and provenance.
 
+### Fixed
+
+- Constrain the optional Daytona SDK to its tested 0.220 API line. Unbounded
+  resolution selected SDK 2.x, which removes the root exports used by the existing
+  workspace adapter and breaks fresh installations.
+
 ## [0.2.39] - 2026-10-30
 
 ### Fixed
