@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.40] - 2026-11-26
+
 ### Added
 
 - **Opt-in live filesystems in sandboxd.** Named workspaces can carry an immutable
