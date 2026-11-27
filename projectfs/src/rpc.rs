@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use nfsembed::vfs::NfsError;
-use reqwest::{header, redirect::Policy, Client, Url};
+use reqwest::{header, redirect::Policy, Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -92,7 +92,14 @@ impl Gateway {
         auth.set_sensitive(true);
         let mut headers = header::HeaderMap::new();
         headers.insert(header::AUTHORIZATION, auth);
+        // Keep the bundled Mozilla trust store used by reqwest 0.12.
+        let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|root| Certificate::from_der(root.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "cannot initialize HTTP transport")?;
         let client = Client::builder()
+            .tls_certs_only(roots)
             .default_headers(headers)
             .redirect(Policy::none())
             .timeout(Duration::from_secs(15))
