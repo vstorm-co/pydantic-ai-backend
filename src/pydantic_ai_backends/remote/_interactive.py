@@ -171,6 +171,11 @@ class _BrowserRelay:
     async def failed(self) -> None:
         raise await self.failure
 
+    def _forget(self, identifier: int, future: asyncio.Future[None]) -> None:
+        if self.pending.get(identifier) is not future:
+            return
+        del self.pending[identifier]
+
     def _completed(self, identifier: int, task: asyncio.Task[None]) -> None:
         self.tasks.discard(task)
         self.active.pop(identifier, None)
@@ -248,12 +253,13 @@ class _BrowserRelay:
                         "Browser command timed out; outcome unknown"
                     ) from error
                 finally:
-                    if not future.done():
+                    if future.done():
+                        self._forget(identifier, future)
+                    else:
                         with suppress(EnvironmentUnavailableError):
                             registry.mark_unavailable(key)
         finally:
-            if self.pending.get(identifier) is future:
-                del self.pending[identifier]
+            self._forget(identifier, future)
             if not future.done():
                 future.cancel()
             if lease is not None:

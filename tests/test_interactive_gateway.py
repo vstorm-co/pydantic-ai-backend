@@ -1204,3 +1204,43 @@ async def test_channel_detach_deadline_is_bounded_and_logged(harness, monkeypatc
     )
     await _interactive.InteractiveGateway(harness.app.state.service)._detach(channel)
     assert "detach timed out" in caplog.text
+
+
+@pytest.mark.parametrize("send_fails", [False, True])
+async def test_already_acknowledged_input_keeps_environment_ready(harness, send_fails):
+    from pydantic_ai_backends.remote._interactive import (
+        EnvironmentStart,
+        InteractiveGateway,
+        _BrowserRelay,
+    )
+
+    service = harness.app.state.service
+    admitted = await service.open_session(wire.CreateSessionRequest(session_id="one"))
+    gateway = InteractiveGateway(service)
+    await gateway.start("one", "browser", EnvironmentStart(), admitted.token)
+    sandbox = harness.built["one"]
+    channel = Channel()
+    channel.fail_send = send_fails
+    relay = _BrowserRelay(gateway, "one", channel)
+    acknowledged = asyncio.get_running_loop().create_future()
+    acknowledged.set_result(None)
+    relay.pending[1] = acknowledged
+    try:
+        if send_fails:
+            with pytest.raises(BrowserChannelError, match="Channel lost"):
+                await relay._active(
+                    1, acknowledged, '{"id":1,"method":"Input.insertText"}', sandbox, None
+                )
+        else:
+            await relay._active(
+                1, acknowledged, '{"id":1,"method":"Input.insertText"}', sandbox, None
+            )
+        assert gateway.registry.inspect("one:browser").state == "ready"
+        assert relay.pending == {}
+        lease = gateway.registry.acquire("one:browser", "next-input")
+        gateway.registry.release("one:browser", lease.token)
+        assert len(channel.sent) == (0 if send_fails else 1)
+    finally:
+        await relay.aclose()
+        await gateway.registry.shutdown()
+        await service.shutdown()

@@ -347,8 +347,9 @@ class BrowserTab:
     async def aclose(self) -> None:
         """Detach this observer; the page remains owned by BrowserSession."""
         async with self._close_lock:
-            if not self._closed:
-                await self._owner.transport.call(
-                    "Target.detachFromTarget", {"sessionId": self._session_id}
-                )
-                self._closed = True
+            if self._closed:
+                return
+            await self._owner.transport.call(
+                "Target.detachFromTarget", {"sessionId": self._session_id}
+            )
+            self._closed = True

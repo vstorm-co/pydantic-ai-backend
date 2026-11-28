@@ -235,3 +235,14 @@ stopped its container 38.5 ms after expiry. Runtime recipes are unchanged from
 candidate04, whose cached images were reused. The candidate04 interleaved A/B
 remains the controlled comparison for the capture optimization; this repeat is
 acceptance of the final timeout/cancellation changes.
+
+## Final explicit-guard refactor smoke — candidate06
+
+After the behavior-preserving cleanup/explicit-guard changes for Python 3.10
+coverage, the installed candidate06 wheel passed all 15 native acceptance checks
+again. Its SHA-256 is
+`9da4ee7d41e5bb103884055dede9ccf62081aac345ec0ac32780551528889a3e`.
+This bounded smoke used five repetitions and skipped resource sampling and timed
+stream profiling; it makes no new performance claim. Candidate05's full 25-sample,
+production-proxy and independent-watchdog receipts remain the detailed evidence.
+See `results/candidate06-smoke.json`. No package release was published.
