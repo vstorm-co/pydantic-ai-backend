@@ -1,7 +1,8 @@
 # sandboxd
 
-`sandboxd` runs your agents' sandboxes in **another process**, so your application
-never needs Docker access. The service owns the Docker socket and rents out
+`sandboxd` runs your agents' sandboxes in **a separate service, on the same machine
+or another host**, so your application never needs Docker access. The service owns
+the Docker socket and rents out
 sandboxes over HTTP; an agent reaches one as a [workspace](workspaces.md) through
 `SandboxdWorkspace`.
 
@@ -16,6 +17,40 @@ agent = Agent("anthropic:claude-opus-5-5", capabilities=[sandbox, ConsoleCapabil
 
 The session — and the container behind it — opens on the **first operation**, so
 an agent granted a sandbox it never touches costs nothing.
+
+## Remote hosts and placement
+
+AgenticOS, or another application, can reach a remote daemon through its configured
+HTTP endpoint. Configure `SandboxdWorkspace(service_url="https://sandboxd-a.example.com",
+token=...)` in the application backend; the client does not need the remote host's
+Docker socket, container filesystem or local Docker credentials. Browser control
+also uses the daemon's authenticated WebSocket endpoint, and Desktop operations
+travel through the existing remote workspace.
+
+Keep the endpoint in deployment configuration and the service credential in the
+application's secret store or vault. Supply only the authorized session credential
+to trusted backend adapters; neither credential belongs in a browser UI. sandboxd
+serves plain HTTP by default. For a remote deployment, terminate TLS at an
+operator-managed reverse proxy or use a protected private tunnel; preserve
+WebSocket upgrades and authentication headers. TLS for this control connection
+does not replace the runtime's separate browser egress policy.
+
+Multiple daemon hosts can serve different assigned sessions. Choose a node when a
+session is created and persist that assignment alongside its tenant/session ref.
+Start, inspection, CDP, Desktop, file, sleep and purge requests for that identity
+must keep reaching its assigned owner. Adding capacity can place new sessions on
+new nodes; moving an existing session requires an explicit state transfer and
+retirement plan. This library does not implement a placement controller, global
+session registry or transparent migration of running processes.
+
+Persistent Browser profiles and Desktop HOME require one authoritative daemon for
+each storage root. Their exclusive ownership lock rejects another participating
+daemon before it can provision or stop containers. Use separate node-local roots,
+or a separately designed storage and ownership scheme, when sharding. A random
+load balancer or an active-active shared root cannot replace session placement.
+Retained state lives on the daemon's host; changing the endpoint alone does not
+move it. Public workspace archives also omit private Browser profiles and Desktop
+HOME, so they are not a complete interactive-state migration bundle.
 
 ## Why this exists
 

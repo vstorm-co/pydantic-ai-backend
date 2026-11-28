@@ -18,6 +18,15 @@ startup refuses an absent proxy. The recipe alone is not a network firewall. Use
 This client never creates a workspace: **Start** explicitly starts the browser in
 that existing session; inspection and attachment never wake a missing container.
 
+The daemon may run on a different host from AgenticOS or your application. Its
+configured HTTPS endpoint carries the HTTP and authenticated WebSocket traffic;
+the application client needs no Docker socket. Keep daemon credentials and profile
+keys in the application's vault or secret store and proxy authorized viewer
+operations through its backend. The daemon host owns the containers and retained
+profile storage. See [remote placement and ownership](concepts/remote.md#remote-hosts-and-placement)
+before routing sessions across several hosts; a random load balancer does not
+preserve a live browser or its retained state.
+
 ```python
 import os
 

@@ -18,6 +18,18 @@ finally:
 
 The selected runtime needs Xvfb, XFCE, scrot and xdotool. The built-in `desktop` runtime installs these with Firefox. Applications choose a container's tenant, CPU/RAM/PID limits, network and idle policy through their workspace provider. `DaemonDesktop` instead attaches to an operator-owned desktop with an explicit URL/token. It never follows redirects or shuts down that machine. Authorize daemon destinations before constructing it.
 
+With `SandboxdWorkspace`, the daemon and Desktop container may run on a separate
+host from AgenticOS or the application backend. Configure the daemon endpoint and
+vault-held credential in that backend; screen, input and file operations use the
+remote workspace API, without mounting Docker into the client application. Use
+TLS or a protected tunnel for the remote control connection. The daemon's
+`workspace_root` and persistent HOME are paths on that daemon host.
+
+Keep a retained session pinned to its assigned node. Additional nodes need stable
+tenant/session placement and separate storage ownership; a random load balancer
+or active-active shared root cannot restore a Desktop's state. See
+[remote placement and ownership](concepts/remote.md#remote-hosts-and-placement).
+
 Closing a desktop adapter detaches it; sandboxd/provider owns the container and workspace files. Restarting an application client can attach to the same exact live workspace, preserving open windows. Stopping or hibernating its container does not promise preservation of unsaved GUI state. A retained workspace ref must not silently stand in for a fresh desktop when the original is lost.
 
 `DesktopWorkspace` is the small consumer contract for native screen operations, compatible with Pydantic AI Workspace. An application adapter translates provider-specific workspace failures into `SandboxUnavailableError`. Screenshots up to 512 KiB return in one workspace command without a temporary file. Larger screenshots transfer the same captured frame through a private temporary file with bounded shielded cleanup, including cancellation. Captures are capped at 32 MiB. `Capture` reports source dimensions; `to_native` maps a selected screenshot coordinate back to that source.
@@ -39,6 +51,13 @@ or a directory beneath `/home`, without traversal or overlapping workspace mount
 HOME programs and configuration can survive replacement; system-wide `apt`
 changes require retained containers or an updated image. Unsaved windows, RAM and
 running processes are not snapshots and must be reopened after sleep.
+
+Enabling this setting does not add a HOME mount to containers that already exist.
+Before recreating an affected retained container, preserve its existing HOME and
+migrate those files into the configured private HOME storage. Then explicitly
+recreate the container with the new mount and verify its files and settings.
+Restarting sandboxd alone reattaches the old container and does not change its
+mounts. Keep the old data until the migration has been verified.
 
 Keep the same authorized tenant/session identity to resume retained files.
 Applications decide conversation/user/project scope, just as for sandbox

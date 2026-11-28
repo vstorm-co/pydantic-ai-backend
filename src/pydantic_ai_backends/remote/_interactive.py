@@ -217,7 +217,7 @@ class _BrowserRelay:
         self.gateway = gateway
         self.session_id = session_id
         self.channel = channel
-        self.pending: dict[int, asyncio.Future[None]] = {}
+        self.pending: dict[int, asyncio.Future[bool]] = {}
         self.tasks: set[asyncio.Task[None]] = set()
         self.active: dict[int, asyncio.Task[None]] = {}
         self.failure: asyncio.Future[BaseException] = asyncio.get_running_loop().create_future()
@@ -226,7 +226,7 @@ class _BrowserRelay:
     async def failed(self) -> None:
         raise await self.failure
 
-    def _forget(self, identifier: int, future: asyncio.Future[None]) -> None:
+    def _forget(self, identifier: int, future: asyncio.Future[bool]) -> None:
         if self.pending.get(identifier) is not future:
             return
         del self.pending[identifier]
@@ -244,7 +244,7 @@ class _BrowserRelay:
         if isinstance(identifier, int) and not isinstance(identifier, bool):
             future = self.pending.pop(identifier, None)
             if future is not None:
-                future.set_result(None)
+                future.set_result("error" not in payload)
                 active = self.active.get(identifier)
                 if active is not None:
                     # A caller may send its next input immediately on receipt.
@@ -268,7 +268,7 @@ class _BrowserRelay:
             or len(self.pending) >= MAX_PENDING_COMMANDS
         ):
             raise BrowserChannelError("Browser command identity repeated or pending limit reached")
-        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self.pending[identifier] = future
         message = json.dumps(payload)
         if active:
@@ -284,7 +284,7 @@ class _BrowserRelay:
     async def _active(
         self,
         identifier: int,
-        future: asyncio.Future[None],
+        future: asyncio.Future[bool],
         message: str,
         sandbox: object,
         control: str | None,
@@ -293,7 +293,9 @@ class _BrowserRelay:
         key = _key(self.session_id, "browser")
         lease = registry.acquire(key, self.owner) if control is None else None
         try:
-            with self.gateway.service.observe(self.session_id, "browser-input", "browser"):
+            with self.gateway.service.observe(
+                self.session_id, "browser-input", "browser"
+            ) as outcome:
                 async with registry.use(
                     key, token=control if lease is None else lease.token, activity=True
                 ):
@@ -301,7 +303,9 @@ class _BrowserRelay:
                         sandbox.touch()
                     try:
                         await self.channel.send(message)
-                        await asyncio.wait_for(asyncio.shield(future), CDP_COMMAND_SECONDS)
+                        outcome.ok = await asyncio.wait_for(
+                            asyncio.shield(future), CDP_COMMAND_SECONDS
+                        )
                     except asyncio.TimeoutError as error:
                         # The command may already be running. Block further input
                         # until bounded recovery/retirement instead of replaying it.
@@ -577,6 +581,8 @@ class InteractiveGateway:
                 raise
             resource.reserved = True
             self.service._inflight[session_id] += 1
+        if isinstance(sandbox, ActiveSandbox):
+            sandbox.touch()
         resource.owner = self
         self.resources[session_id] = resource
         return resource
@@ -586,8 +592,10 @@ class InteractiveGateway:
     ) -> EnvironmentSnapshot:
         self.authorize(session_id, token)
         async with self._mutation(session_id):
-            with self.service.observe(session_id, "environment-start", kind):
-                return await self._start(session_id, kind, body)
+            with self.service.observe(session_id, "environment-start", kind) as outcome:
+                snapshot = await self._start(session_id, kind, body)
+                outcome.ok = True
+                return snapshot
 
     async def _start(
         self, session_id: str, kind: Kind, body: EnvironmentStart

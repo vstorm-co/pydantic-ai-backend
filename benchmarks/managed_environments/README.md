@@ -288,3 +288,26 @@ and the independent watchdog remains runnable, then kills its own service. This
 simulates the process state of an interrupted checkpoint; it does not claim that
 a real periodic archive operation overlapped the kill. Candidate09's container
 stopped within the recorded 0.25-second deadline-observation tolerance.
+
+## Final combined persistence acceptance — candidate14
+
+Installed local wheel SHA-256
+`6d3831ce9e7f283870c18261d9480ae56f1f171a7226bd9e1cf6e8c5b5940eff`
+passed all **ten** combined persistence/ownership checks with a three-second
+sandbox idle timeout. Both persistent and session-only HTTPS cookies, localStorage
+and IndexedDB survived actual container replacement; immediate logout remained
+logged out. Desktop HOME/config/workspace files survived idle and replacement.
+The caller owns a pooled HTTP client for Desktop operations, keeping connection
+setup outside the short idle budget. A dormant session token may expire; orphan
+profile purge deliberately uses the trusted application credential and starts no
+runtime. This is distinct from silently renewing a stale live session.
+
+The service exited with code **0 in 0.614 seconds**. Metadata-only tracing found no
+active channels/sandboxes or remaining native reader frames at thread shutdown.
+The receipt is `results/candidate14-persistence-acceptance.json`. Earlier failed
+receipts remain as evidence of the tmpfs, flush and cancellation defects the
+iterations found. The normal 25-sample performance results remain separate;
+this functional run makes no new latency or production-capacity claim.
+
+The local preview was then upgraded to this wheel without publishing it. Existing
+private profile ciphertext, Vault data and subscription accounts were retained.

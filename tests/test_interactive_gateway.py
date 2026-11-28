@@ -1231,7 +1231,7 @@ async def test_already_acknowledged_input_keeps_environment_ready(harness, send_
     channel.fail_send = send_fails
     relay = _BrowserRelay(gateway, "one", channel)
     acknowledged = asyncio.get_running_loop().create_future()
-    acknowledged.set_result(None)
+    acknowledged.set_result(True)
     relay.pending[1] = acknowledged
     try:
         if send_fails:
@@ -1252,3 +1252,61 @@ async def test_already_acknowledged_input_keeps_environment_ready(harness, send_
         await relay.aclose()
         await gateway.registry.shutdown()
         await service.shutdown()
+
+
+def test_new_desktop_idle_budget_starts_after_gui_ready(client, harness, monkeypatch):
+    import time
+
+    headers = opened(client, runtime="desktop")
+    sandbox = harness.built["one"]
+    original_run = sandbox.run_command
+
+    async def slow_start(argv, **kwargs):
+        result = await original_run(argv, **kwargs)
+        sandbox._last_activity = time.time() - 100
+        return result
+
+    def touch():
+        sandbox.touched += 1
+        sandbox._last_activity = time.time()
+
+    monkeypatch.setattr(sandbox, "run_command", slow_start)
+    monkeypatch.setattr(sandbox, "touch", touch)
+    assert start(client, headers, "desktop").status_code == 200
+    assert client.portal.call(harness.app.state.service.manager.cleanup_idle, 3) == 0
+    assert sandbox.stopped == 0
+    touches = sandbox.touched
+    # Repeating Start is inspection of the exact live environment, not activity.
+    assert start(client, headers, "desktop").status_code == 200
+    assert sandbox.touched == touches
+    assert harness.app.state.service.events("one", 0).events[-1].ok
+
+
+@pytest.mark.parametrize("cdp_error", [False, True])
+def test_input_audit_records_acknowledged_cdp_outcome(client, harness, monkeypatch, cdp_error):
+    headers = opened(client)
+    assert start(client, headers).status_code == 200
+    channel = Channel()
+
+    async def respond(message):
+        request = json.loads(message)
+        response = (
+            {"id": request["id"], "error": {"code": -32000, "message": "refused"}}
+            if cdp_error
+            else {"id": request["id"], "result": {}}
+        )
+        await channel.replies.put(json.dumps(response))
+
+    async def connect():
+        return channel
+
+    monkeypatch.setattr(channel, "send", respond)
+    monkeypatch.setattr(harness.built["one"], "open_browser_channel", connect)
+    with client.websocket_connect("/sessions/one/browser/cdp", headers=headers) as ws:
+        ws.send_json({"id": 1, "method": "Input.insertText", "params": {"text": "test"}})
+        assert ("error" in ws.receive_json()) is cdp_error
+        ws.close()
+        assert ws.receive()["type"] == "websocket.close"
+    events = harness.app.state.service.events("one", 0).events
+    assert events[0].op == "environment-start" and events[0].ok
+    assert events[-1].op == "browser-input" and events[-1].ok is not cdp_error

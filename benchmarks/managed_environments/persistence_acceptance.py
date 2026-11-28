@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from contextlib import closing, suppress
 from pathlib import Path
 from uuid import uuid4
@@ -331,11 +332,18 @@ class Acceptance:
         )
         await self.profile_failures(api, key, sid)
         await self.scope_isolation(api, key, sid)
-        await api.purge()
+        # A dormant per-session token may expire; deletion is a trusted application action.
+        with closing(docker.from_env()) as client:
+            assert not client.containers.list(filters={"name": "sandboxd-" + sid})
+        await SandboxdBrowser(self.base, sid, self.token).purge()
+        with closing(docker.from_env()) as client:
+            assert not client.containers.list(filters={"name": "sandboxd-" + sid})
         assert not (
             self.folder / "service" / "workspaces" / sid / "private" / "browser-profile.enc"
         ).exists()
-        self.checks.append("Explicit profile purge succeeds after suspend")
+        self.checks.append(
+            "Trusted orphan-profile purge succeeds after suspend without booting a runtime"
+        )
 
     async def profile_failures(self, api: SandboxdBrowser, key: str, sid: str) -> None:
         encrypted = self.folder / "service" / "workspaces" / sid / "private" / "browser-profile.enc"
@@ -410,22 +418,26 @@ class Acceptance:
         )
 
     async def desktop_home(self) -> None:
+        async with httpx.AsyncClient(base_url=self.base, timeout=60) as client:
+            await self._desktop_home(client)
+
+    async def _desktop_home(self, http: httpx.AsyncClient) -> None:
         session = await self.create("desktop", runtime="desktop")
         sid = session.session.session_id
         route = "/sessions/" + sid + "/environments/desktop"
         headers = {"X-Sandbox-Token": session.token}
-        async with httpx.AsyncClient(base_url=self.base, timeout=60) as client:
-            response = await client.post(
-                route,
-                headers=headers,
-                json={"width": 1024, "height": 768, "idle_seconds": 3, "lifetime_seconds": 60},
-            )
-            response.raise_for_status()
+        response = await http.post(
+            route,
+            headers=headers,
+            json={"width": 1024, "height": 768, "idle_seconds": 3, "lifetime_seconds": 60},
+        )
+        response.raise_for_status()
         capability = SandboxdWorkspace(
             service_url=self.base,
             token=self.token,
             runtime="desktop",
             tenant=self.prefix + "-desktop",
+            client=http,
         )
         workspace = Workspace(capability.backend(WorkspaceRef(provider="sandboxd", id=sid)))
         desktop = await open_sandbox_desktop(workspace, width=1024, height=768)
@@ -455,26 +467,25 @@ class Acceptance:
             assert old.status != "running", "Desktop idle did not stop its exact container"
         self.remove_own_container(sid)
         # Plain idle may retire Desktop auth; only the trusted application can reopen files.
-        async with httpx.AsyncClient(base_url=self.base, timeout=60) as client:
-            opened = await client.post(
-                "/sessions",
-                headers={"X-Sandbox-Token": self.token},
-                json={
-                    "session_id": sid,
-                    "runtime": "desktop",
-                    "attach": True,
-                    "tenant": self.prefix + "-desktop",
-                },
-            )
-            opened.raise_for_status()
-            fresh_session = SessionCreated.model_validate_json(opened.content)
-            headers = {"X-Sandbox-Token": fresh_session.token}
-            resumed = await client.post(
-                route,
-                headers=headers,
-                json={"width": 1024, "height": 768, "idle_seconds": 30, "lifetime_seconds": 60},
-            )
-            resumed.raise_for_status()
+        opened = await http.post(
+            "/sessions",
+            headers={"X-Sandbox-Token": self.token},
+            json={
+                "session_id": sid,
+                "runtime": "desktop",
+                "attach": True,
+                "tenant": self.prefix + "-desktop",
+            },
+        )
+        opened.raise_for_status()
+        fresh_session = SessionCreated.model_validate_json(opened.content)
+        headers = {"X-Sandbox-Token": fresh_session.token}
+        resumed = await http.post(
+            route,
+            headers=headers,
+            json={"width": 1024, "height": 768, "idle_seconds": 30, "lifetime_seconds": 60},
+        )
+        resumed.raise_for_status()
         with closing(docker.from_env()) as client:
             assert client.containers.get("sandboxd-" + sid).id != old_id
         fresh = Workspace(capability.backend(WorkspaceRef(provider="sandboxd", id=sid)))
@@ -503,6 +514,7 @@ class Acceptance:
             except Exception as error:
                 errors.append("detach: " + type(error).__name__)
         if self.process is not None and self.process.returncode is None:
+            shutdown_started = time.monotonic()
             self.process.send_signal(signal.SIGINT)
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=15)
@@ -513,6 +525,8 @@ class Acceptance:
                 self.process.kill()
                 await self.process.wait()
                 errors.append("Own service required forced shutdown")
+            self.report["service_shutdown_seconds"] = time.monotonic() - shutdown_started
+            self.report["service_exit_code"] = self.process.returncode
         with closing(docker.from_env()) as client:
             for sid in self.sessions:
                 try:
