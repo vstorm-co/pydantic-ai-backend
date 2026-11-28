@@ -218,3 +218,20 @@ The separate candidate04 production-Squid acceptance also passed: public HTTPS,
 three private/loopback denials and transport reconnect under the same policy hash.
 See `results/candidate04-proxy-acceptance.json`; all of its own containers and
 network were removed after the test.
+
+## Candidate05 compatibility follow-up
+
+Candidate05 fixes Python 3.10 timeout classification and replaces the client's
+`asyncio.wait_for` send/response pair with one AnyIO deadline, preserving caller
+cancellation on older interpreters. Gateway and transport regressions passed on
+actual Python 3.10 and 3.11 (75 tests each). This wheel has SHA-256
+`d0f55286f398ae3cc721f3bb0bdb4c587ffb0462f7150f99ea5f29ea5f0901ef`.
+
+All 15 installed-wheel acceptance checks passed again with 25 latency samples,
+along with separate production-proxy and supervisor-SIGKILL acceptance. Browser
+capture median/p95 was 34.77/52.98 ms; pooled Desktop capture was 70.77/82.30 ms,
+with 25 RPCs for 25 captures. The unchanged original Browser watchdog deadline
+stopped its container 38.5 ms after expiry. Runtime recipes are unchanged from
+candidate04, whose cached images were reused. The candidate04 interleaved A/B
+remains the controlled comparison for the capture optimization; this repeat is
+acceptance of the final timeout/cancellation changes.
