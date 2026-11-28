@@ -1,0 +1,44 @@
+{
+  "model_calls": 0,
+  "synthetic": true,
+  "wheel": "pydantic_ai_backend-0.2.42-py3-none-any.whl",
+  "wheel_sha256": "cd646a404796e64eb19b41194a7e668205e788c20ad821d6cb37281b66d912ad",
+  "squid_config_source": "AgenticOS/docker/browser-egress/squid.conf",
+  "squid_config_sha256": "5465b28ead6d3c3d3521398fd40718321f26275aa5d2edbcfd3c6aaedabbc82f",
+  "checks": [
+    "Browser attached only to an internal bridge; no published debugger port",
+    "Public HTTPS page loads through the production Squid policy",
+    "Metadata, browser loopback debugger and private proxy address cannot bypass the independent egress policy",
+    "Independent proxy policy remains when the application transport detaches/reconnects"
+  ],
+  "public_loads": [
+    {
+      "url": "https://example.com/",
+      "outcome": "passed",
+      "elapsed_ms": 368.8245840021409
+    }
+  ],
+  "private_denials": [
+    {
+      "url": "http://169.254.169.254/latest/meta-data/",
+      "outcome": "proxy_access_denied"
+    },
+    {
+      "url": "http://127.0.0.1:9222/json/version",
+      "outcome": "proxy_access_denied"
+    },
+    {
+      "url": "http://qa-proxy:3128/",
+      "outcome": "proxy_access_denied"
+    }
+  ],
+  "daemon": {
+    "Architecture": "aarch64",
+    "NCPU": 10,
+    "MemTotal": 8321970176,
+    "ServerVersion": "29.2.1"
+  },
+  "proxy_image_id": "sha256:d9c34c5ab74c6dd41cf1070d9b4221aac072e67e983527ca2d41512958f77506",
+  "status": "passed",
+  "cleanup_errors": []
+}

@@ -1,0 +1,40 @@
+{
+  "wheel_sha256": "3f2d917e644dde88a39d904fa216e422018c1c4016bc1473e85f8424d10017a9",
+  "scope": "Real local HTTPS fixture; persistent login, localStorage, IndexedDB and HOME",
+  "model_calls": 0,
+  "checks": [
+    "Local HTTPS fixture validates persistent and session-only HttpOnly Secure cookies; localStorage and IndexedDB transaction commit in a secure context",
+    "Persistent and session-only Secure HttpOnly login cookies, localStorage and committed IndexedDB survive suspend and forced container recreation; live generation identity changes",
+    "Logout remains effective after resume; ordinary End retains saved profile",
+    "Wrong profile key refuses resume and leaves encrypted state unchanged",
+    "Corrupt encrypted state refuses resume without silent fresh-profile fallback",
+    "Concurrent starts/viewers share one live profile writer/generation",
+    "Different tenant/session has no auth/localStorage/IndexedDB even with the same key; cross-session token and tenant rebinding are refused",
+    "Explicit profile purge succeeds after suspend",
+    "Desktop HOME saved file, ~/.config setting and /workspace file survive idle and forced container recreation; unsaved process memory is not claimed"
+  ],
+  "fixture_proxy": "Only CONNECT fixture.internal:4443; no outbound network",
+  "certificate_policy": "Test-only certificate bypass on isolated disposable Browser",
+  "status": "partial acceptance; fast logout and orderly service cleanup require fixes",
+  "cleanup_errors": [
+    "Own service required forced shutdown"
+  ],
+  "cases": [
+    {
+      "case": "Original fast logout -> suspend -> forced recreation",
+      "outcome": "failed",
+      "observed": "Authenticated state returned after resume, despite awaited logout fetch"
+    },
+    {
+      "case": "Debug with extra /whoami immediately after logout",
+      "outcome": "nine functional checks passed",
+      "observed": "Both persistent and session cookies false immediately after logout and after resume",
+      "limitation": "Extra observation changes timing, so this does not establish race-free logout"
+    },
+    {
+      "case": "Orderly service cleanup",
+      "outcome": "failed",
+      "observed": "Own service exceeded15second SIGINT bound; explicitly killed and all own Docker resources removed"
+    }
+  ]
+}

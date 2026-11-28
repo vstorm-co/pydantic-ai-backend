@@ -574,3 +574,40 @@ class TestUnprivilegedRuntimes:
 
         with pytest.raises(ValueError, match="positive uid"):
             unprivileged_instructions(uid)
+
+
+@pytest.mark.parametrize("manager", ["pip", "npm", "apt", "cargo"])
+def test_package_specifiers_are_one_literal_shell_argument(manager):
+    import shlex
+
+    from pydantic_ai_backends.backends.docker._image import install_instructions
+
+    package = "websocket-client>=1.8.0"
+    runtime = RuntimeConfig(
+        name="quoted", base_image="python:3.12-slim", packages=[package], package_manager=manager
+    )
+    instructions = install_instructions(runtime)
+    assert shlex.split(instructions[-1])[-1] == package
+    assert "'websocket-client>=1.8.0'" in instructions[-1]
+
+
+def test_affected_old_unquoted_image_is_not_reused():
+    import hashlib
+
+    runtime = RuntimeConfig(
+        name="quoted", base_image="python:3.12-slim", packages=["websocket-client>=1.8.0"]
+    )
+    old_digest = hashlib.md5(runtime.model_dump_json().encode(), usedforsecurity=False).hexdigest()[
+        :12
+    ]
+    assert image_tag_for(runtime) != f"pydantic-ai-backend-runtime:quoted-{old_digest}"
+
+
+def test_unaffected_image_cache_identity_stays_compatible():
+    import hashlib
+
+    runtime = RuntimeConfig(name="plain", base_image="python:3.12-slim", packages=["numpy"])
+    old_digest = hashlib.md5(runtime.model_dump_json().encode(), usedforsecurity=False).hexdigest()[
+        :12
+    ]
+    assert image_tag_for(runtime) == f"pydantic-ai-backend-runtime:plain-{old_digest}"

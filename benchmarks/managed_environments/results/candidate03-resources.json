@@ -1,0 +1,60 @@
+{
+  "browser_idle": {
+    "samples": 3,
+    "working_set_mib_median": 293.6,
+    "working_set_mib_max": 293.9,
+    "cpu_onecore_percent_median": 1.49,
+    "cpu_onecore_percent_max": 2.1,
+    "pids_max": 174,
+    "server_cpu_onecore_percent": 0.25,
+    "server_rss_mib_max": 61.6
+  },
+  "browser_live_1fps": {
+    "samples": 3,
+    "working_set_mib_median": 287.0,
+    "working_set_mib_max": 287.0,
+    "cpu_onecore_percent_median": 3.11,
+    "cpu_onecore_percent_max": 4.25,
+    "pids_max": 174,
+    "requested_fps": 1,
+    "achieved_fps": 1.0,
+    "server_cpu_onecore_percent": 0.25,
+    "server_rss_mib_max": 58.2
+  },
+  "browser_live_10fps": {
+    "samples": 3,
+    "working_set_mib_median": 292.0,
+    "working_set_mib_max": 292.1,
+    "cpu_onecore_percent_median": 24.25,
+    "cpu_onecore_percent_max": 27.96,
+    "pids_max": 173,
+    "requested_fps": 10,
+    "achieved_fps": 9.9,
+    "server_cpu_onecore_percent": 2.49,
+    "server_rss_mib_max": 39.6
+  },
+  "desktop_live_1fps": {
+    "samples": 3,
+    "working_set_mib_median": 101.3,
+    "working_set_mib_max": 101.4,
+    "cpu_onecore_percent_median": 7.05,
+    "cpu_onecore_percent_max": 7.42,
+    "pids_max": 58,
+    "requested_fps": 1,
+    "achieved_fps": 1.0,
+    "server_cpu_onecore_percent": 2.73,
+    "server_rss_mib_max": 55.0
+  },
+  "desktop_live_5fps": {
+    "samples": 3,
+    "working_set_mib_median": 101.5,
+    "working_set_mib_max": 102.7,
+    "cpu_onecore_percent_median": 17.18,
+    "cpu_onecore_percent_max": 17.52,
+    "pids_max": 57,
+    "requested_fps": 5,
+    "achieved_fps": 3.12,
+    "server_cpu_onecore_percent": 6.74,
+    "server_rss_mib_max": 47.8
+  }
+}

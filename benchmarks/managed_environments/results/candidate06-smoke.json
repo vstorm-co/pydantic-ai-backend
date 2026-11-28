@@ -1,0 +1,37 @@
+{
+  "wheel": "pydantic_ai_backend-0.2.42-py3-none-any.whl",
+  "wheel_sha256": "9da4ee7d41e5bb103884055dede9ccf62081aac345ec0ac32780551528889a3e",
+  "status": "passed",
+  "scope": "Final behavior-preserving cleanup/explicit-guard refactor smoke; installed wheel, real Docker Browser/Desktop, no model calls",
+  "sample_count": 5,
+  "profiling": "Resource sampler and timed streaming phases skipped; timings intentionally omitted. Candidate05 retains full 25-sample, proxy and independent watchdog evidence.",
+  "limits": {
+    "max_simultaneous_containers": 2,
+    "cpus_per_container": 1,
+    "memory_per_container": "1g",
+    "network": "none"
+  },
+  "checks": [
+    "Browser exact DOM, unsaved form and JS counter retained after original client disconnect and fresh process reconnect",
+    "Passive zero-view wait and state inspection do not renew Browser idle deadline",
+    "Repeated passive screenshots do not renew Browser idle deadline",
+    "Actual physical input renews Browser idle deadline",
+    "Real Chromium Enter submits the controlled form",
+    "Repeated reconnect leaves exactly one live bridge, without abandoned per-viewer processes",
+    "Two tenants have separate containers/context state; wrong token and foreign target attachment refused",
+    "Actual Docker limits verified: 1CPU/1GiB, networknone and no published ports per session",
+    "Independent network isolation rejects metadata/private and public egress with unreachable mandatory proxy",
+    "Killed exact Browser refuses inspect; no replacement or wake occurs",
+    "Idle deadline revokes passive access, then sweep stops only its container within bounded cleanup window",
+    "Hard lifetime revokes passive access, then sweep stops only its container within bounded cleanup window",
+    "Desktop real terminal retains unsent command across adapter detach; Enter executes it after exact reattach",
+    "Repeated Desktop screenshots leave no temporary image files",
+    "Explicit sandbox retirement keeps persisted workspace file while stopping resident GUI"
+  ],
+  "runtime_images": {
+    "browser": "sha256:ebb696d71b8248a474cec68f5ede1db2d7c6e73f30a297b249c266f75455f4fd",
+    "desktop": "sha256:ef5c648038ab5f4bc65a2da7ee591988c66712e64b09f954f838cf19cec0fc07"
+  },
+  "cleanup": "All own runtime containers removed; own service stopped",
+  "model_calls": 0
+}

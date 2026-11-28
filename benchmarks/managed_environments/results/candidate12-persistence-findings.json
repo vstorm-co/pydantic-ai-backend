@@ -1,0 +1,39 @@
+{
+  "browser_only": true,
+  "sandbox_idle_seconds": 900,
+  "wheel_sha256": "89695c80b1d95d632c91bf7b896cb42886c35346a14e0041591b5e82b22b5773",
+  "scope": "Real local HTTPS Browser profile acceptance only, normal manager idle900; Desktop checked separately",
+  "model_calls": 0,
+  "checks": [
+    "Second persistent service owner refuses the same storage root at startup",
+    "Local HTTPS fixture validates persistent and session-only HttpOnly Secure cookies; localStorage and IndexedDB transaction commit in a secure context",
+    "Persistent and session-only Secure HttpOnly login cookies, localStorage and committed IndexedDB survive suspend and forced container recreation; live generation identity changes",
+    "Logout remains effective after resume; ordinary End retains saved profile",
+    "Wrong profile key refuses resume and leaves encrypted state unchanged",
+    "Corrupt encrypted state refuses resume without silent fresh-profile fallback",
+    "Concurrent starts/viewers share one live profile writer/generation",
+    "Different tenant/session has no auth/localStorage/IndexedDB even with the same key; cross-session token and tenant rebinding are refused",
+    "Explicit profile purge succeeds after suspend"
+  ],
+  "fixture_proxy": "Only CONNECT fixture.internal:4443; no outbound network",
+  "certificate_policy": "Test-only certificate bypass on isolated disposable Browser",
+  "status": "failed",
+  "cleanup_errors": [
+    "Own service required forced shutdown"
+  ],
+  "functional_checks_passed": 9,
+  "diagnostics": {
+    "instrumentation": "Temporary metadata-only sitecustomize, installed local wheel unchanged",
+    "shutdown": "Main thread threading._shutdown; two AnyIO reader threads still blocked in native recv",
+    "reader_channel_metadata": {
+      "count": 2,
+      "closed": true,
+      "file_descriptor": -1,
+      "io_refs": 0,
+      "socket_closed": true,
+      "owner_present": false
+    },
+    "conclusion": "Ownership tracking closed channels, but blocking recv did not wake; bounded read cancellation still required",
+    "aggressive_idle_separate_case": "With global manager idle3, first Start could be reaped while profile CDP context initialized; normal idle900 avoided that startup race"
+  }
+}

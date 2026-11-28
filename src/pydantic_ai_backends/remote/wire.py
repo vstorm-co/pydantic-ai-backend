@@ -388,10 +388,18 @@ class ServicePolicy(BaseModel):
     """Default low-level runtime, or `None` for whatever the daemon defaults to."""
 
     work_dir: str = ""
+    interactive_environments: bool = False
+    """Whether this service supports explicitly managed Browser/Desktop attachments."""
+    interactive_idle_timeout: int = 900
+    interactive_max_lifetime: int = 3600
+    max_interactive_environments: int = 100
+    """Interactive admission ceilings; configured at service startup."""
     idle_timeout: int = 0
     execute_timeout: int = 0
     max_read_bytes: int = 0
     persist_containers: bool = False
+    persist_desktop_home: bool = False
+    persist_browser_profiles: bool = False
     """Whether a stopped sandbox keeps its filesystem for the next attach."""
     sandbox_uid: int | None = None
     """Uid built runtimes run as, or `None` when sandboxes run as root."""

@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import contextlib
+import logging
+import threading
 import time
 import uuid
 import warnings
+import weakref
 from typing import TYPE_CHECKING, Any
 
 from pydantic_ai_backends._limits import MAX_RUN_OUTPUT_BYTES
 from pydantic_ai_backends.backends.docker._client import docker_client
 from pydantic_ai_backends.backends.docker._image import resolve_image
 from pydantic_ai_backends.backends.docker._stats import parse_usage
-from pydantic_ai_backends.protocol import SandboxUnavailableError
+from pydantic_ai_backends.protocol import SandboxProbeError, SandboxUnavailableError
 from pydantic_ai_backends.types import RuntimeConfig, SandboxUsage
 
 if TYPE_CHECKING:
@@ -21,7 +24,13 @@ if TYPE_CHECKING:
     from docker import DockerClient
     from docker.models.containers import Container
 
+    from pydantic_ai_backends.backends.docker._browser_bridge import (
+        BrowserChannel,
+        DockerBrowserChannel,
+    )
     from pydantic_ai_backends.types import CommandOutcome
+
+logger = logging.getLogger(__name__)
 
 ALIVE_CACHE_SECONDS = 30.0
 """How long a liveness answer is trusted before the daemon is asked again.
@@ -232,6 +241,9 @@ class DockerSandbox:
         self._reattach_only = reattach_only
         self._auto_remove = False if container_name else auto_remove
         self._container: Container | None = None
+        self._browser_lock = threading.Lock()
+        self._browser_channels: weakref.WeakSet[DockerBrowserChannel] = weakref.WeakSet()
+        self._browser_closing = False
         self._idle_timeout = idle_timeout
         self._last_activity = time.time()
         self._volumes = volumes or {}
@@ -310,12 +322,16 @@ class DockerSandbox:
         existing = self._reattach(client)
         if existing is not None:
             self._container = existing
+            with self._browser_lock:
+                self._browser_closing = False
             return
         if self._reattach_only:
             raise SandboxUnavailableError(f"container {self._container_name} is gone")
 
         image = resolve_image(client, self._runtime, self._image)
         self._container = client.containers.run(image, **self._run_kwargs())
+        with self._browser_lock:
+            self._browser_closing = False
 
     def _reattach(self, client: DockerClient) -> Container | None:
         """Return the running named container for this sandbox, if there is one.
@@ -433,6 +449,31 @@ class DockerSandbox:
         self._alive_checked_at = now
         return self._alive
 
+    def is_alive_fresh(self) -> bool:
+        """Probe the exact container without cache, wake or replacement.
+
+        Missing/stopped containers return False. A daemon/network failure raises
+        SandboxProbeError so a caller cannot confuse a temporary outage with loss.
+        """
+        from docker.errors import DockerException, NotFound
+
+        container = self._container
+        if container is None:
+            return False
+        try:
+            container.reload()
+        except NotFound:
+            alive = False
+        except (DockerException, OSError) as error:
+            raise SandboxProbeError(
+                "Docker could not confirm the original container's state"
+            ) from error
+        else:
+            alive = container.status == "running"
+        self._alive = alive
+        self._alive_checked_at = time.monotonic()
+        return alive
+
     def container_user(self) -> str | None:
         """The user the container runs as, as Docker reports it, or `None` before it exists.
 
@@ -476,6 +517,7 @@ class DockerSandbox:
             remove: The old name for `purge`, still honoured so nothing that
                 passes it breaks. Deprecated; pass `purge` instead.
         """
+        self._close_browser_channels()
         if remove is not None:
             warnings.warn(
                 "DockerSandbox.stop(remove=...) is deprecated; pass purge=... instead, "
@@ -495,6 +537,45 @@ class DockerSandbox:
             with contextlib.suppress(Exception):
                 container.remove(force=True)
         self._container = None
+        self._alive_checked_at = None
+
+    def _close_browser_channels(self) -> None:
+        with self._browser_lock:
+            self._browser_closing = True
+            channels = list(self._browser_channels)
+        for channel in channels:
+            try:
+                channel.close()
+            except Exception as error:
+                logger.warning("Browser transport retirement failed (%s)", type(error).__name__)
+
+    def stop_confirmed(self, *, purge: bool = False) -> None:
+        """Retire with Docker confirmation; retain the original identity for retry on failure."""
+        from docker.errors import DockerException, NotFound
+
+        self._close_browser_channels()
+        container = self._container
+        if container is None:
+            return
+        try:
+            if purge:
+                container.remove(force=True)
+            else:
+                container.stop()
+            container.reload()
+        except NotFound:
+            pass
+        except (DockerException, OSError) as error:
+            self._alive_checked_at = None
+            raise SandboxUnavailableError(
+                "Docker could not confirm container retirement"
+            ) from error
+        else:
+            if purge or container.status not in ("exited", "dead", "created"):
+                self._alive_checked_at = None
+                raise SandboxUnavailableError("Docker has not confirmed container retirement")
+        self._container = None
+        self._alive = False
         self._alive_checked_at = None
 
     def __del__(self) -> None:
@@ -564,6 +645,84 @@ class DockerSandbox:
         except SandboxUnavailableError:
             self._alive_checked_at = None
             raise
+
+    async def open_browser_channel(self) -> BrowserChannel:
+        """Attach only to this live container's loopback CDP, without publishing ports.
+
+        The runtime must include Chromium and websocket-client. This method never
+        creates or wakes a container and never renews its idle deadline.
+        """
+        import anyio.to_thread
+
+        from pydantic_ai_backends.backends.docker._browser_bridge import (
+            BrowserChannelError,
+            DockerBrowserChannel,
+        )
+
+        container = self._container
+        if container is None:
+            raise BrowserChannelError("The original browser container is no longer running")
+        container_id = container.id
+        api = container.client.api
+        if not isinstance(container_id, str):
+            raise BrowserChannelError("The original browser container has no identity")
+        if not await anyio.to_thread.run_sync(self.is_alive) or self._container is not container:
+            raise BrowserChannelError("The original browser container is no longer running")
+        channel = await DockerBrowserChannel.open(api, container_id)
+        with self._browser_lock:
+            retired = self._browser_closing or self._container is not container
+            if not retired:
+                self._browser_channels.add(channel)
+        if retired:
+            channel.close()
+            raise BrowserChannelError("The original browser container retired during attachment")
+        return channel
+
+    async def export_browser_profile(self, *, graceful: bool) -> bytes:
+        """Capture this exact live container's Chromium profile without host plaintext."""
+        import functools
+
+        import anyio.to_thread
+        from docker.errors import DockerException
+
+        from pydantic_ai_backends.backends.docker._browser_profile_io import (
+            DockerProfileContainer,
+            export_profile,
+        )
+        from pydantic_ai_backends.remote._browser_profiles import BrowserProfileError
+
+        container = self._container
+        if container is None:
+            raise BrowserProfileError("The original browser container is unavailable")
+        try:
+            return await anyio.to_thread.run_sync(
+                functools.partial(
+                    export_profile, DockerProfileContainer(container), graceful=graceful
+                )
+            )
+        except (DockerException, OSError) as error:
+            raise BrowserProfileError("The browser profile could not be captured") from error
+
+    async def restore_browser_profile(self, archive: bytes) -> None:
+        """Restore into this already-started container before Chromium starts."""
+        import anyio.to_thread
+        from docker.errors import DockerException
+
+        from pydantic_ai_backends.backends.docker._browser_profile_io import (
+            DockerProfileContainer,
+            restore_profile,
+        )
+        from pydantic_ai_backends.remote._browser_profiles import BrowserProfileError
+
+        container = self._container
+        if container is None:
+            raise BrowserProfileError("The original browser container is unavailable")
+        try:
+            await anyio.to_thread.run_sync(
+                restore_profile, DockerProfileContainer(container), archive
+            )
+        except (DockerException, OSError) as error:
+            raise BrowserProfileError("The browser profile could not be restored") from error
 
     async def stop_command(self, run_id: str) -> None:
         """Stop a command :meth:`run_command` started, and everything it started.

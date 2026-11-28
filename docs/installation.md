@@ -213,3 +213,17 @@ own host before promising anyone a density number.
 - [Core Concepts](concepts/index.md) - Learn the fundamentals
 - [Local Workspace Example](examples/local-workspace.md) - Start with a directory on your machine
 - [API Reference](api/index.md) - Complete API documentation
+
+## Browser and computer use preview
+
+The Browser/Desktop APIs in this branch are not in the current PyPI release.
+Build a local wheel and install that exact wheel with the `browser` and/or
+`desktop` extra. Add `server` for sandboxd and `workspaces` for Pydantic AI
+workspace integration. Keep the wheel checksum with test results: the existing
+metadata version is not a published identifier for this preview.
+
+- [Browser environments](browser.md): managed private Chromium or a vetted CDP service.
+- [Desktop environments](desktop.md): screenshots and native input over an existing workspace or operator-owned daemon.
+
+Both can be used without model calls. Your application owns user authorization
+and consent; privileged session/CDP tokens must never be handed to browser UI.

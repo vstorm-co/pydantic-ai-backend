@@ -1,0 +1,26 @@
+{
+  "model_calls": 0,
+  "wheel_sha256": "77fd46bc07655cb5746ce3ddfe743d13520db521b09824ea54aca001bed605ac",
+  "sdk_module": "site-packages/pydantic_ai_backends/__init__.py",
+  "provider_mocked": false,
+  "vault_mocked": false,
+  "profile_repository_mocked": false,
+  "checks": [
+    "Actual Profile DB row uses user-per-agent identity, padded32-byte key and real owner Vault envelope; first profile seeds remembered synthetic auth",
+    "Two actual app conversations share private user-per-agent profile; ending one closes only its target and preserves sibling/native auth",
+    "Explicit app Start restores real updated cookie/localStorage/IndexedDB after suspend; old GET cannot wake old generation or reuse oldcontext",
+    "App browser_new_tab after logout does not reseed still-saved legacy auth cookie",
+    "Immediate logout persists across actual GUI suspend and fresh app Start without extra flush barrier or legacy-cookie reseeding",
+    "Actual Forget revokes ProfileDB admission, purges old archive and starts new empty generation without resurrecting auth or IndexedDB",
+    "Actual agent deletion retains original person-sealed purge receipt until provider erasure, then removes ProfileDB row"
+  ],
+  "limits": [
+    "Synthetic typed authority fixture bypasses HTTP/AgentRegistry publication admission",
+    "Resource journal/driver use in-memory fixtures; Profile DB/Vault and provider/CDP are real",
+    "HTTPS response fulfilled via CDP Fetch on own page; no site/model requests"
+  ],
+  "owned_sessions_purged": 2,
+  "temporary_database_removed": true,
+  "application": "AgenticOS local unpublished integration worktree",
+  "scope": "Real Profile DB, owner Vault, installed local wheel and native Chromium; synthetic authority/journal/driver fixtures"
+}

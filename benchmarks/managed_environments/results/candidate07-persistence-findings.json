@@ -1,0 +1,25 @@
+{
+  "wheel_sha256": "8b052e40d5be60b437f8bf126f31824a5ca5ad11175ce64990d93bd2ba14e6bb",
+  "status": "partial acceptance; full Browser resume blocked by verified export defect",
+  "model_calls": 0,
+  "passed": [
+    "Local HTTPS login fixture: persistent and session-only Secure HttpOnly cookies, secure context, localStorage and committed IndexedDB",
+    "Desktop HOME saved file, ~/.config setting and /workspace file survive manager idle and forced container replacement",
+    "Fault-state watchdog: exact Chromium PGID SIGSTOP, watchdog runnable and Docker Paused=False; own service SIGKILL still permits original hard deadline to stop container"
+  ],
+  "confirmed_defect": {
+    "operation": "first persistent Browser suspend",
+    "outcome": "HTTP503 profile capture failure",
+    "root_cause": "Docker archive API cannot see the live /tmp tmpfs profile",
+    "evidence": {
+      "container_running": true,
+      "tmpfs_mount": "/tmp, size64m",
+      "native_exec_profile_directory_exists": true,
+      "docker_get_archive_profile_outcome": "404 missing path in the same live container"
+    },
+    "resolution_pending": "Use bounded native Docker stdio for tmpfs-aware profile export and restore"
+  },
+  "watchdog_scope": "Manually simulates interrupted-checkpoint Chrome-stop state; not actual periodic archive overlap",
+  "ownership_scope": "Library tenant/session boundaries; user/conversation mapping belongs to application acceptance",
+  "cleanup": "All own fixture/runtime containers and networks removed; own service processes stopped"
+}

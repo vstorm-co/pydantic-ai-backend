@@ -4,7 +4,7 @@
 
 <h1 align="center">Pydantic AI Backend</h1>
 
-<p align="center"><em>Sandboxed execution & file tools for agents.</em></p>
+<p align="center"><em>Sandbox, browser and desktop environments for Pydantic AI agents.</em></p>
 
 <p align="center">
   <a href="https://pypi.org/project/pydantic-ai-backend/"><img src="https://img.shields.io/pypi/v/pydantic-ai-backend.svg" alt="PyPI version"></a>
@@ -24,16 +24,32 @@
     Claude Code alternative & Python agent framework. Use it standalone, or get every
     library wired together in a single `create_deep_agent()` call.
 
-**pydantic-ai-backend** gives [pydantic-ai](https://ai.pydantic.dev/) agents somewhere to
-work and the tools to work there: [workspaces](concepts/workspaces.md) Pydantic AI does not
-ship — a Docker container, a `sandboxd` session, a Kubernetes pod, a Daytona sandbox, a JSON
-document — and file and shell tools that run in whichever workspace the run has.
+**Pydantic AI Backend** manages sandboxes, browser sessions and desktops, with workspace
+integrations and console tools for Pydantic AI agents. Use native Browser/Desktop APIs
+without a model call, or connect an agent through its workspace and toolset.
+
+!!! info "Browser and Desktop: unreleased preview"
+    These APIs are being validated from local wheels. The current PyPI release does not
+    include them. See [Browser environments](browser.md), [Desktop environments](desktop.md)
+    and the [validation scope](design-environments.md) before trying the preview.
+
+Your application owns tenant authorization and UI. `sandboxd` manages containers and their
+limits; environment APIs expose exact identities and lifecycle operations. Retaining files
+is different from retaining a live browser's DOM or unsaved desktop state.
 
 <div class="grid cards" markdown>
 
 - :material-docker: **Self-hosted sandboxes**
 
     A container on this host, or behind `sandboxd` so your app never holds the Docker socket
+
+- :material-web: **Browser use — preview**
+
+    Private Chromium contexts, exact tabs, screenshots and input, managed through sandboxd
+
+- :material-monitor: **Computer use — preview**
+
+    Desktop screenshots, keyboard/mouse and application launching over existing workspaces
 
 - :material-console: **Console tools**
 

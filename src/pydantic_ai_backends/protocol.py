@@ -17,6 +17,10 @@ if TYPE_CHECKING:
     from pydantic_ai_backends.types import CommandOutcome
 
 
+class SandboxProbeError(RuntimeError):
+    """The provider cannot currently confirm liveness; this does not prove loss."""
+
+
 class SandboxUnavailableError(RuntimeError):
     """The sandbox is gone or no longer running, so no command can reach it."""
 

@@ -1,0 +1,26 @@
+{
+  "wheel_sha256": "1f49e3d80110d495606a3a285003078c252af23898bc82e99f29a31d6067a45f",
+  "scope": "Real local HTTPS fixture; persistent login, localStorage, IndexedDB and HOME",
+  "model_calls": 0,
+  "checks": [
+    "Second persistent service owner refuses the same storage root at startup",
+    "Local HTTPS fixture validates persistent and session-only HttpOnly Secure cookies; localStorage and IndexedDB transaction commit in a secure context",
+    "Persistent and session-only Secure HttpOnly login cookies, localStorage and committed IndexedDB survive suspend and forced container recreation; live generation identity changes",
+    "Logout remains effective after resume; ordinary End retains saved profile",
+    "Wrong profile key refuses resume and leaves encrypted state unchanged",
+    "Corrupt encrypted state refuses resume without silent fresh-profile fallback",
+    "Concurrent starts/viewers share one live profile writer/generation",
+    "Different tenant/session has no auth/localStorage/IndexedDB even with the same key; cross-session token and tenant rebinding are refused",
+    "Explicit profile purge succeeds after suspend",
+    "Desktop HOME saved file, ~/.config setting and /workspace file survive idle and forced container recreation; unsaved process memory is not claimed"
+  ],
+  "fixture_proxy": "Only CONNECT fixture.internal:4443; no outbound network",
+  "certificate_policy": "Test-only certificate bypass on isolated disposable Browser",
+  "status": "failed",
+  "cleanup_errors": [
+    "Own service required forced shutdown"
+  ],
+  "functional_checks_passed": 10,
+  "cleanup_diagnosis": "Python main thread in threading._shutdown with one AnyIO worker blocked in native Docker browser bridge _read_exactly recv after asyncio loop exit",
+  "diagnostic_scope": "Own server faulthandler/task-stack signals after15second graceful shutdown bound; own server then killed and Docker resources removed"
+}

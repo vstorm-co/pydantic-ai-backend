@@ -117,8 +117,21 @@ def config_from_env(env: Mapping[str, str]) -> SandboxdConfig:
                 env, "FILESYSTEM_EXPORT_IMAGE", defaults.filesystem_export_image, str
             ),
             persist_containers=_flag(env, "PERSIST_CONTAINERS", defaults.persist_containers),
+            persist_desktop_home=_flag(env, "PERSIST_DESKTOP_HOME", defaults.persist_desktop_home),
+            persist_browser_profiles=_flag(
+                env, "PERSIST_BROWSER_PROFILES", defaults.persist_browser_profiles
+            ),
             prewarm=_flag(env, "PREWARM", defaults.prewarm),
             idle_timeout=_value(env, "IDLE_TIMEOUT", defaults.idle_timeout, _as_int),
+            interactive_idle_timeout=_value(
+                env, "INTERACTIVE_IDLE_TIMEOUT", defaults.interactive_idle_timeout, _as_int
+            ),
+            interactive_max_lifetime=_value(
+                env, "INTERACTIVE_MAX_LIFETIME", defaults.interactive_max_lifetime, _as_int
+            ),
+            max_interactive_environments=_value(
+                env, "MAX_INTERACTIVE_ENVIRONMENTS", defaults.max_interactive_environments, _as_int
+            ),
             cleanup_interval=_value(env, "CLEANUP_INTERVAL", defaults.cleanup_interval, _as_int),
             workspace_ttl=_optional(env, "WORKSPACE_TTL", defaults.workspace_ttl, _as_int),
             container_ttl=_optional(env, "CONTAINER_TTL", defaults.container_ttl, _as_int),
