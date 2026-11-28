@@ -1,0 +1,154 @@
+{
+  "date": "2026-11-28",
+  "scope": "Installed client wheel03 vs wheel04 Desktop capture; same live container/server/image within one interleaved A/B run",
+  "released": false,
+  "source_library_pythonpath": false,
+  "model_calls": 0,
+  "synthetic": true,
+  "server_wheel": "candidate03",
+  "client_wheels": {
+    "candidate03": {
+      "sha256": "fd74920ab328b753ea1ceb9988166da82220d7648f07460f1d0ff837e8679d54"
+    },
+    "candidate04": {
+      "sha256": "cd646a404796e64eb19b41194a7e668205e788c20ad821d6cb37281b66d912ad"
+    }
+  },
+  "same_container": true,
+  "image": "pydantic-ai-backend-runtime:desktop-e3592752eff8",
+  "limits": {
+    "cpus": 1,
+    "memory": "1g",
+    "network": "none",
+    "published_ports": 0,
+    "max_own_containers": 1
+  },
+  "dependencies": {
+    "python": "3.12.9",
+    "httpx": "0.29.0",
+    "anyio": "4.16.0",
+    "pydantic": "2.14.4",
+    "pydantic-ai-slim": "2.77.0"
+  },
+  "method": {
+    "order": [
+      "old-wheel03-first",
+      "new-wheel04-first",
+      "old-wheel03-repeat",
+      "new-wheel04-repeat"
+    ],
+    "samples_per_interval": 25,
+    "warmup_captures_per_interval": 1,
+    "http_client": "pooled httpx.AsyncClient, separate client process per interval",
+    "dimensions": [
+      1024,
+      768
+    ],
+    "p95": "linear interpolation over sorted interval samples",
+    "normal_frame": "Unchanged real XFCE desktop, approximately20KiB PNG",
+    "large_frame": "Temporary real X11 window with seeded random RGB pixels; no fake PNG/provider response"
+  },
+  "timings": [
+    {
+      "label": "old-wheel03-first",
+      "n": 25,
+      "median_ms": 223.2621670118533,
+      "p95_ms": 284.9817421752959,
+      "requests": 175,
+      "rpc_per_capture": 7.0,
+      "request_paths": [
+        "POST /sessions/<own-session>/files/read",
+        "POST /sessions/<own-session>/files/remove",
+        "POST /sessions/<own-session>/run"
+      ],
+      "installed_module": "site-packages/pydantic_ai_backends/desktop/_sandbox.py",
+      "installed_module_sha256": "fd76dd4e03ef87c2a90a4334c14c704fd27dc63c5ee07255f3f4642f713ba2f5",
+      "model_calls": 0,
+      "image_bytes_min": 20769,
+      "image_bytes_max": 20769
+    },
+    {
+      "label": "new-wheel04-first",
+      "n": 25,
+      "median_ms": 78.44441599445418,
+      "p95_ms": 90.85104218684135,
+      "requests": 25,
+      "rpc_per_capture": 1.0,
+      "request_paths": [
+        "POST /sessions/<own-session>/run"
+      ],
+      "installed_module": "site-packages/pydantic_ai_backends/desktop/_sandbox.py",
+      "installed_module_sha256": "9356555d7f4dc94fdab001a0272a781a229003b709b9882d109f7ae68282777d",
+      "model_calls": 0,
+      "image_bytes_min": 20769,
+      "image_bytes_max": 20769
+    },
+    {
+      "label": "old-wheel03-repeat",
+      "n": 25,
+      "median_ms": 228.32183400169015,
+      "p95_ms": 267.8274334291927,
+      "requests": 175,
+      "rpc_per_capture": 7.0,
+      "request_paths": [
+        "POST /sessions/<own-session>/files/read",
+        "POST /sessions/<own-session>/files/remove",
+        "POST /sessions/<own-session>/run"
+      ],
+      "installed_module": "site-packages/pydantic_ai_backends/desktop/_sandbox.py",
+      "installed_module_sha256": "fd76dd4e03ef87c2a90a4334c14c704fd27dc63c5ee07255f3f4642f713ba2f5",
+      "model_calls": 0,
+      "image_bytes_min": 20769,
+      "image_bytes_max": 20769
+    },
+    {
+      "label": "new-wheel04-repeat",
+      "n": 25,
+      "median_ms": 77.40591699257493,
+      "p95_ms": 93.46488341689108,
+      "requests": 25,
+      "rpc_per_capture": 1.0,
+      "request_paths": [
+        "POST /sessions/<own-session>/run"
+      ],
+      "installed_module": "site-packages/pydantic_ai_backends/desktop/_sandbox.py",
+      "installed_module_sha256": "9356555d7f4dc94fdab001a0272a781a229003b709b9882d109f7ae68282777d",
+      "model_calls": 0,
+      "image_bytes_min": 20769,
+      "image_bytes_max": 20769
+    }
+  ],
+  "large_fallback": {
+    "real_incompressible_x11_frame": true,
+    "width": 1024,
+    "height": 768,
+    "image_bytes": 1682792,
+    "png_all_chunk_checksums_valid": true,
+    "png_decompression_valid": true,
+    "elapsed_ms": 1474.8249169788323,
+    "requests": 33,
+    "request_paths": [
+      "POST /sessions/<own-session>/files/read",
+      "POST /sessions/<own-session>/files/remove",
+      "POST /sessions/<own-session>/run"
+    ],
+    "capture_command_count": 1,
+    "screenshot_temporary_files_remaining": 0,
+    "model_calls": 0
+  },
+  "checks": [
+    "Ordinary real PNG needs exactly one /run request, no read/remove",
+    "All intervals reattach exactly the same retained desktop session",
+    "The actual >512KiB PNG uses one capture command and existing chunked reader",
+    "Large PNG validates every chunk CRC and decompresses successfully",
+    "No screenshot temporary file remains after large transfer",
+    "Own session explicitly deleted after run"
+  ],
+  "limitations": [
+    "Local Docker Desktop on macOS ARM64; cached minimal image and warm runtime",
+    "Small synthetic XFCE frame is not a representative complex application workload",
+    "Large-frame fallback has one functional observation, not a latency distribution",
+    "Client capture optimization isolated against candidate03 server; final candidate04 server acceptance measured separately",
+    "No CPU/memory profiling during this A/B; see separate resource receipt"
+  ]
+}

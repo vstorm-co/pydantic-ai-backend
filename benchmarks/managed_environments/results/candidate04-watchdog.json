@@ -1,0 +1,15 @@
+{
+  "wheel": "pydantic_ai_backend-0.2.42-py3-none-any.whl",
+  "wheel_sha256": "cd646a404796e64eb19b41194a7e668205e788c20ad821d6cb37281b66d912ad",
+  "scope": "Own sandboxd SIGKILL, not a client disconnect",
+  "model_calls": 0,
+  "runtime_websocket_client_version": "1.9.2",
+  "runtime_image_id": "sha256:ebb696d71b8248a474cec68f5ede1db2d7c6e73f30a297b249c266f75455f4fd",
+  "status": "passed",
+  "reconnect_preserved_original_deadline": true,
+  "supervisor_exit_code": -9,
+  "remaining_lifetime_at_kill_seconds": 6.345943498999986,
+  "container_stop_after_supervisor_kill_seconds": 6.3751556249917485,
+  "container_stop_after_original_deadline_seconds": 0.029212125984486192,
+  "container_status": "exited"
+}

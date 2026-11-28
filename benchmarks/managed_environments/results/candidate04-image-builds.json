@@ -1,0 +1,25 @@
+{
+  "images": {
+    "browser": {
+      "tag": "pydantic-ai-backend-runtime:benchmark-browser-44e220951f9d",
+      "id": "sha256:ebb696d71b8248a474cec68f5ede1db2d7c6e73f30a297b249c266f75455f4fd",
+      "size_bytes": 340230067,
+      "elapsed_seconds": 3.975797125021927,
+      "scope": "First build on current Docker daemon; shared base/layers may be cached"
+    },
+    "desktop": {
+      "tag": "pydantic-ai-backend-runtime:benchmark-desktop-842f5f8b4bf1",
+      "id": "sha256:ef5c648038ab5f4bc65a2da7ee591988c66712e64b09f954f838cf19cec0fc07",
+      "size_bytes": 351458060,
+      "elapsed_seconds": 0.8555314999539405,
+      "scope": "First build on current Docker daemon; shared base/layers may be cached"
+    }
+  },
+  "daemon": {
+    "Architecture": "aarch64",
+    "OSType": "linux",
+    "NCPU": 10,
+    "MemTotal": 8321970176,
+    "ServerVersion": "29.2.1"
+  }
+}

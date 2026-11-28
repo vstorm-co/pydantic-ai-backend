@@ -1,0 +1,407 @@
+{
+  "model_calls": 0,
+  "synthetic": true,
+  "sample_count": 25,
+  "scope": "Browser, expiry and Desktop",
+  "wheel": "pydantic_ai_backend-0.2.42-py3-none-any.whl",
+  "wheel_sha256": "cd646a404796e64eb19b41194a7e668205e788c20ad821d6cb37281b66d912ad",
+  "installed_module": "site-packages/pydantic_ai_backends/__init__.py",
+  "installed_version": "0.2.42",
+  "python": "3.12.9 (main, Feb 12 2025, 15:09:19) [Clang 19.1.6 ]",
+  "platform": "macOS-26.5-arm64-arm-64bit",
+  "docker_daemon": {
+    "Architecture": "aarch64",
+    "OSType": "linux",
+    "NCPU": 10,
+    "MemTotal": 8321970176,
+    "ServerVersion": "29.2.1"
+  },
+  "timing_scope": "Cached runtime image: fresh container/GUI startup; not cold image pull or build",
+  "limits": {
+    "max_simultaneous_containers": 2,
+    "cpus_per_container": 1,
+    "memory_per_container": "1g",
+    "network": "none"
+  },
+  "checks": [
+    "Browser exact DOM, unsaved form and JS counter retained after original client disconnect and fresh process reconnect",
+    "Passive zero-view wait and state inspection do not renew Browser idle deadline",
+    "Repeated passive screenshots do not renew Browser idle deadline",
+    "Actual physical input renews Browser idle deadline",
+    "Real Chromium Enter submits the controlled form",
+    "Repeated reconnect leaves exactly one live bridge, without abandoned per-viewer processes",
+    "Two tenants have separate containers/context state; wrong token and foreign target attachment refused",
+    "Actual Docker limits verified: 1CPU/1GiB, networknone and no published ports per session",
+    "Independent network isolation rejects metadata/private and public egress with unreachable mandatory proxy",
+    "Killed exact Browser refuses inspect; no replacement or wake occurs",
+    "Idle deadline revokes passive access, then sweep stops only its container within bounded cleanup window",
+    "Hard lifetime revokes passive access, then sweep stops only its container within bounded cleanup window",
+    "Desktop real terminal retains unsent command across adapter detach; Enter executes it after exact reattach",
+    "Repeated Desktop screenshots leave no temporary image files",
+    "Explicit sandbox retirement keeps persisted workspace file while stopping resident GUI"
+  ],
+  "timings": {
+    "browser_cached_image_fresh_container_ms": 244.5657500065863,
+    "browser_first_gui_start_ms": 1300.1551249762997,
+    "browser_first_context_connect_ms": 282.9454999882728,
+    "browser_screenshot": {
+      "n": 25,
+      "min_ms": 26.947707985527813,
+      "median_ms": 34.08920799847692,
+      "p95_ms": 53.695533180143684,
+      "max_ms": 57.9808329930529
+    },
+    "browser_evaluate_small": {
+      "n": 25,
+      "min_ms": 1.36283301981166,
+      "median_ms": 1.5287919668480754,
+      "p95_ms": 1.901366387028247,
+      "max_ms": 4.112624970730394
+    },
+    "browser_type_text_one_character": {
+      "n": 25,
+      "min_ms": 1.6457079909741879,
+      "median_ms": 1.876791997347027,
+      "p95_ms": 3.1727247755043195,
+      "max_ms": 5.337167007382959
+    },
+    "browser_existing_context_reconnect": {
+      "n": 25,
+      "min_ms": 78.4015409881249,
+      "median_ms": 84.07974999863654,
+      "p95_ms": 91.80150001775473,
+      "max_ms": 102.04795800382271
+    },
+    "browser_second_fresh_container_ms": 132.9418340465054,
+    "browser_idle_provider_stop_after_refusal_ms": 673.1239160289988,
+    "browser_hard_provider_stop_after_refusal_ms": 36.04941599769518,
+    "desktop_cached_image_fresh_container_ms": 178.63608401967213,
+    "desktop_first_gui_start_ms": 1032.639916986227,
+    "desktop_screenshot": {
+      "n": 25,
+      "min_ms": 72.99387501552701,
+      "median_ms": 83.46000005258247,
+      "p95_ms": 97.66105001326649,
+      "max_ms": 100.28691700426862
+    },
+    "desktop_screenshot_pooled_http": {
+      "n": 25,
+      "min_ms": 58.68029099656269,
+      "median_ms": 72.50237499829382,
+      "p95_ms": 124.23464980674893,
+      "max_ms": 154.63962504873052
+    },
+    "desktop_same_gui_reattach_ms": 81.2227499554865,
+    "desktop_keyboard_chord": {
+      "n": 25,
+      "min_ms": 53.06420795386657,
+      "median_ms": 68.65274999290705,
+      "p95_ms": 81.46432542707771,
+      "max_ms": 126.48137501673773
+    }
+  },
+  "resources": {
+    "browser_idle": [
+      {
+        "memory_usage_bytes": 313303040,
+        "working_set_bytes": 312684544,
+        "cpu_one_core_percent": 4.6056772908366534,
+        "pids": 180,
+        "memory_limit_bytes": 1073741824,
+        "cpu_throttled_ns_total": 9094376000,
+        "server_cpu_seconds_total": 0.53,
+        "server_rss_bytes": 50642944,
+        "phase_elapsed_seconds": 0.0
+      },
+      {
+        "memory_usage_bytes": 312664064,
+        "working_set_bytes": 312045568,
+        "cpu_one_core_percent": 3.1152626362735383,
+        "pids": 180,
+        "memory_limit_bytes": 1073741824,
+        "cpu_throttled_ns_total": 9094376000,
+        "server_cpu_seconds_total": 0.53,
+        "server_rss_bytes": 50610176,
+        "phase_elapsed_seconds": 2.012715707998723
+      },
+      {
+        "memory_usage_bytes": 310243328,
+        "working_set_bytes": 309624832,
+        "cpu_one_core_percent": 1.9493557978196234,
+        "pids": 180,
+        "memory_limit_bytes": 1073741824,
+        "cpu_throttled_ns_total": 9094376000,
+        "server_cpu_seconds_total": 0.53,
+        "server_rss_bytes": 28180480,
+        "phase_elapsed_seconds": 4.035019000002649
+      }
+    ],
+    "browser_screenshot_loop": [
+      {
+        "memory_usage_bytes": 310378496,
+        "working_set_bytes": 309760000,
+        "cpu_one_core_percent": 2.349152542372881,
+        "pids": 180,
+        "memory_limit_bytes": 1073741824,
+        "cpu_throttled_ns_total": 9094376000,
+        "server_cpu_seconds_total": 0.56,
+        "server_rss_bytes": 46120960,
+        "phase_elapsed_seconds": 0.0
+      },
+      {
+        "memory_usage_bytes": 306356224,
+        "working_set_bytes": 305737728,
+        "cpu_one_core_percent": 1.9000991080277503,
+        "pids": 180,
+        "memory_limit_bytes": 1073741824,
+        "cpu_throttled_ns_total": 9094376000,
+        "server_cpu_seconds_total": 0.56,
+        "server_rss_bytes": 45957120,
+        "phase_elapsed_seconds": 2.015377959003672
+      }
+    ],
+    "browser_live_1fps": {
+      "requested_fps": 1,
+      "duration_seconds": 6.0059270419878885,
+      "sampling_span_seconds": 6.02737604198046,
+      "frames": 6,
+      "latency": {
+        "n": 6,
+        "min_ms": 22.028708015568554,
+        "median_ms": 37.371729529695585,
+        "p95_ms": 42.37891650700476,
+        "max_ms": 43.74325001845136
+      },
+      "samples": [
+        {
+          "memory_usage_bytes": 305909760,
+          "working_set_bytes": 305291264,
+          "cpu_one_core_percent": 3.298604187437687,
+          "pids": 180,
+          "memory_limit_bytes": 1073741824,
+          "cpu_throttled_ns_total": 9094376000,
+          "server_cpu_seconds_total": 0.57,
+          "server_rss_bytes": 34619392,
+          "phase_elapsed_seconds": 0.0
+        },
+        {
+          "memory_usage_bytes": 305954816,
+          "working_set_bytes": 305336320,
+          "cpu_one_core_percent": 3.451394422310757,
+          "pids": 180,
+          "memory_limit_bytes": 1073741824,
+          "cpu_throttled_ns_total": 9094376000,
+          "server_cpu_seconds_total": 0.57,
+          "server_rss_bytes": 34668544,
+          "phase_elapsed_seconds": 2.0084204169688746
+        },
+        {
+          "memory_usage_bytes": 305803264,
+          "working_set_bytes": 305184768,
+          "cpu_one_core_percent": 2.6168159203980097,
+          "pids": 179,
+          "memory_limit_bytes": 1073741824,
+          "cpu_throttled_ns_total": 9094376000,
+          "server_cpu_seconds_total": 0.57,
+          "server_rss_bytes": 34701312,
+          "phase_elapsed_seconds": 4.017777666973416
+        }
+      ]
+    },
+    "browser_live_10fps": {
+      "requested_fps": 10,
+      "duration_seconds": 6.052341250004247,
+      "sampling_span_seconds": 6.052384542010259,
+      "frames": 60,
+      "latency": {
+        "n": 60,
+        "min_ms": 15.756833949126303,
+        "median_ms": 31.56087498064153,
+        "p95_ms": 41.1204208532581,
+        "max_ms": 46.30816698772833
+      },
+      "samples": [
+        {
+          "memory_usage_bytes": 309903360,
+          "working_set_bytes": 309284864,
+          "cpu_one_core_percent": 23.125450901803607,
+          "pids": 179,
+          "memory_limit_bytes": 1073741824,
+          "cpu_throttled_ns_total": 9094376000,
+          "server_cpu_seconds_total": 0.59,
+          "server_rss_bytes": 34717696,
+          "phase_elapsed_seconds": 0.0
+        },
+        {
+          "memory_usage_bytes": 311607296,
+          "working_set_bytes": 310988800,
+          "cpu_one_core_percent": 30.85225677031093,
+          "pids": 179,
+          "memory_limit_bytes": 1073741824,
+          "cpu_throttled_ns_total": 9094376000,
+          "server_cpu_seconds_total": 0.6,
+          "server_rss_bytes": 34799616,
+          "phase_elapsed_seconds": 2.0051219169981778
+        },
+        {
+          "memory_usage_bytes": 311738368,
+          "working_set_bytes": 311119872,
+          "cpu_one_core_percent": 23.528328328328328,
+          "pids": 179,
+          "memory_limit_bytes": 1073741824,
+          "cpu_throttled_ns_total": 9094376000,
+          "server_cpu_seconds_total": 0.63,
+          "server_rss_bytes": 35110912,
+          "phase_elapsed_seconds": 4.0109181250445545
+        }
+      ]
+    },
+    "browser_live_bridges_after_25_reconnects": 1,
+    "desktop_screenshot_loop": [
+      {
+        "memory_usage_bytes": 116822016,
+        "working_set_bytes": 114798592,
+        "cpu_one_core_percent": 42.15758793969849,
+        "pids": 64,
+        "memory_limit_bytes": 1073741824,
+        "cpu_throttled_ns_total": 777835000,
+        "server_cpu_seconds_total": 1.11,
+        "server_rss_bytes": 58458112,
+        "phase_elapsed_seconds": 0.0
+      },
+      {
+        "memory_usage_bytes": 106188800,
+        "working_set_bytes": 104165376,
+        "cpu_one_core_percent": 5.159980139026812,
+        "pids": 61,
+        "memory_limit_bytes": 1073741824,
+        "cpu_throttled_ns_total": 777835000,
+        "server_cpu_seconds_total": 1.18,
+        "server_rss_bytes": 58490880,
+        "phase_elapsed_seconds": 2.0094413330079988
+      },
+      {
+        "memory_usage_bytes": 105795584,
+        "working_set_bytes": 103723008,
+        "cpu_one_core_percent": 0.002290836653386454,
+        "pids": 61,
+        "memory_limit_bytes": 1073741824,
+        "cpu_throttled_ns_total": 777835000,
+        "server_cpu_seconds_total": 1.18,
+        "server_rss_bytes": 58490880,
+        "phase_elapsed_seconds": 4.0177822500118054
+      }
+    ],
+    "desktop_live_1fps": {
+      "requested_fps": 1,
+      "duration_seconds": 6.005856959032826,
+      "sampling_span_seconds": 6.027596459025517,
+      "frames": 6,
+      "latency": {
+        "n": 6,
+        "min_ms": 99.51104101492092,
+        "median_ms": 124.51968746609055,
+        "p95_ms": 145.63528099097311,
+        "max_ms": 145.76345798559487
+      },
+      "samples": [
+        {
+          "memory_usage_bytes": 105984000,
+          "working_set_bytes": 103911424,
+          "cpu_one_core_percent": 5.901492537313432,
+          "pids": 61,
+          "memory_limit_bytes": 1073741824,
+          "cpu_throttled_ns_total": 777835000,
+          "server_cpu_seconds_total": 1.2,
+          "server_rss_bytes": 58179584,
+          "phase_elapsed_seconds": 0.0
+        },
+        {
+          "memory_usage_bytes": 106070016,
+          "working_set_bytes": 103997440,
+          "cpu_one_core_percent": 5.7486055776892435,
+          "pids": 61,
+          "memory_limit_bytes": 1073741824,
+          "cpu_throttled_ns_total": 777835000,
+          "server_cpu_seconds_total": 1.22,
+          "server_rss_bytes": 57376768,
+          "phase_elapsed_seconds": 2.012639708002098
+        },
+        {
+          "memory_usage_bytes": 105840640,
+          "working_set_bytes": 103768064,
+          "cpu_one_core_percent": 4.778343313373254,
+          "pids": 61,
+          "memory_limit_bytes": 1073741824,
+          "cpu_throttled_ns_total": 777835000,
+          "server_cpu_seconds_total": 1.23,
+          "server_rss_bytes": 56672256,
+          "phase_elapsed_seconds": 4.017391917004716
+        }
+      ]
+    },
+    "desktop_live_5fps": {
+      "requested_fps": 5,
+      "duration_seconds": 6.030238915991504,
+      "sampling_span_seconds": 6.035616040986497,
+      "frames": 30,
+      "latency": {
+        "n": 30,
+        "min_ms": 85.80645901383832,
+        "median_ms": 114.25393747049384,
+        "p95_ms": 123.22049132781103,
+        "max_ms": 126.94741698214784
+      },
+      "samples": [
+        {
+          "memory_usage_bytes": 105869312,
+          "working_set_bytes": 103796736,
+          "cpu_one_core_percent": 23.316216216216215,
+          "pids": 59,
+          "memory_limit_bytes": 1073741824,
+          "cpu_throttled_ns_total": 777835000,
+          "server_cpu_seconds_total": 1.29,
+          "server_rss_bytes": 56360960,
+          "phase_elapsed_seconds": 0.0
+        },
+        {
+          "memory_usage_bytes": 105590784,
+          "working_set_bytes": 103518208,
+          "cpu_one_core_percent": 23.533033932135726,
+          "pids": 51,
+          "memory_limit_bytes": 1073741824,
+          "cpu_throttled_ns_total": 777835000,
+          "server_cpu_seconds_total": 1.35,
+          "server_rss_bytes": 51314688,
+          "phase_elapsed_seconds": 2.008869874989614
+        },
+        {
+          "memory_usage_bytes": 105840640,
+          "working_set_bytes": 103768064,
+          "cpu_one_core_percent": 23.657868525896415,
+          "pids": 51,
+          "memory_limit_bytes": 1073741824,
+          "cpu_throttled_ns_total": 777835000,
+          "server_cpu_seconds_total": 1.42,
+          "server_rss_bytes": 51380224,
+          "phase_elapsed_seconds": 4.0219122499693185
+        }
+      ]
+    },
+    "desktop_pooled_capture_requests": {
+      "captures": 25,
+      "requests": 25,
+      "paths": {
+        "POST /sessions/qa-bench-4cbe0a230f-desktop/run": 25
+      }
+    }
+  },
+  "status": "passed",
+  "own_containers_removed": [
+    "benchmark-session-browser-a",
+    "benchmark-session-browser-b",
+    "benchmark-session-idle-expiry",
+    "benchmark-session-hard-expiry",
+    "benchmark-session-desktop"
+  ]
+}
