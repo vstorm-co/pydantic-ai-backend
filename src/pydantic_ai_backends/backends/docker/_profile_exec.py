@@ -40,6 +40,7 @@ def include(member):
     if count>20000 or member.size<0 or member.size>LIMIT:
         raise RuntimeError('Profile archive exceeds its bound')
     parts=pathlib.PurePosixPath(member.name).parts
+    if parts[:2]==('sandboxd-browser-profile','component_crx_cache'): return None
     caches={'Cache','Code Cache','GPUCache','ShaderCache','BrowserMetrics'}
     if any(p.startswith('Singleton') or p in caches for p in parts): return None
     return member

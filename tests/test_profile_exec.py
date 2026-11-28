@@ -4,6 +4,9 @@ import hashlib
 import io
 import socket
 import struct
+import subprocess
+import sys
+import tarfile
 import threading
 import time
 from types import SimpleNamespace
@@ -21,6 +24,43 @@ def frame(data, stream=1, reserved=b"\0\0\0"):
 
 def envelope(data):
     return native.MAGIC + struct.pack(">Q", len(data)) + hashlib.sha256(data).digest() + data
+
+
+def test_export_script_omits_only_root_component_download_cache(tmp_path):
+    profile = tmp_path / "sandboxd-browser-profile"
+    preserved = {
+        "Default/Cookies": b"private-login",
+        "Default/IndexedDB/site.leveldb/000001.log": b"private-indexed-db",
+        "Default/Preferences": b'{"setting":"preserved"}',
+        "Default/IndexedDB/component_crx_cache/user-data": b"not-an-updater-cache",
+        "CertificateRevocation/security-component": b"security-data",
+    }
+    files = {**preserved, "component_crx_cache/reinstallable-crx": b"download-cache"}
+    for name, data in files.items():
+        destination = profile / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+    script = native._EXPORT.replace("'/tmp/sandboxd-browser-profile'", repr(str(profile)))
+    output = subprocess.run(
+        [sys.executable, "-c", script], check=True, capture_output=True, timeout=5
+    ).stdout
+    assert output[:5] == native.MAGIC
+    length = struct.unpack(">Q", output[5:13])[0]
+    payload = output[native.HEADER_BYTES :]
+    assert len(payload) == length
+    assert hashlib.sha256(payload).digest() == output[13 : native.HEADER_BYTES]
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as captured:
+        names = captured.getnames()
+        assert not any(
+            name == "sandboxd-browser-profile/component_crx_cache"
+            or name.startswith("sandboxd-browser-profile/component_crx_cache/")
+            for name in names
+        )
+        for name, data in preserved.items():
+            entry = captured.extractfile(f"sandboxd-browser-profile/{name}")
+            assert entry is not None
+            with entry:
+                assert entry.read() == data
 
 
 class Owner:
