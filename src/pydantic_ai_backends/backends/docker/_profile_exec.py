@@ -14,7 +14,7 @@ import struct
 import time
 from typing import TYPE_CHECKING
 
-from pydantic_ai_backends.backends.docker._browser_bridge import SocketOwner
+from pydantic_ai_backends.backends.docker._browser_bridge import SocketOwner, close_exec_socket
 from pydantic_ai_backends.remote._browser_profiles import MAX_PROFILE_BYTES, BrowserProfileError
 
 if TYPE_CHECKING:
@@ -141,11 +141,10 @@ def _frames(stream: socket.socket, limit: int, deadline: float) -> bytes:
 
 
 def _close(stream: socket.socket, owner: SocketOwner) -> None:
-    for resource in (stream, owner):
-        try:
-            resource.close()
-        except Exception as error:
-            logger.warning("Browser profile transport cleanup failed (%s)", type(error).__name__)
+    try:
+        close_exec_socket(stream, owner)
+    except Exception as error:
+        logger.warning("Browser profile transport cleanup failed (%s)", type(error).__name__)
 
 
 def export_archive(container: Container) -> bytes:

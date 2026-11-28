@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import http.client
 import socket
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -82,6 +85,60 @@ async def test_channel_keeps_and_closes_docker_socket_wrapper(sockets):
     await channel.aclose()
     await channel.aclose()
     assert wrapper.closed == 1
+
+
+@pytest.mark.parametrize("abandoned", [False, True])
+async def test_real_docker_http_wrapper_closes_without_unraisable_flush(
+    sockets, monkeypatch, abandoned
+):
+    import requests
+    import urllib3
+
+    local, peer = sockets
+    peer.sendall(b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\n\r\n")
+    original = http.client.HTTPResponse(local)
+    original.begin()
+    owner = original.fp.raw
+    response = requests.Response()
+    response.raw = urllib3.HTTPResponse(
+        body=original, original_response=original, preload_content=False
+    )
+    owner._response = response
+    failures = []
+    monkeypatch.setattr(sys, "unraisablehook", failures.append)
+    if abandoned:
+        opening = bridge._Opening()
+        opening.publish(local, owner)
+        opening.abandon()
+        del opening
+    else:
+        channel = bridge.DockerBrowserChannel(local, owner)
+        await channel.aclose()
+        await channel.aclose()
+        del channel
+    assert original.isclosed()
+    assert owner.closed
+    assert local.fileno() == -1
+    del original, response, owner
+    gc.collect()
+    assert failures == []
+
+
+def test_response_close_failure_still_retires_raw_socket_and_wrapper(sockets):
+    local, _peer = sockets
+
+    class FailedResponse:
+        def close(self):
+            raise OSError("private-response-body")
+
+    class Owner(Wrapper):
+        _response = FailedResponse()
+
+    owner = Owner(local)
+    with pytest.raises(OSError, match="private-response-body"):
+        bridge.close_exec_socket(local, owner)
+    assert owner.closed == 1
+    assert local.fileno() == -1
 
 
 async def test_missing_exec_identity_and_unsupported_socket_are_explicit(sockets):

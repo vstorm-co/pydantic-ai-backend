@@ -72,6 +72,26 @@ class SocketOwner(Protocol):
     def close(self) -> None: ...
 
 
+def close_exec_socket(raw: socket.socket, owner: SocketOwner | None) -> None:
+    """Close Docker's HTTP response before its SocketIO flush target disappears."""
+    response: object = getattr(owner, "_response", None)
+    resources: list[SocketOwner] = []
+    if isinstance(response, SocketOwner):
+        resources.append(response)
+    resources.append(raw)
+    if owner is not None and owner is not raw:
+        resources.append(owner)
+    failure: Exception | None = None
+    for resource in resources:
+        try:
+            resource.close()
+        except Exception as error:
+            if failure is None:
+                failure = error
+    if failure is not None:
+        raise failure
+
+
 class _Opening:
     """Close a socket returned after the async owner already timed out/cancelled."""
 
@@ -82,11 +102,10 @@ class _Opening:
 
     @staticmethod
     def _dispose(raw: socket.socket, owner: SocketOwner) -> None:
-        for resource in (raw, owner):
-            try:
-                resource.close()
-            except Exception as error:
-                logger.warning("Abandoned browser socket cleanup failed (%s)", type(error).__name__)
+        try:
+            close_exec_socket(raw, owner)
+        except Exception as error:
+            logger.warning("Abandoned browser socket cleanup failed (%s)", type(error).__name__)
 
     def publish(self, raw: socket.socket, owner: SocketOwner) -> tuple[socket.socket, SocketOwner]:
         with self.lock:
@@ -275,7 +294,5 @@ class DockerBrowserChannel:
             self._closed = True
             with suppress(OSError):
                 self._stream.shutdown(socket.SHUT_RDWR)
-            self._stream.close()
-            if self._owner is not None:
-                self._owner.close()
-                self._owner = None
+            close_exec_socket(self._stream, self._owner)
+            self._owner = None
