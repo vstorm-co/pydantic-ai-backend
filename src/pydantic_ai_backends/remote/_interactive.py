@@ -685,6 +685,15 @@ class InteractiveGateway:
                 if error.status_code == 404:
                     return
                 raise
+            if sandbox is None and self.service.config.workspace_root is not None:
+                saved = (
+                    Path(self.service.config.workspace_root)
+                    / session_id
+                    / "private"
+                    / "browser-profile.enc"
+                )
+                if saved.is_file():
+                    return
             if self.service.describe(session_id, sandbox, alive=True).runtime == "browser":
                 await self.service.close_session(session_id)
 

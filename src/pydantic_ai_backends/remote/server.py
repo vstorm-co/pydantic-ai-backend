@@ -2005,6 +2005,10 @@ class _Service:
         if body.filesystem_binding is not None and self.filesystem_mounts is None:
             raise HTTPException(status_code=400, detail="Live filesystem mounts are not enabled")
         open_already = self._sessions.get(session_id)
+        # Attach is read-only when nothing remains: reserving durable scope here
+        # would recreate a purged session directory and claim a missing name.
+        if body.attach and open_already is None and not self._holds_workspace(session_id):
+            raise HTTPException(status_code=404, detail=f"Nothing to attach to: {session_id}")
         await self._bind_retained_scope(session_id, body, alias)
         self._require_not_closing(session_id)
         if open_already is not None:

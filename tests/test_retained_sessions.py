@@ -254,3 +254,27 @@ async def test_close_preserves_a_concurrently_replaced_record_and_its_files(tmp_
         assert "one" not in service._closing
     finally:
         await service.shutdown()
+
+
+def test_missing_attach_does_not_create_or_reserve_retained_scope(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from tests.test_interactive_gateway import SERVICE, Harness
+
+    harness = Harness()
+    harness.config.workspace_root = str(tmp_path)
+    with TestClient(harness.app) as client:
+        missing = client.post(
+            "/sessions",
+            headers=SERVICE,
+            json={"session_id": "missing", "tenant": "original", "attach": True},
+        )
+        assert missing.status_code == 404
+        assert not (tmp_path / "missing").exists()
+        assert harness.built == {}
+        created = client.post(
+            "/sessions",
+            headers=SERVICE,
+            json={"session_id": "missing", "tenant": "different"},
+        )
+        assert created.status_code == 200

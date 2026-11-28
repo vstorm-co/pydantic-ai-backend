@@ -597,3 +597,22 @@ def test_provider_retirement_refusal_is_retryable_not_success(
         monkeypatch.setattr(app.state.service, "hibernate", hibernate)
         assert client.delete(PATH, headers=headers).status_code == 204
         assert built[0].stopped == 1
+
+
+def test_repeated_end_preserves_saved_profile_and_session_authority(tmp_path):
+    with setup(tmp_path) as (client, headers, built, app, clock):
+        assert client.post(PATH, headers=headers, json={"profile_key": KEY}).status_code == 200
+        assert client.delete(PATH, headers=headers).status_code == 204
+        assert client.delete(PATH, headers=headers).status_code == 204
+        assert client.get("/sessions/profile", headers=headers).status_code == 200
+        resumed = client.post(PATH, headers=headers, json={"profile_key": KEY})
+        assert resumed.status_code == 200 and resumed.json()["profile_restored"]
+        assert len(built) == 2
+
+
+def test_end_hibernated_unstarted_browser_without_profile_closes_session(tmp_path):
+    with setup(tmp_path) as (client, headers, built, app, clock):
+        client.portal.call(app.state.service.hibernate, "profile")
+        assert client.delete(PATH, headers=headers).status_code == 204
+        assert client.get("/sessions/profile", headers=headers).status_code == 401
+        assert not (tmp_path / "profile/private/browser-profile.enc").exists()
