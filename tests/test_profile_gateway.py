@@ -616,3 +616,43 @@ def test_end_hibernated_unstarted_browser_without_profile_closes_session(tmp_pat
         assert client.delete(PATH, headers=headers).status_code == 204
         assert client.get("/sessions/profile", headers=headers).status_code == 401
         assert not (tmp_path / "profile/private/browser-profile.enc").exists()
+
+
+def test_initial_profile_discovery_is_busy_until_admission_completes(tmp_path, monkeypatch):
+    import asyncio
+    import time
+    from functools import partial
+
+    from pydantic_ai_backends.remote._interactive import EnvironmentStart, InteractiveGateway
+
+    with setup(tmp_path) as (client, headers, built, app, clock):
+        gateway = InteractiveGateway(app.state.service)
+        entered, release = asyncio.Event(), asyncio.Event()
+        discover = gateway._profile_context
+
+        async def delayed_discovery(sandbox):
+            entered.set()
+            await release.wait()
+            return await discover(sandbox)
+
+        monkeypatch.setattr(gateway, "_profile_context", delayed_discovery)
+        start = client.portal.start_task_soon(
+            partial(
+                gateway.start,
+                "profile",
+                "browser",
+                EnvironmentStart(profile_key=KEY),
+                headers["X-Sandbox-Token"],
+            )
+        )
+        try:
+            client.portal.call(entered.wait)
+            built[0]._last_activity = time.time() - 100
+            assert client.portal.call(app.state.service.manager.cleanup_idle, 1) == 0
+            assert built[0].stopped == 0
+        finally:
+            client.portal.call(release.set)
+        assert start.result(timeout=5).state == "ready"
+        assert app.state.service._inflight["profile"] == 1
+        client.portal.call(gateway.end, "profile", "browser", headers["X-Sandbox-Token"])
+        assert app.state.service._inflight.get("profile", 0) == 0

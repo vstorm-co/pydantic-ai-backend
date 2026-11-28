@@ -278,3 +278,89 @@ def test_missing_attach_does_not_create_or_reserve_retained_scope(tmp_path):
             json={"session_id": "missing", "tenant": "different"},
         )
         assert created.status_code == 200
+
+
+@pytest.mark.parametrize("quiet_refusal", [False, True])
+def test_destructive_service_cleanup_uses_confirmed_docker_removal(quiet_refusal):
+    from pydantic_ai_backends.backends.docker.sandbox import DockerSandbox
+    from pydantic_ai_backends.protocol import SandboxUnavailableError
+    from pydantic_ai_backends.remote.server import _remove_sandbox
+    from tests.test_docker_retirement import Container
+
+    sandbox = DockerSandbox(image="not-started")
+    container = Container()
+    sandbox._container = container
+    try:
+        if quiet_refusal:
+            container.remove = lambda *, force: None
+            with pytest.raises(SandboxUnavailableError):
+                _remove_sandbox(sandbox)
+            assert sandbox._container is container
+        else:
+            _remove_sandbox(sandbox)
+            assert container.removed
+            assert sandbox._container is None
+    finally:
+        sandbox._container = None
+
+
+def test_attach_refuses_a_workspace_that_disappeared_during_scope_check(tmp_path, monkeypatch):
+    import shutil
+
+    from fastapi.testclient import TestClient
+
+    from tests.test_interactive_gateway import SERVICE, Harness
+
+    harness = Harness()
+    service = harness.app.state.service
+    service.config.workspace_root = str(tmp_path)
+    workspace = tmp_path / "one/workspace"
+    workspace.mkdir(parents=True)
+    bind = service._bind_retained_scope
+
+    async def disappeared(session_id, body, alias):
+        await bind(session_id, body, alias)
+        shutil.rmtree(workspace)
+
+    monkeypatch.setattr(service, "_bind_retained_scope", disappeared)
+    with TestClient(harness.app) as client:
+        response = client.post(
+            "/sessions", headers=SERVICE, json={"session_id": "one", "attach": True}
+        )
+        assert response.status_code == 404
+        assert harness.built == {}
+        assert service.manager.session_count == 0
+
+
+@pytest.mark.parametrize("purge", [False, True])
+def test_raw_session_delete_returns_retryable_503_without_losing_failed_retirement(
+    monkeypatch, purge
+):
+    from fastapi.testclient import TestClient
+
+    from pydantic_ai_backends.protocol import SandboxUnavailableError
+    from tests.test_interactive_gateway import SERVICE, Harness
+
+    harness = Harness()
+    service = harness.app.state.service
+    with TestClient(harness.app) as client:
+        opened = client.post("/sessions", headers=SERVICE, json={"session_id": "one"})
+        headers = {"X-Sandbox-Token": opened.json()["token"]}
+        original = harness.built["one"]
+
+        def refused(*, purge=False):
+            raise SandboxUnavailableError("private provider payload")
+
+        monkeypatch.setattr(original, "stop_confirmed", refused, raising=False)
+        response = client.delete("/sessions/one", headers=headers, params={"purge": purge})
+        assert response.status_code == 503
+        assert "private provider payload" not in response.text
+        assert service.manager.sessions["one"] is original
+        assert service._sessions["one"].token == headers["X-Sandbox-Token"]
+        monkeypatch.setattr(
+            original, "stop_confirmed", lambda *, purge=False: original.stop(remove=purge)
+        )
+        assert (
+            client.delete("/sessions/one", headers=headers, params={"purge": purge}).status_code
+            == 204
+        )

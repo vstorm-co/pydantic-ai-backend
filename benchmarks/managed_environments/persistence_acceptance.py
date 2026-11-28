@@ -81,6 +81,8 @@ class Acceptance:
         self.base = "http://127.0.0.1:" + str(self.port)
         self.checks: list[str] = []
         self.report: dict[str, object] = {
+            "browser_only": args.browser_only,
+            "sandbox_idle_seconds": args.sandbox_idle_seconds,
             "wheel_sha256": hashlib.sha256(args.wheel.read_bytes()).hexdigest(),
             "scope": "Real local HTTPS fixture; persistent login, localStorage, IndexedDB and HOME",
             "model_calls": 0,
@@ -167,7 +169,7 @@ class Acceptance:
                 "--persist-browser-profiles",
                 "--persist-desktop-home",
                 "--sandbox-idle-seconds",
-                "3",
+                str(self.args.sandbox_idle_seconds),
                 stdout=log,
                 stderr=log,
             )
@@ -255,7 +257,7 @@ class Acceptance:
     async def browser_roundtrip(self) -> None:
         session = await self.create("browser-a")
         sid = session.session.session_id
-        api = SandboxdBrowser(self.base, sid, session.token)
+        api = SandboxdBrowser(self.base, sid, session.token, timeout=40)
         key, marker = new_key(), secrets.token_hex(16)
         initial = await api.start(profile_key=key)
         assert initial.persistent is True and initial.profile_restored is False
@@ -541,7 +543,8 @@ class Acceptance:
             await self.setup()
             await self.owner_lock()
             await self.browser_roundtrip()
-            await self.desktop_home()
+            if not self.args.browser_only:
+                await self.desktop_home()
             self.report["status"] = "passed"
         except BaseException as error:
             self.report.update(
@@ -570,6 +573,8 @@ def main() -> None:
     parser.add_argument("--wheel", type=Path, required=True)
     parser.add_argument("--browser-image", required=True)
     parser.add_argument("--desktop-image", required=True)
+    parser.add_argument("--browser-only", action="store_true")
+    parser.add_argument("--sandbox-idle-seconds", type=int, default=3)
     asyncio.run(Acceptance(parser.parse_args()).run())
 
 

@@ -719,6 +719,11 @@ def test_intercepted_navigation_can_continue_while_its_control_lease_is_held(
             {"id": 1, "method": "Page.navigate", "params": {"url": "https://example.test"}}
         )
         assert websocket.receive_json()["method"] == "Fetch.requestPaused"
+        import time
+
+        sandbox._last_activity = time.time() - 100
+        assert client.portal.call(harness.app.state.service.manager.cleanup_idle, 1) == 0
+        assert sandbox.stopped == 0
         assert client.get("/sessions/one/environments/browser", headers=headers).status_code == 200
         assert (
             client.post(

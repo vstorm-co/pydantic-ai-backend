@@ -293,26 +293,27 @@ class _BrowserRelay:
         key = _key(self.session_id, "browser")
         lease = registry.acquire(key, self.owner) if control is None else None
         try:
-            async with registry.use(
-                key, token=control if lease is None else lease.token, activity=True
-            ):
-                if isinstance(sandbox, ActiveSandbox):
-                    sandbox.touch()
-                try:
-                    await self.channel.send(message)
-                    await asyncio.wait_for(asyncio.shield(future), CDP_COMMAND_SECONDS)
-                except asyncio.TimeoutError as error:
-                    # The command may already be running. Block further input
-                    # until bounded recovery/retirement instead of replaying it.
-                    raise BrowserChannelError(
-                        "Browser command timed out; outcome unknown"
-                    ) from error
-                finally:
-                    if future.done():
-                        self._forget(identifier, future)
-                    else:
-                        with suppress(EnvironmentUnavailableError):
-                            registry.mark_unavailable(key)
+            with self.gateway.service.observe(self.session_id, "browser-input", "browser"):
+                async with registry.use(
+                    key, token=control if lease is None else lease.token, activity=True
+                ):
+                    if isinstance(sandbox, ActiveSandbox):
+                        sandbox.touch()
+                    try:
+                        await self.channel.send(message)
+                        await asyncio.wait_for(asyncio.shield(future), CDP_COMMAND_SECONDS)
+                    except asyncio.TimeoutError as error:
+                        # The command may already be running. Block further input
+                        # until bounded recovery/retirement instead of replaying it.
+                        raise BrowserChannelError(
+                            "Browser command timed out; outcome unknown"
+                        ) from error
+                    finally:
+                        if future.done():
+                            self._forget(identifier, future)
+                        else:
+                            with suppress(EnvironmentUnavailableError):
+                                registry.mark_unavailable(key)
         finally:
             self._forget(identifier, future)
             if not future.done():
@@ -537,13 +538,12 @@ class InteractiveGateway:
 
             script = desktop_start(body.width, body.height)
         try:
-            with self.service.observe(session_id, "environment-start", "desktop"):
-                result = await sandbox.run_command(
-                    ["/bin/sh", "-c", script],
-                    run_id=uuid4().hex,
-                    timeout=90,
-                    output_limit=4096,
-                )
+            result = await sandbox.run_command(
+                ["/bin/sh", "-c", script],
+                run_id=uuid4().hex,
+                timeout=90,
+                output_limit=4096,
+            )
             if result.exit_code != 0:
                 raise HTTPException(503, "The configured runtime could not start its environment")
         except BaseException:
@@ -586,7 +586,8 @@ class InteractiveGateway:
     ) -> EnvironmentSnapshot:
         self.authorize(session_id, token)
         async with self._mutation(session_id):
-            return await self._start(session_id, kind, body)
+            with self.service.observe(session_id, "environment-start", kind):
+                return await self._start(session_id, kind, body)
 
     async def _start(
         self, session_id: str, kind: Kind, body: EnvironmentStart

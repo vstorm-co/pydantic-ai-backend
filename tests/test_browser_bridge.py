@@ -169,7 +169,7 @@ async def test_close_unblocks_a_waiting_reader(sockets):
     receiving = asyncio.create_task(channel.receive())
     await asyncio.sleep(0)
     await channel.aclose()
-    with pytest.raises(bridge.BrowserChannelError, match="disconnected"):
+    with pytest.raises(bridge.BrowserChannelError, match="closed|disconnected"):
         await asyncio.wait_for(receiving, 1)
 
 
@@ -407,3 +407,95 @@ async def test_docker_open_failures_have_explicit_sanitized_channel_contract(soc
     with pytest.raises(bridge.BrowserChannelError, match="Docker could not open") as caught:
         await bridge.DockerBrowserChannel.open(FailedAPI(local), "owned-container")
     assert "private-docker-token" not in str(caught.value)
+
+
+def test_native_reader_polls_closed_state_even_when_shutdown_does_not_wake_recv(monkeypatch):
+    import threading
+
+    monkeypatch.setattr(bridge, "IO_POLL_SECONDS", 0.01)
+    entered = threading.Event()
+
+    class UnwokenSocket:
+        def settimeout(self, seconds):
+            self.timeout = seconds
+
+        def recv(self, _size):
+            entered.set()
+            threading.Event().wait(self.timeout)
+            raise TimeoutError()
+
+        def shutdown(self, _direction):
+            pass
+
+        def close(self):
+            pass
+
+    channel = bridge.DockerBrowserChannel(UnwokenSocket())
+    failures = []
+
+    def read():
+        try:
+            channel._read_exactly(8)
+        except bridge.BrowserChannelError as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=read)
+    worker.start()
+    try:
+        assert entered.wait(1)
+        channel.close()
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+        assert failures
+    finally:
+        channel.close()
+        worker.join(timeout=1)
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_polled_writer_preserves_offsets_and_does_not_replay_partial_bytes(stop):
+    output = bytearray()
+
+    class PartialSocket:
+        calls = 0
+
+        def settimeout(self, _seconds):
+            pass
+
+        def send(self, data):
+            self.calls += 1
+            if self.calls == 1:
+                output.extend(data[:1])
+                return 1
+            if self.calls == 2:
+                raise TimeoutError()
+            if stop:
+                return 0
+            output.extend(data)
+            return len(data)
+
+    channel = bridge.DockerBrowserChannel(PartialSocket())
+    if stop:
+        with pytest.raises(bridge.BrowserChannelError, match="disconnected"):
+            channel._send(b"complete")
+        assert output == b"c"
+    else:
+        channel._send(b"complete")
+        assert output == b"complete"
+    channel._closed = True
+    with pytest.raises(bridge.BrowserChannelError, match="closed"):
+        channel._send(b"more")
+
+
+async def test_socket_initialization_failure_does_not_lose_published_wrapper(sockets, monkeypatch):
+    raw, _peer = sockets
+    wrapper = Wrapper(raw)
+
+    def failed(_self, _raw, _owner):
+        raise OSError("socket configuration failed")
+
+    monkeypatch.setattr(bridge.DockerBrowserChannel, "__init__", failed)
+    with pytest.raises(bridge.BrowserChannelError, match="open"):
+        await bridge.DockerBrowserChannel.open(ExecAPI(wrapper), "owned-container")
+    assert wrapper.closed == 1
+    assert raw.fileno() == -1

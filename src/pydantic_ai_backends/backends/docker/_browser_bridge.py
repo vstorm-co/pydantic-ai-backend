@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE = 16 * 1024 * 1024
 OPEN_SECONDS = 15
 SEND_SECONDS = 15
+IO_POLL_SECONDS = 0.25
 
 
 class BrowserChannel(Protocol):
@@ -118,6 +119,7 @@ class DockerBrowserChannel:
         self._send_lock = asyncio.Lock()
         self._closed = False
         self._close_lock = threading.Lock()
+        self._stream.settimeout(IO_POLL_SECONDS)
 
     @classmethod
     async def open(cls, api: ExecAPI, container_id: str) -> DockerBrowserChannel:
@@ -151,6 +153,7 @@ class DockerBrowserChannel:
         try:
             with anyio.fail_after(OPEN_SECONDS):
                 raw, owner = await anyio.to_thread.run_sync(start, abandon_on_cancel=True)
+            channel = cls(raw, owner)
             opening.transfer()
         except TimeoutError as error:
             opening.abandon()
@@ -161,7 +164,7 @@ class DockerBrowserChannel:
         except BaseException:
             opening.abandon()
             raise
-        return cls(raw, owner)
+        return channel
 
     async def send(self, message: str) -> None:
         if self._closed:
@@ -181,7 +184,7 @@ class DockerBrowserChannel:
                     if self._closed:
                         raise BrowserChannelError("The browser channel is closed")
                     await anyio.to_thread.run_sync(
-                        self._stream.sendall, (message + "\n").encode(), abandon_on_cancel=True
+                        self._send, (message + "\n").encode(), abandon_on_cancel=True
                     )
         except TimeoutError as error:
             await self._abort()
@@ -195,10 +198,28 @@ class DockerBrowserChannel:
             await self._abort()
             raise
 
+    def _send(self, message: bytes) -> None:
+        remaining = memoryview(message)
+        while remaining:
+            if self._closed:
+                raise BrowserChannelError("The browser channel is closed")
+            try:
+                sent = self._stream.send(remaining)
+            except TimeoutError:
+                continue
+            if sent <= 0:
+                raise BrowserChannelError("The browser channel disconnected")
+            remaining = remaining[sent:]
+
     def _read_exactly(self, length: int) -> bytes:
         chunks = bytearray()
         while len(chunks) < length:
-            part = self._stream.recv(length - len(chunks))
+            if self._closed:
+                raise BrowserChannelError("The browser channel is closed")
+            try:
+                part = self._stream.recv(length - len(chunks))
+            except TimeoutError:
+                continue
             if not part:
                 raise BrowserChannelError("The browser channel disconnected")
             chunks.extend(part)
