@@ -241,7 +241,7 @@ class _BrowserRelay:
                 try:
                     await self.channel.send(message)
                     await asyncio.wait_for(asyncio.shield(future), CDP_COMMAND_SECONDS)
-                except TimeoutError as error:
+                except asyncio.TimeoutError as error:
                     # The command may already be running. Block further input
                     # until bounded recovery/retirement instead of replaying it.
                     raise BrowserChannelError(

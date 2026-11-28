@@ -39,6 +39,7 @@ workspaces = [
     "httpx>=0.28.0",
 ]
 browser = [
+    "anyio>=4.1.0",
     "httpx>=0.28.0",
     "websockets>=14.0",
     "websocket-client>=1.8.0",

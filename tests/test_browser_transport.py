@@ -76,20 +76,34 @@ async def test_provider_error_wakes_all_waiters(mode: str) -> None:
         await cdp.aclose()
 
 
-async def test_timeout_and_cancellation_do_not_replay_input() -> None:
+async def test_timeout_does_not_replay_input() -> None:
     socket = Socket("wait")
     cdp = WebSocketCDP(socket, timeout=0.01)
     with pytest.raises(TimeoutError):
         await cdp.call("Input.insertText", {"text": "once"})
-    command = asyncio.create_task(cdp.call("Input.insertText", {"text": "twice"}))
-    while len(socket.sent) < 2:
+    await socket.incoming.put(json.dumps({"id": 1, "result": {}}))
+    await asyncio.sleep(0)
+    assert len(socket.sent) == 1
+    await cdp.aclose()
+
+
+@pytest.mark.parametrize("during_send", [False, True])
+async def test_cancellation_preserves_caller_and_does_not_replay_input(during_send) -> None:
+    class WaitingSocket(Socket):
+        async def send(self, message: str) -> None:
+            await super().send(message)
+            if during_send:
+                await asyncio.Event().wait()
+
+    socket = WaitingSocket("wait")
+    cdp = WebSocketCDP(socket, timeout=30)
+    command = asyncio.create_task(cdp.call("Input.insertText", {"text": "once"}))
+    while not socket.sent:
         await asyncio.sleep(0)
     command.cancel()
     with pytest.raises(asyncio.CancelledError):
         await command
-    await socket.incoming.put(json.dumps({"id": 1, "result": {}}))
-    await asyncio.sleep(0)
-    assert len(socket.sent) == 2
+    assert len(socket.sent) == 1
     await cdp.aclose()
 
 

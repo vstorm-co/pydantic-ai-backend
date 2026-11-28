@@ -118,6 +118,8 @@ class WebSocketCDP:
     async def call(
         self, method: str, params: Mapping[str, object], *, session_id: str | None = None
     ) -> dict[str, object]:
+        from anyio import fail_after
+
         async with self._slots:
             if self._closed or self._reader.done():
                 raise BrowserError("The browser connection is closed")
@@ -133,8 +135,9 @@ class WebSocketCDP:
             if session_id is not None:
                 message["sessionId"] = session_id
             try:
-                await asyncio.wait_for(self._socket.send(json.dumps(message)), self._timeout)
-                return await asyncio.wait_for(future, self._timeout)
+                with fail_after(self._timeout):
+                    await self._socket.send(json.dumps(message))
+                    return await future
             finally:
                 self._pending.pop(identifier, None)
                 if future.done() and not future.cancelled():
