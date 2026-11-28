@@ -55,6 +55,10 @@ class EnvironmentSnapshot:
     last_activity_at: float
     expires_at: float
     lease_owner: str | None
+    persistent: bool = False
+    profile_restored: bool = False
+    profile_saved_at: float | None = None
+    generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -327,6 +331,10 @@ class ManagedEnvironmentRegistry(Generic[ResourceT]):
                 return
             await entry.resource.aclose()
             del self._entries[environment_id]
+
+    def retained_resources(self) -> list[ResourceT]:
+        """Resources still owned by this supervisor, including pending cleanup."""
+        return [entry.resource for entry in self._entries.values()]
 
     async def sweep(self) -> list[CleanupFailure]:
         """Retry due disposal independently; one failed provider cannot starve others."""

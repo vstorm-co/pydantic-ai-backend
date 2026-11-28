@@ -8,10 +8,16 @@ nor ports come from a caller. The managed container survives client disconnect.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
-from contextlib import suppress
-from dataclasses import dataclass
+import re
+import secrets
+import time
+import weakref
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from shlex import quote
@@ -20,7 +26,7 @@ from uuid import uuid4
 
 import anyio
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, TypeAdapter, ValidationError
 
 from pydantic_ai_backends.backends.docker._browser_bridge import (
     BrowserChannel,
@@ -29,6 +35,7 @@ from pydantic_ai_backends.backends.docker._browser_bridge import (
 from pydantic_ai_backends.backends.docker.session import alive_of
 from pydantic_ai_backends.protocol import CommandRunner, SandboxProbeError, SandboxUnavailableError
 from pydantic_ai_backends.remote import _browser_watchdog
+from pydantic_ai_backends.remote._browser_profiles import BrowserProfileError, BrowserProfileStore
 from pydantic_ai_backends.remote._environments import (
     EnvironmentConflictError,
     EnvironmentLease,
@@ -36,7 +43,8 @@ from pydantic_ai_backends.remote._environments import (
     EnvironmentUnavailableError,
     ManagedEnvironmentRegistry,
 )
-from pydantic_ai_backends.remote.wire import TOKEN_HEADER
+from pydantic_ai_backends.remote._profile_cdp import ProfileCDP
+from pydantic_ai_backends.remote.wire import SESSION_ID_PATTERN, TOKEN_HEADER
 
 if TYPE_CHECKING:
     from pydantic_ai_backends.remote.server import _Service
@@ -76,7 +84,7 @@ setsid nohup chromium --no-sandbox --no-first-run --no-default-browser-check \
     --user-data-dir=/tmp/sandboxd-browser-profile --password-store=basic \
     --proxy-server="$SANDBOXD_BROWSER_PROXY" --proxy-bypass-list="<-loopback>" \
     --disable-quic --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
-    --disable-dev-shm-usage about:blank >/tmp/sandboxd-browser.log 2>&1 &
+    --disable-dev-shm-usage __PROFILE_FLAGS__ about:blank >/tmp/sandboxd-browser.log 2>&1 &
 browser_pid=$!
 for _ in $(seq 100); do
     if python3 -c "$probe" 2>/dev/null; then
@@ -96,6 +104,7 @@ class EnvironmentStart(BaseModel):
     lifetime_seconds: int = Field(default=3600, ge=1, le=86400)
     width: int = Field(default=1280, ge=640, le=1920)
     height: int = Field(default=800, ge=480, le=1200)
+    profile_key: SecretStr | None = Field(default=None, repr=False)
 
 
 class LeaseToken(BaseModel):
@@ -129,19 +138,65 @@ class InteractiveResource:
     session_id: str
     sandbox: object
     kind: Kind
+    profile: BrowserProfileStore | None = field(default=None, repr=False)
+    profile_cdp: ProfileCDP | None = None
+    profile_fingerprint: bytes | None = field(default=None, repr=False)
+    profile_restored: bool = False
+    profile_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    profile_slots: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(2), repr=False
+    )
+    checkpointed: bool = False
+    last_checkpoint: float = field(default_factory=time.monotonic)
+    reserved: bool = False
+    owner: InteractiveGateway | None = field(default=None, repr=False)
+
+    async def checkpoint(self, *, graceful: bool) -> None:
+        if self.profile is None or self.checkpointed:
+            return
+        async with self.profile_lock:
+            if self.checkpointed:
+                return
+            if isinstance(self.sandbox, FreshSandbox):
+                alive = await anyio.to_thread.run_sync(self.sandbox.is_alive_fresh)
+                if not alive:
+                    # Emergency retirement can only retain the last completed
+                    # checkpoint. Never overwrite it with a fresh empty profile.
+                    self.checkpointed = True
+                    return
+            async with self.profile_slots:
+                await self.profile.checkpoint(self.sandbox, graceful=graceful)
+            self.last_checkpoint = time.monotonic()
+            self.checkpointed = graceful
+
+    async def checkpoint_due(self) -> None:
+        if self.profile is not None and time.monotonic() - self.last_checkpoint >= 30:
+            await self.checkpoint(graceful=False)
 
     async def aclose(self) -> None:
-        # Ending Browser's dedicated runtime stops all tabs, while workspace files
-        # remain subject to storage retention. Desktop can share a code workspace.
-        if self.kind == "browser":
-            try:
-                current = self.service.peek(self.session_id)
-            except HTTPException as error:
-                if error.status_code == 404:
-                    return
+        if self.kind != "browser":
+            if self.owner is not None:
+                self.owner._released(self)
+            return
+        if self.profile is not None:
+            await self.checkpoint(graceful=True)
+        try:
+            current = self.service.peek(self.session_id)
+        except HTTPException as error:
+            if error.status_code != 404:
                 raise
-            if current is self.sandbox:
+            current = None
+        if self.reserved:
+            if self.service._inflight.get(self.session_id, 0) > 0:
+                self.service._inflight[self.session_id] -= 1
+            self.reserved = False
+        if current is self.sandbox:
+            if self.profile is None:
                 await self.service.close_session(self.session_id)
+            else:
+                await self.service.hibernate(self.session_id)
+        if self.owner is not None:
+            self.owner._released(self)
 
 
 def _key(session_id: str, kind: Kind) -> str:
@@ -282,8 +337,50 @@ class _BrowserRelay:
 class InteractiveGateway:
     def __init__(self, service: _Service) -> None:
         self.service = service
+        self.resources: dict[str, InteractiveResource] = {}
+        self.profile_slots = asyncio.Semaphore(2)
+        self._mutations: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self.registry: ManagedEnvironmentRegistry[InteractiveResource] = ManagedEnvironmentRegistry(
             max_environments=service.config.max_interactive_environments
+        )
+
+    @asynccontextmanager
+    async def _mutation(self, session_id: str) -> AsyncIterator[None]:
+        lock = self._mutations.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            yield
+
+    def _released(self, resource: InteractiveResource) -> None:
+        if self.resources.get(resource.session_id) is resource:
+            del self.resources[resource.session_id]
+
+    async def prepare_purge(self, session_id: str) -> None:
+        resource = self.resources.get(session_id)
+        if resource is not None:
+            # Wait for any existing writer before deleting its ciphertext.
+            # New checkpoints recheck the flag while holding the same lock.
+            async with resource.profile_lock:
+                resource.checkpointed = True
+            with suppress(EnvironmentUnavailableError):
+                self.registry.mark_gone(_key(session_id, resource.kind))
+
+    async def prepare_sleep(self, session_id: str) -> None:
+        resource = self.resources.get(session_id)
+        if resource is not None:
+            await resource.checkpoint(graceful=True)
+
+    def _snapshot(self, session_id: str, snapshot: EnvironmentSnapshot) -> EnvironmentSnapshot:
+        resource = self.resources.get(session_id)
+        if resource is None or resource.profile is None:
+            return snapshot
+        return replace(
+            snapshot,
+            persistent=True,
+            profile_restored=resource.profile_restored,
+            profile_saved_at=resource.profile.saved_at,
+            generation=None if resource.profile_cdp is None else resource.profile_cdp.context_id,
         )
 
     def authorize(self, session_id: str, token: str | None) -> None:
@@ -322,6 +419,89 @@ class InteractiveGateway:
             raise EnvironmentUnavailableError("The original environment container is gone")
         return resource
 
+    async def _profile_context(self, sandbox: object) -> ProfileCDP:
+        if not isinstance(sandbox, BrowserProvider):
+            raise HTTPException(501, "This runtime cannot attach a persistent browser")
+        channel = await sandbox.open_browser_channel()
+        try:
+            with anyio.fail_after(10):
+                await channel.send(json.dumps({"id": 1, "method": "Target.getBrowserContexts"}))
+                while True:
+                    reply = _OBJECT.validate_json(await channel.receive())
+                    if reply.get("id") == 1:
+                        break
+                result = reply.get("result")
+                if not isinstance(result, dict):
+                    raise BrowserChannelError("The browser context discovery failed")
+                context = result.get("defaultBrowserContextId")
+                if context is not None and not isinstance(context, str):
+                    raise BrowserChannelError("The browser default context identity is invalid")
+                if context is None:
+                    await channel.send(json.dumps({"id": 2, "method": "Target.getTargets"}))
+                    while True:
+                        reply = _OBJECT.validate_json(await channel.receive())
+                        if reply.get("id") == 2:
+                            break
+                    result = reply.get("result")
+                    if isinstance(result, dict):
+                        targets = result.get("targetInfos")
+                        if isinstance(targets, list):
+                            for item in targets:
+                                if isinstance(item, dict) and item.get("type") == "page":
+                                    found = item.get("browserContextId")
+                                    if isinstance(found, str):
+                                        context = found
+                                        break
+                return ProfileCDP(uuid4().hex, context)
+        finally:
+            await self._detach(channel)
+
+    async def _failed_profile_start(self, session_id: str) -> None:
+        with anyio.move_on_after(10, shield=True) as deadline:
+            try:
+                await self.service.hibernate(session_id)
+            except Exception as error:
+                logger.warning("Profile startup cleanup failed (%s)", type(error).__name__)
+        if deadline.cancel_called:
+            logger.warning("Profile startup cleanup timed out: %s", session_id)
+
+    async def _restore_profile(
+        self,
+        session_id: str,
+        kind: Kind,
+        body: EnvironmentStart,
+        sandbox: object,
+    ) -> tuple[BrowserProfileStore | None, bool]:
+        if body.profile_key is None:
+            return None, False
+        if (
+            kind != "browser"
+            or self.service.config.workspace_root is None
+            or not self.service.config.persist_browser_profiles
+        ):
+            raise HTTPException(
+                409, "Persistent browser profiles require an enabled, stored browser workspace"
+            )
+        info = self.service.describe(session_id, sandbox, alive=True)
+        if not info.tenant:
+            raise HTTPException(409, "Persistent browser profiles require a tenant identity")
+        try:
+            profile = BrowserProfileStore(
+                Path(self.service.config.workspace_root),
+                info.tenant,
+                session_id,
+                body.profile_key.get_secret_value(),
+            )
+            async with self.profile_slots:
+                restored = await profile.restore(sandbox)
+        except ValueError as error:
+            await self._failed_profile_start(session_id)
+            raise HTTPException(422, "Invalid browser profile key or identity") from error
+        except BrowserProfileError as error:
+            await self._failed_profile_start(session_id)
+            raise HTTPException(409, "The saved browser profile could not be restored") from error
+        return profile, restored
+
     async def open_resource(
         self, session_id: str, kind: Kind, body: EnvironmentStart
     ) -> InteractiveResource:
@@ -333,6 +513,9 @@ class InteractiveGateway:
         runtime = self.service.describe(session_id, sandbox, alive=True).runtime
         if kind == "browser" and runtime != "browser":
             raise HTTPException(409, "Browser needs its dedicated browser runtime")
+        if kind == "desktop" and runtime == "browser":
+            raise HTTPException(409, "The browser runtime is dedicated to Browser environments")
+        profile, restored = await self._restore_profile(session_id, kind, body, sandbox)
         if kind == "browser":
             script = (
                 _BROWSER_START.replace("__WIDTH__", str(body.width))
@@ -342,6 +525,12 @@ class InteractiveGateway:
                     str(min(body.lifetime_seconds, self.service.config.interactive_max_lifetime)),
                 )
                 .replace("__WATCHDOG_SOURCE__", quote(_WATCHDOG_SOURCE))
+                .replace(
+                    "__PROFILE_FLAGS__",
+                    "--restore-last-session --disk-cache-size=1048576 --media-cache-size=1048576"
+                    if profile is not None
+                    else "",
+                )
             )
         else:
             from pydantic_ai_backends.desktop import desktop_start
@@ -371,20 +560,73 @@ class InteractiveGateway:
                 if cleanup.cancel_called:
                     logger.warning("Browser provision cleanup timed out: %s", session_id)
             raise
-        return InteractiveResource(self.service, session_id, sandbox, kind)
+        resource = InteractiveResource(self.service, session_id, sandbox, kind)
+        if profile is not None:
+            resource.profile = profile
+            resource.profile_slots = self.profile_slots
+            resource.profile_restored = restored
+            resource.profile_fingerprint = (
+                hashlib.sha256(body.profile_key.get_secret_value().encode()).digest()
+                if body.profile_key is not None
+                else None
+            )
+            try:
+                resource.profile_cdp = await self._profile_context(sandbox)
+            except BaseException:
+                await self._failed_profile_start(session_id)
+                raise
+            resource.reserved = True
+            self.service._inflight[session_id] += 1
+        resource.owner = self
+        self.resources[session_id] = resource
+        return resource
 
     async def start(
         self, session_id: str, kind: Kind, body: EnvironmentStart, token: TokenHeader = None
     ) -> EnvironmentSnapshot:
         self.authorize(session_id, token)
+        async with self._mutation(session_id):
+            return await self._start(session_id, kind, body)
+
+    async def _start(
+        self, session_id: str, kind: Kind, body: EnvironmentStart
+    ) -> EnvironmentSnapshot:
 
         try:
             try:
                 existing = self.registry.inspect(_key(session_id, kind))
             except EnvironmentUnavailableError:
                 existing = None
+            if existing is not None and existing.state == "expired":
+                await self.registry.close(_key(session_id, kind))
+                self.resources.pop(session_id, None)
+                existing = None
             if existing is not None and existing.state in ("ready", "unavailable"):
-                await self._original(session_id, kind)
+                try:
+                    resource = await self._original(session_id, kind)
+                except EnvironmentUnavailableError:
+                    if kind == "browser" and body.profile_key is None:
+                        raise
+                    # Only explicit Start can replace confirmed-lost processes.
+                    # GET/connect continue to refuse their exact old identities.
+                    await self.registry.close(_key(session_id, kind))
+                    self.resources.pop(session_id, None)
+                    resource = None
+                fingerprint = (
+                    None
+                    if body.profile_key is None
+                    else hashlib.sha256(body.profile_key.get_secret_value().encode()).digest()
+                )
+                expected = None if resource is None else resource.profile_fingerprint
+                same = (
+                    (expected is fingerprint)
+                    if expected is None or fingerprint is None
+                    else secrets.compare_digest(expected, fingerprint)
+                )
+                if resource is not None and not same:
+                    raise EnvironmentConflictError(
+                        "End the current browser before changing its profile"
+                    )
             snapshot = await self.registry.ensure(
                 _key(session_id, kind),
                 kind=kind,
@@ -404,7 +646,9 @@ class InteractiveGateway:
             raise HTTPException(409, str(error)) from error
         except EnvironmentUnavailableError as error:
             raise HTTPException(410, str(error)) from error
-        return snapshot
+        except (BrowserProfileError, SandboxUnavailableError, SandboxProbeError) as error:
+            raise HTTPException(503, "Browser profile restore or retirement failed") from error
+        return self._snapshot(session_id, snapshot)
 
     async def inspect(
         self, session_id: str, kind: Kind, token: TokenHeader = None
@@ -412,18 +656,26 @@ class InteractiveGateway:
         self.authorize(session_id, token)
         try:
             await self._original(session_id, kind)
-            return self.registry.inspect(_key(session_id, kind))
+            return self._snapshot(session_id, self.registry.inspect(_key(session_id, kind)))
         except EnvironmentUnavailableError as error:
             raise HTTPException(410, str(error)) from error
 
     async def end(self, session_id: str, kind: Kind, token: TokenHeader = None) -> None:
         self.authorize(session_id, token)
+        async with self._mutation(session_id):
+            await self._end(session_id, kind)
+
+    async def _end(self, session_id: str, kind: Kind) -> None:
         try:
             self.registry.inspect(_key(session_id, kind))
             registered = True
         except EnvironmentUnavailableError:
             registered = False
-        await self.registry.close(_key(session_id, kind))
+        try:
+            await self.registry.close(_key(session_id, kind))
+        except (BrowserProfileError, SandboxUnavailableError, SandboxProbeError) as error:
+            raise HTTPException(503, "Browser retirement failed; end was not completed") from error
+        self.resources.pop(session_id, None)
         if kind == "browser" and not registered:
             # A client may have journaled the workspace before Start was admitted.
             # End must settle that known dedicated container even without a GUI row.
@@ -435,6 +687,56 @@ class InteractiveGateway:
                 raise
             if self.service.describe(session_id, sandbox, alive=True).runtime == "browser":
                 await self.service.close_session(session_id)
+
+    async def suspend(self, session_id: str, kind: Kind, token: TokenHeader = None) -> None:
+        self.authorize(session_id, token)
+        async with self._mutation(session_id):
+            await self._suspend(session_id, kind)
+
+    async def _suspend(self, session_id: str, kind: Kind) -> None:
+        resource = self.resources.get(session_id)
+        if (
+            kind == "browser"
+            and resource is None
+            and self.service.config.workspace_root is not None
+        ):
+            saved = (
+                Path(self.service.config.workspace_root)
+                / session_id
+                / "private"
+                / "browser-profile.enc"
+            )
+            if self.service.peek(session_id) is None and saved.is_file():
+                return
+        if kind != "browser" or resource is None or resource.profile is None:
+            raise HTTPException(409, "Suspend requires a persistent browser profile")
+        try:
+            await self.registry.close(_key(session_id, kind))
+        except (BrowserProfileError, SandboxUnavailableError, SandboxProbeError) as error:
+            raise HTTPException(
+                503, "Browser retirement failed; sleep was not completed"
+            ) from error
+        self.resources.pop(session_id, None)
+
+    async def purge_profile(self, session_id: str, kind: Kind, token: TokenHeader = None) -> None:
+        if re.fullmatch(SESSION_ID_PATTERN, session_id) is None:
+            raise HTTPException(422, "Invalid browser session identity")
+        try:
+            self.authorize(session_id, token)
+        except HTTPException as error:
+            if error.status_code != 404:
+                raise
+            self.service.check_service_token(token)
+        async with self._mutation(session_id):
+            await self._purge_profile(session_id, kind)
+
+    async def _purge_profile(self, session_id: str, kind: Kind) -> None:
+        if kind != "browser":
+            raise HTTPException(409, "Only Browser profiles have this purge operation")
+        await self.prepare_purge(session_id)
+        await self.registry.close(_key(session_id, kind))
+        self.resources.pop(session_id, None)
+        await self.service.close_session(session_id, purge=True)
 
     async def lease(
         self, session_id: str, kind: Kind, body: LeaseRequest, token: TokenHeader = None
@@ -547,6 +849,14 @@ class InteractiveGateway:
                     "The browser channel belongs to an older container"
                 )
             parsed = _OBJECT.validate_json(message)
+            if resource.profile_cdp is not None:
+                decision = resource.profile_cdp.request(parsed)
+                if decision.response is not None:
+                    await websocket.send_json(decision.response)
+                    continue
+                assert decision.forward is not None
+                parsed = _OBJECT.validate_python(decision.forward)
+                message = json.dumps(parsed)
             if parsed.get("method") == "Target.createBrowserContext":
                 params = parsed.get("params", {})
                 if not isinstance(params, dict):
@@ -582,8 +892,12 @@ class InteractiveGateway:
                 raise EnvironmentUnavailableError(
                     "The browser channel belongs to an older container"
                 )
-            await relay.acknowledge(_OBJECT.validate_json(message))
-            await websocket.send_text(message)
+            payload = _OBJECT.validate_json(message)
+            await relay.acknowledge(payload)
+            if resource.profile_cdp is not None:
+                await websocket.send_json(resource.profile_cdp.response(payload))
+            else:
+                await websocket.send_text(message)
 
 
 def register_interactive_routes(
@@ -594,6 +908,10 @@ def register_interactive_routes(
     app.add_api_route(path, gateway.start, methods=["POST"])
     app.add_api_route(path, gateway.inspect, methods=["GET"])
     app.add_api_route(path, gateway.end, methods=["DELETE"], status_code=204)
+    app.add_api_route(path + "/suspend", gateway.suspend, methods=["POST"], status_code=204)
+    app.add_api_route(path + "/profile", gateway.purge_profile, methods=["DELETE"], status_code=204)
+    service.manager.before_release = gateway.prepare_sleep
+    service.before_purge = gateway.prepare_purge
     app.add_api_route(path + "/lease", gateway.lease, methods=["POST"])
     app.add_api_route(path + "/lease/renew", gateway.renew_lease, methods=["POST"])
     app.add_api_route(
@@ -607,5 +925,10 @@ async def maintain_interactive(registry: ManagedEnvironmentRegistry[InteractiveR
     """Retire by deadline without screenshot work or client traffic."""
     while True:
         await asyncio.sleep(1)
+        for resource in registry.retained_resources():
+            try:
+                await resource.checkpoint_due()
+            except (BrowserProfileError, SandboxUnavailableError, SandboxProbeError):
+                logger.warning("Browser profile checkpoint failed: %s", resource.session_id)
         for failed in await registry.sweep():
             logger.warning("Interactive cleanup failed: %s", failed.environment_id)

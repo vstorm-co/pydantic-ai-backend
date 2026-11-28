@@ -52,12 +52,12 @@ import stat
 import time
 import uuid
 from collections import Counter, deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -70,6 +70,7 @@ from pydantic_ai_backends._limits import MAX_RUN_OUTPUT_BYTES
 from pydantic_ai_backends.backends.docker._image import buildkit_available
 from pydantic_ai_backends.backends.docker.runtimes import get_runtime
 from pydantic_ai_backends.backends.docker.session import (
+    ConfirmedStop,
     SessionLimitExceeded,
     SessionManager,
     alive_of,
@@ -84,6 +85,7 @@ from pydantic_ai_backends.remote._filesystem import (
     FilesystemMountBroker,
     FilesystemMountError,
 )
+from pydantic_ai_backends.remote._storage_owner import StorageOwner
 from pydantic_ai_backends.remote._workspace import (
     WorkspacePathError,
     list_workspace,
@@ -148,6 +150,9 @@ class SandboxRuntime:
             runtime that installs arbitrary packages off the network is the one
             worth paying gVisor's I/O overhead for, while a plain shell is not.
             Must be registered with the daemon; `None` takes its default.
+        home_path: Operator-known home for a custom desktop image, required
+            when enabling persistent desktop home for that image. Restricted
+            to `/root` or a path below `/home`; never supplied by a client.
     """
 
     image: str | None = None
@@ -160,8 +165,20 @@ class SandboxRuntime:
     pids_limit: int | None = None
     network_mode: str | None = None
     oci_runtime: str | None = None
+    home_path: str | None = None
 
     def __post_init__(self) -> None:
+        if self.home_path is not None:
+            home = PurePosixPath(self.home_path)
+            if (
+                not home.is_absolute()
+                or ".." in home.parts
+                or not (
+                    home == PurePosixPath("/root")
+                    or (len(home.parts) >= 3 and home.parts[1] == "home")
+                )
+            ):
+                raise ValueError("home_path must be /root or an absolute path below /home")
         if (self.image is None) == (self.runtime is None):
             raise ValueError("A SandboxRuntime needs exactly one of image or runtime")
 
@@ -437,6 +454,10 @@ class SandboxdConfig:
             every idle timeout is not working in "the same" machine. The cost is
             that stopped containers accumulate until a session is closed with
             `purge`, so this is off by default.
+        persist_desktop_home: Persist desktop application settings and user
+            files outside the container write layer. Requires `workspace_root`;
+            mounts a private sibling home directory, outside workspace archives.
+            Built-in desktops infer their home; custom images name `home_path`.
         idle_timeout: Seconds of inactivity before a session is reaped.
         cleanup_interval: Seconds between reaping passes.
         workspace_ttl: Seconds an unused workspace directory is kept before it is
@@ -517,6 +538,8 @@ class SandboxdConfig:
     work_dir: str = "/workspace"
     workspace_root: str | None = None
     persist_containers: bool = False
+    persist_desktop_home: bool = False
+    persist_browser_profiles: bool = False
     prewarm: bool = True
     idle_timeout: int = 1800
     interactive_idle_timeout: int = 900
@@ -553,6 +576,9 @@ class SandboxdConfig:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        self._validate_desktop_home()
+        if self.persist_browser_profiles and self.workspace_root is None:
+            raise ValueError("Persistent browser profiles require workspace_root")
         if bool(self.filesystem_gateway_url) != bool(self.filesystem_export_image):
             raise ValueError(
                 "filesystem_gateway_url and filesystem_export_image must be configured together"
@@ -575,6 +601,7 @@ class SandboxdConfig:
             raise ValueError("SandboxdConfig.runtimes must allow at least one image")
         if not self.default_runtime:
             self.default_runtime = next(iter(self.runtimes))
+
         if self.default_runtime not in self.runtimes:
             raise ValueError(
                 f"default_runtime {self.default_runtime!r} is not in runtimes "
@@ -594,6 +621,14 @@ class SandboxdConfig:
                 f"max_open_sessions ({self.max_open_sessions}) is below max_sessions "
                 f"({self.max_sessions}): a session has to exist to be resident"
             )
+
+    def _validate_desktop_home(self) -> None:
+        if self.persist_desktop_home and self.workspace_root is None:
+            raise ValueError("Persistent desktop home requires workspace_root")
+        if self.persist_desktop_home and "desktop" in self.runtimes:
+            desktop_entry = _as_runtime(self.runtimes["desktop"])
+            if desktop_entry.resolved_runtime() is None and desktop_entry.home_path is None:
+                raise ValueError("Custom desktop images require an explicit home_path")
 
     def resolve_runtime(self, alias: str | None) -> tuple[str, SandboxRuntime]:
         """Resolve a client-supplied alias to an allowed runtime.
@@ -946,12 +981,30 @@ def _default_builder(
         from pydantic_ai_backends.backends.docker.sandbox import DockerSandbox
 
         volumes = _session_volumes(config, session_id)
+        built_runtime = _session_runtime(config, runtime)
+        desktop_runtime = built_runtime is not None and built_runtime.name == "desktop"
+        if config.persist_desktop_home and (desktop_runtime or runtime.home_path is not None):
+            session_dir = _session_dir(config, session_id)
+            assert session_dir is not None
+            home = session_dir / "home"
+            if home.is_symlink():
+                raise ValueError("Persistent desktop home must not be a symbolic link")
+            home.mkdir(exist_ok=True, mode=0o700)
+            home_uid = built_runtime.run_as_uid if built_runtime is not None else config.sandbox_uid
+            if home_uid is not None:
+                _hand_workspace_to(home, home_uid)
+            home_path = runtime.home_path or ("/home/agent" if home_uid is not None else "/root")
+            work = PurePosixPath(config.work_dir)
+            home_target = PurePosixPath(home_path)
+            if work == home_target or work in home_target.parents or home_target in work.parents:
+                raise ValueError("Persistent home and workspace paths must not overlap")
+            volumes = {**(volumes or {}), str(home.resolve()): home_path}
         if filesystem_volume is not None:
             volume = filesystem_volume(session_id)
             if volume is not None:
                 volumes = {**(volumes or {}), volume: MOUNT_PATH}
         return DockerSandbox(
-            runtime=_session_runtime(config, runtime),
+            runtime=built_runtime,
             image=runtime.image or "",
             session_id=session_id,
             work_dir=config.work_dir,
@@ -1153,6 +1206,9 @@ def _remove_sandbox(sandbox: Any) -> None:
     rather than through `SessionManager.release` keeps the manager's contract at
     plain `stop()`, and the second `stop()` release makes is a no-op.
     """
+    if isinstance(sandbox, ConfirmedStop):
+        sandbox.stop_confirmed(purge=True)
+        return
     remover = getattr(sandbox, "stop", None)
     if remover is None:  # pragma: no cover - every sandbox has stop()
         return
@@ -1302,6 +1358,7 @@ class _Service:
         self._pending: dict[str, _Pending] = {}
         self._executor: ThreadPoolExecutor | None = None
         self._sweep_task: asyncio.Task[None] | None = None
+        self.before_purge: Callable[[str], Awaitable[None]] | None = None
         self._prewarm_task: asyncio.Task[None] | None = None
         # `None` when no overrides file is configured, which is the default - so
         # the sweep loop skips even the `stat` for every deployment not using it.
@@ -1326,12 +1383,15 @@ class _Service:
         # `on_release` cannot tell the two apart on its own, and forgetting a
         # hibernating session would throw away the token its caller still holds.
         self._hibernating: set[str] = set()
+        self._closing: set[str] = set()
+        self._storage_owner: StorageOwner | None = None
         self.manager = SessionManager(
             sandbox_factory=self._new_sandbox,
             max_sessions=config.max_sessions,
             default_idle_timeout=config.idle_timeout,
             on_release=self._forget,
             in_use=self._in_use,
+            confirm_stop=True,
         )
 
     def _in_use(self, session_id: str) -> bool:
@@ -1370,7 +1430,29 @@ class _Service:
         return self._build_sandbox(session_id, pending.runtime)
 
     def startup(self) -> None:
-        """Create the worker pool and begin reaping idle sessions and workspaces."""
+        """Acquire storage authority before starting any session lifecycle work."""
+        if self._storage_owner is not None:
+            raise RuntimeError("This storage supervisor is already started")
+        if self.config.workspace_root is not None:
+            owner = StorageOwner(
+                Path(self.config.workspace_root),
+                exclusive=self.config.persist_browser_profiles or self.config.persist_desktop_home,
+            )
+            owner.acquire()
+            self._storage_owner = owner
+        try:
+            self._startup()
+        except BaseException:
+            self._release_storage_owner()
+            raise
+
+    def _release_storage_owner(self) -> None:
+        if self._storage_owner is not None:
+            self._storage_owner.close()
+            self._storage_owner = None
+
+    def _startup(self) -> None:
+        """Create worker pools and maintenance after storage ownership is established."""
         # A running command holds a thread for as long as it runs, reading its
         # output. On anyio's default limiter of 40 the forty-first command on the
         # whole service waited; commands now have a pool of their own, and the
@@ -1473,7 +1555,13 @@ class _Service:
             self.filesystem_mounts.sweep(set(keep))
 
     async def shutdown(self) -> None:
-        """Stop every sandbox and release the worker pool."""
+        """Stop every sandbox before releasing this process's storage authority."""
+        try:
+            await self._shutdown()
+        finally:
+            self._release_storage_owner()
+
+    async def _shutdown(self) -> None:
         for task in (self._sweep_task, self._prewarm_task):
             if task is not None:
                 task.cancel()
@@ -1542,6 +1630,7 @@ class _Service:
                 backpressure rather than an error: the work is still there, and
                 the caller is being asked to come back.
         """
+        self._require_not_closing(session_id)
         if self.filesystem_mounts is not None:
             try:
                 await self._in_thread(functools.partial(self.filesystem_mounts.check, session_id))
@@ -1561,6 +1650,7 @@ class _Service:
             if resident is None:
                 # Waking claims a slot, so somebody idle may have to give one up.
                 await self.make_room()
+            self._require_not_closing(session_id)
             sandbox = await self.manager.get_or_create(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"No such session: {session_id}") from exc
@@ -1786,6 +1876,8 @@ class _Service:
             execute_timeout=config.execute_timeout,
             max_read_bytes=config.max_read_bytes,
             persist_containers=config.persist_containers,
+            persist_desktop_home=config.persist_desktop_home,
+            persist_browser_profiles=config.persist_browser_profiles,
             sandbox_uid=config.sandbox_uid,
             workspace_ttl=config.workspace_ttl,
             container_ttl=config.container_ttl,
@@ -1854,6 +1946,34 @@ class _Service:
         except HTTPException:
             return None
 
+    async def _bind_retained_scope(
+        self, session_id: str, body: wire.CreateSessionRequest, alias: str
+    ) -> None:
+        open_already = self._sessions.get(session_id)
+        if self.config.workspace_root is not None:
+            from ._retained_sessions import (
+                RetainedSessionConflict,
+                RetainedSessionUnavailable,
+                bind_retained_session,
+            )
+
+            try:
+                await self._in_thread(
+                    functools.partial(
+                        bind_retained_session,
+                        Path(self.config.workspace_root),
+                        session_id,
+                        body.tenant,
+                        open_already.runtime
+                        if open_already is not None and body.runtime is None
+                        else alias,
+                    )
+                )
+            except RetainedSessionConflict as error:
+                raise HTTPException(409, "Retained session scope does not match") from error
+            except RetainedSessionUnavailable as error:
+                raise HTTPException(503, "Retained session scope could not be verified") from error
+
     async def open_session(self, body: wire.CreateSessionRequest) -> wire.SessionCreated:
         """Open a session and mint a token scoped to it.
 
@@ -1877,6 +1997,7 @@ class _Service:
         if body.attach and body.session_id is None:
             raise HTTPException(status_code=400, detail="attach needs the session_id to attach to")
         session_id = body.session_id or f"s-{uuid.uuid4().hex[:16]}"
+        self._require_not_closing(session_id)
         if body.filesystem_binding is not None and body.session_id is None:
             raise HTTPException(
                 status_code=400, detail="A filesystem binding requires a named session"
@@ -1884,6 +2005,8 @@ class _Service:
         if body.filesystem_binding is not None and self.filesystem_mounts is None:
             raise HTTPException(status_code=400, detail="Live filesystem mounts are not enabled")
         open_already = self._sessions.get(session_id)
+        await self._bind_retained_scope(session_id, body, alias)
+        self._require_not_closing(session_id)
         if open_already is not None:
             if not (body.reuse or body.attach):
                 raise HTTPException(status_code=409, detail=f"Session exists: {session_id}")
@@ -2158,6 +2281,22 @@ class _Service:
                 which is what makes a later attach find the same files; with it,
                 the session is gone for good.
         """
+        self._require_not_closing(session_id)
+        self._closing.add(session_id)
+        try:
+            await self._close_session(session_id, purge)
+        finally:
+            self._closing.discard(session_id)
+
+    def _require_not_closing(self, session_id: str) -> None:
+        if session_id in self._closing:
+            raise HTTPException(409, "Session is closing; retry after cleanup completes")
+
+    async def _close_session(self, session_id: str, purge: bool) -> None:
+        original = self._sessions.get(session_id)
+        original_pending = self._pending.get(session_id)
+        if purge and self.before_purge is not None:
+            await self.before_purge(session_id)
         sandbox = self.manager.sessions.get(session_id)
         if purge:
             if sandbox is not None:
@@ -2172,10 +2311,18 @@ class _Service:
                     )
                 )
 
-        if not await self.manager.release(session_id):
-            # Hibernated, so the manager has nothing to release and `on_release`
-            # never fires. The records that outlive a sandbox end here instead.
+        await self.manager.release(session_id)
+        if (
+            self._sessions.get(session_id) is original
+            and self._pending.get(session_id) is original_pending
+        ):
+            # An explicit close wins over a queued hibernate's keep-token flag.
+            self._hibernating.discard(session_id)
             self._forget(session_id)
+        elif self._sessions.get(session_id) is not None:
+            raise HTTPException(
+                409, "Session identity changed during cleanup; replacement retained"
+            )
 
         if self.filesystem_mounts is not None:
             await self._in_thread(
@@ -2592,7 +2739,12 @@ def _register_session_routes(app: FastAPI, service: _Service) -> None:
                 nothing is left for a later attach to find. Use it when the thing
                 the session belonged to — a conversation, a user — is gone.
         """
-        await service.close_session(session_id, purge=purge)
+        try:
+            await service.close_session(session_id, purge=purge)
+        except SandboxUnavailableError as error:
+            raise HTTPException(
+                503, "Container retirement could not be confirmed; retry cleanup"
+            ) from error
 
 
 def _register_workspace_routes(app: FastAPI, service: _Service) -> None:

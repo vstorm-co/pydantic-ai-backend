@@ -1329,3 +1329,43 @@ class TestIdleCleanupLeavesBusySessionsAlone:
         manager = SessionManager(sandbox_factory=self.Quiet)
         await manager.get_or_create("a")
         assert await manager._release_if_idle("missing", None) is False
+
+
+@pytest.mark.parametrize("idle", [False, True])
+async def test_before_release_failure_preserves_live_identity_for_checkpoint_retry(idle):
+    sandbox = MockDockerSandbox(session_id="one")
+    sandbox._last_activity = time.time() - 100
+    calls = []
+
+    async def checkpoint(session_id):
+        calls.append(session_id)
+        assert manager.sessions[session_id] is sandbox
+        if len(calls) == 1:
+            raise RuntimeError("checkpoint failed")
+
+    manager = SessionManager(sandbox_factory=lambda _id: sandbox, before_release=checkpoint)
+    await manager.get_or_create("one")
+    with pytest.raises(RuntimeError, match="checkpoint failed"):
+        if idle:
+            await manager.cleanup_idle(max_idle=1)
+        else:
+            await manager.release("one")
+    assert manager.sessions["one"] is sandbox
+    assert sandbox.is_alive()
+    if idle:
+        assert await manager.cleanup_idle(max_idle=1) == 1
+    else:
+        assert await manager.release("one")
+    assert calls == ["one", "one"]
+    assert not sandbox.is_alive()
+
+
+async def test_idle_release_without_a_checkpoint_hook_still_retires():
+    sandbox = MockDockerSandbox(session_id="one")
+    sandbox._last_activity = time.time() - 100
+    released = []
+    manager = SessionManager(sandbox_factory=lambda _id: sandbox, on_release=released.append)
+    await manager.get_or_create("one")
+    assert await manager.cleanup_idle(max_idle=1) == 1
+    assert not sandbox.is_alive()
+    assert released == ["one"]

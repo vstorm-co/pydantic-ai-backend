@@ -246,3 +246,45 @@ This bounded smoke used five repetitions and skipped resource sampling and timed
 stream profiling; it makes no new performance claim. Candidate05's full 25-sample,
 production-proxy and independent-watchdog receipts remain the detailed evidence.
 See `results/candidate06-smoke.json`. No package release was published.
+
+## Persistent-profile and Desktop HOME acceptance
+
+Run `persistence_acceptance.py` with an installed candidate that includes persistent
+profiles. It starts its own service with **explicit** `persist_browser_profiles`
+and `persist_desktop_home` opt-ins and a private storage root. The custom benchmark
+Desktop image runs as root, so the fixture explicitly declares `/root` as its HOME;
+operators must match their actual image UID and HOME instead.
+
+```bash
+env -u PYTHONPATH "$BENCH_PY" benchmarks/managed_environments/persistence_acceptance.py \
+  --folder "$BENCH_ROOT/persistence-run" --wheel "$BENCH_WHEEL" \
+  --browser-image "$BENCH_BROWSER_IMAGE" --desktop-image "$BENCH_DESKTOP_IMAGE"
+```
+
+The fixture adds one container serving a local HTTPS origin and an HTTP CONNECT
+proxy that permits **only** that exact origin. It has no external network. A
+certificate bypass is enabled only on the disposable test Browser; this validates
+HTTPS cookie/storage behavior, not production certificate trust. The production
+Squid policy remains a separate acceptance test.
+
+The checks validate server-side persistent and session-only `Secure; HttpOnly`
+cookies, localStorage, committed IndexedDB, fast logout followed immediately by
+suspend, actual container removal/recreation and explicit resume. Old live
+context/target IDs are refused after a new generation starts. Wrong keys, corrupt
+ciphertext, simultaneous starts, tenant/session isolation, ordinary End versus
+purge, storage-owner locking and Desktop HOME/config/workspace files are also
+checked. User/agent/conversation ownership mapping belongs to application tests.
+No cookie values, profile keys or raw profiles belong in the recorded receipts.
+
+The recorded findings preserve the failed experiments: candidate07 exposed Docker
+archive APIs missing live tmpfs contents; candidate08 exposed logout flush timing;
+candidate09 passed all ten functional checks, but a remaining native socket-reader
+thread prevented orderly service exit. Its receipt remains failed, with that
+cleanup limitation explicit. A later passing receipt must identify its own wheel.
+
+The watchdog fixture also accepts `--stop-chromium-before-service-kill`. It stops
+only the exact recorded Chromium process group, verifies Docker is **not** paused
+and the independent watchdog remains runnable, then kills its own service. This
+simulates the process state of an interrupted checkpoint; it does not claim that
+a real periodic archive operation overlapped the kill. Candidate09's container
+stopped within the recorded 0.25-second deadline-observation tolerance.

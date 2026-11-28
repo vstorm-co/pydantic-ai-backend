@@ -70,6 +70,7 @@ remote = [
     "httpx>=0.28.0",
 ]
 server = [
+    "cryptography>=50.0.2",
     "anyio>=4.1.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",

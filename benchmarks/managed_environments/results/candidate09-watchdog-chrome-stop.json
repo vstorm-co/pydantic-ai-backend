@@ -1,0 +1,20 @@
+{
+  "wheel": "pydantic_ai_backend-0.2.42-py3-none-any.whl",
+  "wheel_sha256": "1f49e3d80110d495606a3a285003078c252af23898bc82e99f29a31d6067a45f",
+  "scope": "Own sandboxd SIGKILL, not a client disconnect",
+  "model_calls": 0,
+  "checkpoint_interruption_scope": "Manually reproduce checkpoint writer SIGSTOP on exact Chromium group; Docker/watchdog remain running, then kill own service",
+  "runtime_websocket_client_version": "1.9.2",
+  "runtime_image_id": "sha256:ebb696d71b8248a474cec68f5ede1db2d7c6e73f30a297b249c266f75455f4fd",
+  "chromium_group_stopped_before_supervisor_kill": true,
+  "docker_container_paused": false,
+  "watchdog_process_stopped": false,
+  "status": "passed",
+  "reconnect_preserved_original_deadline": true,
+  "supervisor_exit_code": -9,
+  "remaining_lifetime_at_kill_seconds": 6.884466833027545,
+  "deadline_observation_tolerance_seconds": 0.25,
+  "container_stop_after_supervisor_kill_seconds": 6.9506953750387765,
+  "container_stop_after_original_deadline_seconds": 0.06622854201123118,
+  "container_status": "exited"
+}

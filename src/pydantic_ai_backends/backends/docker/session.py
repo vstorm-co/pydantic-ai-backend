@@ -32,11 +32,11 @@ import functools
 import inspect
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -82,6 +82,11 @@ class SessionLimitExceeded(RuntimeError):
         )
 
 
+@runtime_checkable
+class ConfirmedStop(Protocol):
+    def stop_confirmed(self, *, purge: bool = False) -> None: ...
+
+
 class SessionManager:
     """Creates, reuses and reaps one sandbox per session id.
 
@@ -105,6 +110,8 @@ class SessionManager:
         on_release: Callable[[str], None] | None = None,
         executor: Executor | None = None,
         in_use: Callable[[str], bool] | None = None,
+        before_release: Callable[[str], Awaitable[None]] | None = None,
+        confirm_stop: bool = False,
     ):
         """Initialize the manager.
 
@@ -138,6 +145,10 @@ class SessionManager:
                 that tracks them. Idle cleanup never stops such a session: its
                 last activity is when the operation began, and a command longer
                 than the idle timeout is not idle.
+            before_release: Optional async checkpoint hook, run under the
+                session's lifecycle lock before stop/removal. Failure retains
+                the resident sandbox for retry. It must not recursively open
+                or release the same session.
         """
         self._sessions: dict[str, Any] = {}
         self._sandbox_factory = sandbox_factory
@@ -147,6 +158,8 @@ class SessionManager:
         self._workspace_root = Path(workspace_root) if workspace_root else None
         self._max_sessions = max_sessions
         self._on_release = on_release
+        self.before_release = before_release
+        self._confirm_stop = confirm_stop
         self.executor = executor
         self._in_use = in_use
         # Per-session locks serialize every lifecycle change for one id —
@@ -324,10 +337,20 @@ class SessionManager:
         second sandbox for one session — the leak the lock is meant to prevent.
         """
         async with self._session_lock(session_id):
-            sandbox = self._sessions.pop(session_id, None)
+            sandbox = self._sessions.get(session_id)
             if sandbox is None:
                 return False
-            await self._lifecycle(sandbox.stop)
+            if self.before_release is not None:
+                await self.before_release(session_id)
+            if not self._confirm_stop:
+                self._sessions.pop(session_id)
+            stop = (
+                sandbox.stop_confirmed
+                if self._confirm_stop and isinstance(sandbox, ConfirmedStop)
+                else sandbox.stop
+            )
+            await self._lifecycle(stop)
+            self._sessions.pop(session_id, None)
 
         self._prune_locks()
         # Outside the lock: `on_release` belongs to the caller, and one that
@@ -380,8 +403,17 @@ class SessionManager:
             sandbox = self._sessions.get(session_id)
             if sandbox is None or not self._idle(session_id, sandbox, time.time(), max_idle):
                 return False
-            self._sessions.pop(session_id)
-            await self._lifecycle(sandbox.stop)
+            if self.before_release is not None:
+                await self.before_release(session_id)
+            if not self._confirm_stop:
+                self._sessions.pop(session_id)
+            stop = (
+                sandbox.stop_confirmed
+                if self._confirm_stop and isinstance(sandbox, ConfirmedStop)
+                else sandbox.stop
+            )
+            await self._lifecycle(stop)
+            self._sessions.pop(session_id, None)
         if self._on_release is not None:
             self._on_release(session_id)
         return True

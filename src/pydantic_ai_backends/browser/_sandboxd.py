@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from pydantic_ai_backends.remote.wire import SESSION_ID_PATTERN, TOKEN_HEADER
 
@@ -49,6 +49,10 @@ class ManagedBrowserState(BaseModel):
     last_activity_at: float = Field(ge=0, allow_inf_nan=False)
     expires_at: float = Field(ge=0, allow_inf_nan=False)
     lease_owner: str | None
+    persistent: bool = False
+    profile_restored: bool = False
+    profile_saved_at: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    generation: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class _Start(BaseModel):
@@ -57,6 +61,7 @@ class _Start(BaseModel):
     lifetime_seconds: int = Field(ge=1, le=86400)
     width: int = Field(ge=640, le=1920)
     height: int = Field(ge=480, le=1200)
+    profile_key: SecretStr | None = Field(default=None, repr=False)
 
 
 @dataclass
@@ -140,15 +145,17 @@ class SandboxdBrowser:
         """Session-scoped credential headers; never include in logs or UI responses."""
         return {TOKEN_HEADER: self.token}
 
-    async def _request(self, method: str, body: _Start | None = None) -> bytes | None:
+    async def _request(
+        self, method: str, body: _Start | None = None, *, suffix: str = ""
+    ) -> bytes | None:
         import httpx
 
         async def send(client: httpx.AsyncClient) -> httpx.Response:
             return await client.request(
                 method,
-                self._path,
+                self._path + suffix,
                 headers=self.connection_headers,
-                json=None if body is None else body.model_dump(),
+                json=None if body is None else self._start_payload(body),
                 timeout=self.timeout,
                 follow_redirects=False,
             )
@@ -179,6 +186,13 @@ class SandboxdBrowser:
             )
         return response.content
 
+    @staticmethod
+    def _start_payload(body: _Start) -> dict[str, object]:
+        result = body.model_dump(exclude={"profile_key"})
+        if body.profile_key is not None:
+            result["profile_key"] = body.profile_key.get_secret_value()
+        return result
+
     def _state(self, content: bytes | None) -> ManagedBrowserState:
         try:
             state = ManagedBrowserState.model_validate_json(content or b"")
@@ -195,10 +209,15 @@ class SandboxdBrowser:
         lifetime_seconds: int = 3600,
         width: int = 1280,
         height: int = 800,
+        profile_key: str | None = None,
     ) -> ManagedBrowserState:
         """Explicitly start the authorized session's browser; never creates a workspace."""
         body = _Start(
-            idle_seconds=idle_seconds, lifetime_seconds=lifetime_seconds, width=width, height=height
+            idle_seconds=idle_seconds,
+            lifetime_seconds=lifetime_seconds,
+            width=width,
+            height=height,
+            profile_key=None if profile_key is None else SecretStr(profile_key),
         )
         return self._state(await self._request("POST", body))
 
@@ -209,6 +228,14 @@ class SandboxdBrowser:
     async def end(self) -> None:
         """End the supervised browser and its dedicated runtime; missing is idempotent."""
         await self._request("DELETE")
+
+    async def suspend(self) -> None:
+        """Checkpoint a durable profile and sleep its runtime; keep the named session."""
+        await self._request("POST", suffix="/suspend")
+
+    async def purge(self) -> None:
+        """Erase a profile and its session files; never use this for ordinary idle."""
+        await self._request("DELETE", suffix="/profile")
 
     async def connect(self, *, context_id: str | None = None) -> ManagedBrowserConnection:
         """Attach a transport, preserving existing DOM after consumer disconnect.

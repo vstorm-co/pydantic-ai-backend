@@ -48,7 +48,7 @@
 
 > **Unreleased preview:** Browser/Desktop APIs and managed interactive sessions are being tested from local wheels in this branch. The current PyPI release does not include them. No new release is published as part of this preview. Existing workspace and console APIs remain available in released versions.
 
-`sandboxd` owns container admission, resource limits and idle retirement. Browser sessions have exact context/tab identities, private debugger transport, and idle/maximum-lifetime policies; desktop adapters provide screenshots, physical input and application launching. Your application retains tenant authorization, user consent, model tools and UI. Workspace files and unsaved live browser/desktop state have separate lifetimes.
+`sandboxd` owns container admission, resource limits and idle retirement. Browser sessions have exact context/tab identities, private debugger transport, and idle/maximum-lifetime policies; desktop adapters provide screenshots, physical input and application launching. Your application retains tenant authorization, user consent, model tools and UI. Workspace files, retained browser profiles, Desktop HOME and unsaved live state have separate lifetimes.
 
 ![pydantic-ai-backend by layer: the agent's tools call ctx.workspace, Pydantic AI's contract, and a workspace from this library or from Pydantic AI answers it](assets/architecture.png)
 
@@ -115,7 +115,7 @@ This installs the wheel from this checkout; its metadata version alone does not 
 | `SandboxDesktop` | Native screen/input adapter over an existing workspace | Detach; sandboxd/provider retains responsibility for the container |
 | `DaemonDesktop` | Connection to an operator-owned computer | Disconnect; never shut down the computer |
 
-Browser runtimes require an operator-configured egress proxy and private network isolation. CDP/session tokens belong only in trusted applications. A stopped container may retain files while losing unsaved forms, open windows and JavaScript memory.
+Browser runtimes require an operator-configured egress proxy and private network isolation. CDP/session tokens belong only in trusted applications. Opt-in encrypted Browser profiles remember sign-ins; retained Desktop HOME keeps files and settings across sleep and container replacement. Applications supply vault-held profile keys and authorize session scope. Persistent storage requires one sandboxd owner per root. Unsaved forms, open windows and JavaScript memory are not snapshots.
 
 See [Browser environments](docs/browser.md), [Desktop environments](docs/desktop.md) and the [implementation/validation scope](docs/design-environments.md).
 

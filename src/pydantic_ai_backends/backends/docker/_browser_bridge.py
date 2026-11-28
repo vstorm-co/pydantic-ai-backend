@@ -117,6 +117,7 @@ class DockerBrowserChannel:
         self._buffer = bytearray()
         self._send_lock = asyncio.Lock()
         self._closed = False
+        self._close_lock = threading.Lock()
 
     @classmethod
     async def open(cls, api: ExecAPI, container_id: str) -> DockerBrowserChannel:
@@ -245,10 +246,15 @@ class DockerBrowserChannel:
             logger.warning("Browser channel cleanup failed (%s)", type(error).__name__)
 
     async def aclose(self) -> None:
-        self._closed = True
-        with suppress(OSError):
-            self._stream.shutdown(socket.SHUT_RDWR)
-        self._stream.close()
-        if self._owner is not None:
-            self._owner.close()
-            self._owner = None
+        self.close()
+
+    def close(self) -> None:
+        """Unblock native readers when either their request or container retires."""
+        with self._close_lock:
+            self._closed = True
+            with suppress(OSError):
+                self._stream.shutdown(socket.SHUT_RDWR)
+            self._stream.close()
+            if self._owner is not None:
+                self._owner.close()
+                self._owner = None

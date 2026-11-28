@@ -409,6 +409,9 @@ async def test_maintenance_retries_cleanup_and_logs_failure_without_payload(capl
     from pydantic_ai_backends.remote._environments import ManagedEnvironmentRegistry
 
     class FailedResource:
+        async def checkpoint_due(self) -> None:
+            pass
+
         async def aclose(self) -> None:
             raise OSError("sensitive-provider-payload")
 

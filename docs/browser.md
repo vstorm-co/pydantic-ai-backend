@@ -55,8 +55,8 @@ that disappeared is refused; attachment never silently opens a substitute.
 
 `ManagedBrowserConnection.aclose()` only detaches its CDP transport. It does not
 end the supervised environment. `SandboxdBrowser.inspect()` reads current state
-without extending idle or capturing screenshots. Returned clock values are
-monotonic service times, not UTC timestamps or durable resume metadata.
+without extending idle or capturing screenshots. Deadline clock values are
+monotonic service times; persistent profile metadata is described below.
 
 The `websocket_url` and `connection_headers` properties support trusted server-side
 CDP integrations. **Never expose the token or authenticated debugger connection to
@@ -68,6 +68,58 @@ Idle expiry and absolute lifetime can terminate a live browser. Stopping a
 container may preserve workspace files, but does not promise restoration of
 unsaved forms, DOM objects or JavaScript memory. Changing idle/lifetime policy
 requires explicitly ending the existing environment first.
+
+## Remembering sign-ins after sleep
+
+Persistent profiles are an opt-in feature of the local preview. Set
+`SANDBOXD_PERSIST_BROWSER_PROFILES=true` and `SANDBOXD_WORKSPACE_ROOT` on sandboxd,
+then pass `profile_key` to `SandboxdBrowser.start()`. Generate it once with
+`base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()` and store it in your
+application's secret store. Reuse that key and the same tenant/session identity
+when explicitly starting the environment again. Never send it to the viewer.
+The server extra includes the encryption dependency.
+
+This mode uses one Chromium default profile in a dedicated container. Cookies,
+including session cookies supported by Chromium's restored profile, local storage
+and IndexedDB survive a successful checkpoint. Clients sharing that session share
+its browser storage and tabs. The synthetic context identity changes after a
+restart: reconnect through the new state and discover tabs again. Old context/tab
+references are refused rather than replaced silently.
+
+`await browser.suspend()` checkpoints and hibernates the runtime. Persistent
+`await browser.end()` also retains the encrypted profile; `await browser.purge()`
+erases it and the session's retained files. Ephemeral End keeps its previous
+retirement behavior. Passive inspection does not wake a sleeping environment;
+call Start explicitly to restore it.
+
+The profile archive is AES-256-GCM encrypted, bound to tenant and session, and
+written atomically into the session's private storage. The profile key is neither
+stored there nor passed into the container. Wrong keys and corrupt archives fail
+closed. Plaintext transfer stays in process memory and the runtime's temporary
+filesystem. Full profiles can contain credentials: authorize their reuse as
+carefully as the application's vault. Archive size is capped at 64 MiB and 20,000
+members; an oversized checkpoint fails visibly.
+
+Normal sleep closes Chromium and waits for its processes to finish flushing
+before saving. A periodic checkpoint runs at most once per 30 seconds, temporarily
+stopping only Chromium's process group; the independent watchdog remains runnable.
+A crash can lose changes since the last completed checkpoint. DOM objects,
+unsaved forms, JavaScript memory and running processes are not restored.
+`persistent`, `profile_restored`, `profile_saved_at` (UTC epoch seconds) and
+`generation` in managed state describe the profile lifecycle; the other deadline
+fields remain monotonic service times.
+
+Applications choose whether a session belongs to a conversation, a user/agent or
+a project. sandboxd enforces the supplied tenant/session binding; it does not
+choose product scopes or consent. Do not attach a personal profile to a shared
+conversation without an explicit authorization policy. To forget native sign-ins,
+purge the profile and rotate its application-held key. Close only owned tabs when
+one of several clients detaches; ending the shared environment affects them all.
+
+A service restart loses live session tokens and registry entries, even though the
+archive survives. Old scoped tokens cannot erase an orphan: trusted operator
+credentials may purge it without creating a container. Reconcile orphan runtimes
+before restoring retained state; this is not transparent daemon-crash recovery.
 
 ## Operator-managed CDP
 

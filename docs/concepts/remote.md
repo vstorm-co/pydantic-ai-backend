@@ -1038,3 +1038,14 @@ Purging a session removes its owned exporter, volume, bridge and binding record;
 the normal workspace TTL sweep removes orphaned records after their workspace is
 gone. The application gateway must fail closed when a binding or lease is
 revoked, including for already running commands.
+
+## Interactive state retention (preview)
+
+The unreleased Browser/Desktop APIs add two opt-in startup settings alongside
+`workspace_root`: `persist_browser_profiles` / `SANDBOXD_PERSIST_BROWSER_PROFILES`
+and `persist_desktop_home` / `SANDBOXD_PERSIST_DESKTOP_HOME`. They reuse session
+storage and tenant/runtime bindings, independently of `persist_containers`.
+Browser profiles additionally require a per-session encryption key supplied by
+the trusted application. See [Browser retention](../browser.md#remembering-sign-ins-after-sleep)
+and [Desktop retention](../desktop.md#retaining-files-and-settings) for scope,
+secret storage, cleanup, crash limitations and the single-owner volume requirement.

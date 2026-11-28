@@ -23,3 +23,30 @@ Closing a desktop adapter detaches it; sandboxd/provider owns the container and 
 `DesktopWorkspace` is the small consumer contract for native screen operations, compatible with Pydantic AI Workspace. An application adapter translates provider-specific workspace failures into `SandboxUnavailableError`. Screenshots up to 512 KiB return in one workspace command without a temporary file. Larger screenshots transfer the same captured frame through a private temporary file with bounded shielded cleanup, including cancellation. Captures are capped at 32 MiB. `Capture` reports source dimensions; `to_native` maps a selected screenshot coordinate back to that source.
 
 For a manual sandboxd environment, explicitly start `POST /sessions/{session_id}/environments/desktop` with the session token. Its product-level idle/hard deadlines are independent of workspace storage retention. A Desktop can share a workspace with console tools; ending its manual attachment does not delete shared work or stop its GUI processes. Its deadline fences the attachment; the workspace provider still owns retirement of the shared container. Do not expose session tokens or raw workspace execution to a browser viewer.
+
+## Retaining files and settings
+
+For the local preview, set `SANDBOXD_PERSIST_DESKTOP_HOME=true` together with
+`SANDBOXD_WORKSPACE_ROOT`. sandboxd stores Desktop HOME separately from the public
+workspace directory. Files in `/workspace` and settings under HOME, including
+`.config`, survive idle retirement and container replacement. Both follow the
+session's existing retention and purge policy. HOME is not included in public
+workspace archive/file endpoints.
+
+The built-in runtime uses `/root` for root and `/home/agent` for a non-root user.
+Custom desktop runtimes must declare `SandboxRuntime.home_path` explicitly: `/root`
+or a directory beneath `/home`, without traversal or overlapping workspace mounts.
+HOME programs and configuration can survive replacement; system-wide `apt`
+changes require retained containers or an updated image. Unsaved windows, RAM and
+running processes are not snapshots and must be reopened after sleep.
+
+Keep the same authorized tenant/session identity to resume retained files.
+Applications decide conversation/user/project scope, just as for sandbox
+workspaces. Personal HOME state must not be reused across unrelated people.
+
+Persistent Browser profiles and Desktop HOME require a single sandboxd owner for
+that storage root. The service holds a lifetime filesystem lock and refuses a
+second persistent owner before provisioning. Stop the old process before starting
+its replacement; use a Recreate deployment strategy. Older releases do not
+participate in this lock. Filesystem locking and storage permissions must work on
+the chosen volume; these settings do not provide active-active ownership.

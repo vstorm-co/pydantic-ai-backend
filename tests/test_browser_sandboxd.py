@@ -272,3 +272,35 @@ async def test_temporary_provider_refusal_is_not_authoritative_resource_loss() -
         with pytest.raises(BrowserUnavailableError) as raised:
             await SandboxdBrowser("http://host", "session", "token", client=http).inspect()
     assert not isinstance(raised.value, BrowserGoneError)
+
+
+async def test_durable_profile_key_only_travels_in_start_and_sleep_is_not_purge():
+    requests = []
+    key = "owned-profile-encryption-key"
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path.endswith(("/suspend", "/profile")):
+            return httpx.Response(204)
+        return httpx.Response(
+            200,
+            json={
+                **_STATE,
+                "persistent": True,
+                "profile_restored": True,
+                "profile_saved_at": 123.0,
+                "generation": "profile-current",
+            },
+        )
+
+    async with client_for(respond) as http:
+        api = SandboxdBrowser("http://host", "session", "scoped-token", client=http)
+        state = await api.start(profile_key=key)
+        assert state.persistent and state.profile_restored and state.profile_saved_at == 123
+        assert json.loads(requests[0].content)["profile_key"] == key
+        assert key not in repr(api) and key not in repr(state)
+        await api.suspend()
+        await api.purge()
+    assert requests[1].method == "POST" and requests[1].url.path.endswith("/suspend")
+    assert requests[2].method == "DELETE" and requests[2].url.path.endswith("/profile")
+    assert key not in requests[1].content.decode() and key not in requests[2].content.decode()
