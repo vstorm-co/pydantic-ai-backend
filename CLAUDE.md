@@ -4,9 +4,11 @@ Guidance for Claude Code when working on this repository.
 
 ## What This Project Is
 
-**pydantic-ai-backend** supplies Pydantic AI workspaces (Docker, sandboxd, Kubernetes,
-Daytona, a JSON state document) and the console tools that work in any workspace. It's
-designed to work with pydantic-ai and pydantic-deep.
+**pydantic-ai-backend** manages agent environments: Pydantic AI workspaces
+(Docker, sandboxd, Kubernetes, Daytona, a JSON state document), console tools,
+Browser use and Computer use backends. The interactive APIs are an unreleased
+preview validated from local wheels. It is designed to work with pydantic-ai and
+pydantic-deep; native browser/desktop operations do not require a model call.
 
 Key pattern: **Pydantic AI workspaces** — tools reach the environment through
 `ctx.workspace`; a workspace capability supplies it. This library has no file-operation
@@ -42,6 +44,8 @@ src/pydantic_ai_backends/
 │   ├── state.py      # StateBackend (a filesystem as a JSON document)
 │   ├── kubernetes.py # KubernetesPodSandbox (pods/exec)
 │   └── docker/       # sandbox.py, session.py, runtimes.py, _exec/_client/_image/_stats
+├── browser/          # Typed CDP sessions/tabs and managed sandboxd browser client
+├── desktop/          # Native screen/input/apps over an existing workspace or daemon
 ├── workspaces/       # Docker/Sandboxd/Kubernetes/Daytona/StateWorkspace (+ *Backend)
 ├── permissions/      # types.py, checker.py, presets.py
 ├── toolsets/         # console.py, descriptions.py, _workspace (ops over ctx.workspace),

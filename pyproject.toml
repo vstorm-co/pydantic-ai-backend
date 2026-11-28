@@ -1,7 +1,7 @@
 [project]
 name = "pydantic-ai-backend"
 version = "0.2.42"
-description = "File storage and sandbox backends for AI agents"
+description = "Sandbox, browser and desktop environments for Pydantic AI agents"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -38,6 +38,15 @@ workspaces = [
     # `SandboxdWorkspace` talks to its service over HTTP, and the package imports it.
     "httpx>=0.28.0",
 ]
+browser = [
+    "httpx>=0.28.0",
+    "websockets>=14.0",
+    "websocket-client>=1.8.0",
+]
+desktop = [
+    "anyio>=4.1.0",
+    "httpx>=0.28.0",
+]
 images = [
     "pillow>=10.0.0",
 ]
@@ -60,8 +69,10 @@ remote = [
     "httpx>=0.28.0",
 ]
 server = [
+    "anyio>=4.1.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
+    "websockets>=14.0",
     "httpx>=0.28.0",
     "docker>=7.0",
     "pypdf>=5.1.0",

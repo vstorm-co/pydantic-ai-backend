@@ -54,7 +54,7 @@ import uuid
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -519,6 +519,9 @@ class SandboxdConfig:
     persist_containers: bool = False
     prewarm: bool = True
     idle_timeout: int = 1800
+    interactive_idle_timeout: int = 900
+    interactive_max_lifetime: int = 3600
+    max_interactive_environments: int = 100
     cleanup_interval: int = 300
     workspace_ttl: int | None = None
     container_ttl: int | None = None
@@ -542,6 +545,14 @@ class SandboxdConfig:
     """
 
     def __post_init__(self) -> None:
+        for name in (
+            "interactive_idle_timeout",
+            "interactive_max_lifetime",
+            "max_interactive_environments",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         if bool(self.filesystem_gateway_url) != bool(self.filesystem_export_image):
             raise ValueError(
                 "filesystem_gateway_url and filesystem_export_image must be configured together"
@@ -1768,6 +1779,10 @@ class _Service:
             oci_runtime=config.oci_runtime,
             work_dir=config.work_dir,
             idle_timeout=config.idle_timeout,
+            interactive_environments=True,
+            interactive_idle_timeout=config.interactive_idle_timeout,
+            interactive_max_lifetime=config.interactive_max_lifetime,
+            max_interactive_environments=config.max_interactive_environments,
             execute_timeout=config.execute_timeout,
             max_read_bytes=config.max_read_bytes,
             persist_containers=config.persist_containers,
@@ -2874,13 +2889,25 @@ def create_app(
         filesystem_mounts=filesystem_mounts,
     )
 
+    from pydantic_ai_backends.remote._interactive import (
+        maintain_interactive,
+        register_interactive_routes,
+    )
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         service.startup()
+        interactive_sweep = asyncio.create_task(maintain_interactive(interactive))
         try:
             yield
         finally:
-            await service.shutdown()
+            interactive_sweep.cancel()
+            with suppress(asyncio.CancelledError):
+                await interactive_sweep
+            try:
+                await interactive.shutdown()
+            finally:
+                await service.shutdown()
 
     app = FastAPI(
         title="sandboxd",
@@ -2900,6 +2927,8 @@ def create_app(
     _register_session_routes(app, service)
     _register_workspace_routes(app, service)
     _register_run_routes(app, service)
+    interactive = register_interactive_routes(app, service)
+    app.state.interactive = interactive
     return app
 
 

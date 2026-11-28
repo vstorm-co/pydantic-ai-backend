@@ -237,7 +237,12 @@ def image_tag_for(runtime: RuntimeConfig) -> str:
     The digest is not a security boundary, hence `usedforsecurity=False` —
     plain `md5()` is unavailable on FIPS-enforcing hosts.
     """
-    digest = hashlib.md5(runtime.model_dump_json().encode(), usedforsecurity=False)
+    identity = runtime.model_dump_json()
+    # Old recipes interpreted comparison/glob characters as shell syntax. Only
+    # affected profiles need a new tag; unrelated warm images remain reusable.
+    if any(shlex.quote(package) != package for package in runtime.packages):
+        identity += "\nquoted-package-specifiers-v1"
+    digest = hashlib.md5(identity.encode(), usedforsecurity=False)
     return f"{IMAGE_REPOSITORY}:{runtime.name}-{digest.hexdigest()[:12]}"
 
 
@@ -345,7 +350,7 @@ def install_instructions(runtime: RuntimeConfig, *, cache_mounts: bool = False) 
     runtime re-downloads nothing — and keeping it in the layer would be the wrong
     trade.
     """
-    packages = " ".join(validate_package_name(p) for p in runtime.packages)
+    packages = " ".join(shlex.quote(validate_package_name(p)) for p in runtime.packages)
     mounts = cache_mount_flags(runtime.package_manager) if cache_mounts else ""
 
     if runtime.package_manager == "pip":

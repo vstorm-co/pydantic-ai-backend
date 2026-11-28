@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Optional Browser and Desktop environment APIs, independent of agent/model calls.
+- Sandboxd-managed interactive lifetimes, bounded recovery and control leases; a private Docker-exec CDP gateway retains browser state across application-client disconnects without publishing debugger ports.
+- Dedicated Chromium and Linux desktop runtime recipes. Browser startup requires an operator-configured egress proxy; workspace files and live GUI memory have separate retention contracts.
+
+
+## [Unreleased]
+
 ## [0.2.42] - 2026-11-27
 
 ### Changed

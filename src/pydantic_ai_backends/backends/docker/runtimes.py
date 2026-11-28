@@ -172,6 +172,28 @@ BUILTIN_RUNTIMES: dict[str, RuntimeConfig] = {
         image="rust:1-slim",
         work_dir="/src",
     ),
+    "browser": RuntimeConfig(
+        name="browser",
+        description="Private Chromium with a loopback debugger and virtual display",
+        base_image="python:3.12-slim",
+        setup_commands=[
+            "apt-get update && apt-get install -y --no-install-recommends "
+            "chromium xvfb procps x11-utils fonts-liberation fonts-noto-color-emoji "
+            "ca-certificates && rm -rf /var/lib/apt/lists/*",
+        ],
+        packages=["websocket-client>=1.8.0"],
+    ),
+    "desktop": RuntimeConfig(
+        name="desktop",
+        description="Linux desktop with Firefox and native screen/input tools",
+        base_image="python:3.12-slim",
+        setup_commands=[
+            "apt-get update && apt-get install -y --no-install-recommends "
+            "xvfb x11-utils xfce4 xfce4-terminal dbus-x11 xdotool scrot firefox-esr "
+            "fonts-dejavu-core fonts-noto-color-emoji procps "
+            "&& rm -rf /var/lib/apt/lists/*",
+        ],
+    ),
 }
 """Runtimes available by name. Keys are stable: a stored configuration names one."""
 

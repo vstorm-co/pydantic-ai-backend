@@ -12,9 +12,9 @@
 <h1 align="center">Pydantic AI Backend</h1>
 
 <p align="center">
-  <b>Workspaces & console tools for Pydantic AI agents.</b><br>
-  Docker / sandboxd / Kubernetes / Daytona / State workspaces and a console toolset that works in any of them,<br>
-  plus a sandbox service so your app never needs Docker access.
+  <b>Sandbox, browser and desktop environments for Pydantic AI agents.</b><br>
+  Manage isolated sessions, workspace files and native automation,<br>
+  with console tools and a sandbox service that keeps Docker access out of your app.
 </p>
 
 <p align="center">
@@ -37,14 +37,18 @@
 </p>
 
 <p align="center">
-  <b>Pydantic AI workspaces</b> &nbsp;&bull;&nbsp; <b>Docker / sandboxd / Kubernetes / Daytona / State</b> &nbsp;&bull;&nbsp; <b>Console toolset</b> &nbsp;&bull;&nbsp; <b>Permission system</b> &nbsp;&bull;&nbsp; <b>No docker-in-docker</b>
+  <b>Pydantic AI workspaces</b> &nbsp;&bull;&nbsp; <b>Docker / sandboxd / Kubernetes / Daytona / State</b> &nbsp;&bull;&nbsp; <b>Browser use & computer use</b> &nbsp;&bull;&nbsp; <b>Console tools & permissions</b> &nbsp;&bull;&nbsp; <b>No docker-in-docker</b>
 </p>
 
 ---
 
 > **Part of [Pydantic Deep Agents](https://github.com/vstorm-co/pydantic-deepagents)** — the open-source Claude Code alternative & Python agent framework. Use this library standalone, or get everything wired together in one `create_deep_agent()` call.
 
-**Pydantic AI Backend** gives your [Pydantic AI](https://ai.pydantic.dev/) agent somewhere to work and the tools to work there. It supplies [Pydantic AI workspaces](https://pydantic.dev/docs/ai/core-concepts/workspace/) — a Docker container, a `sandboxd` session, a Kubernetes pod, a Daytona sandbox, a JSON document — and a console toolset that reads, writes, searches and runs code in whichever workspace the run has, under a fine-grained permission system.
+**Pydantic AI Backend** manages environments where agents work: sandboxes for code and files, browser sessions for web automation, and desktops for computer use. Applications can use the native Browser/Desktop APIs without a model call. Pydantic AI workspace integrations and the console toolset connect agents to those environments.
+
+> **Unreleased preview:** Browser/Desktop APIs and managed interactive sessions are being tested from local wheels in this branch. The current PyPI release does not include them. No new release is published as part of this preview. Existing workspace and console APIs remain available in released versions.
+
+`sandboxd` owns container admission, resource limits and idle retirement. Browser sessions have exact context/tab identities, private debugger transport, and idle/maximum-lifetime policies; desktop adapters provide screenshots, physical input and application launching. Your application retains tenant authorization, user consent, model tools and UI. Workspace files and unsaved live browser/desktop state have separate lifetimes.
 
 ![pydantic-ai-backend by layer: the agent's tools call ctx.workspace, Pydantic AI's contract, and a workspace from this library or from Pydantic AI answers it](assets/architecture.png)
 
@@ -52,6 +56,9 @@
 
 | What You Want to Build | How This Library Helps |
 |------------------------|------------------------|
+| **Browser use (preview)** | Private Chromium sessions, exact tabs, screenshots and physical input |
+| **Computer use (preview)** | Linux desktop or external daemon, screenshots, keyboard/mouse and application launching |
+| **Environment management (preview)** | Explicit start/end, Browser retirement, Desktop attachment deadlines and control leases |
 | **AI Coding Assistant** | Console tools with file ops + code execution, in any workspace |
 | **Multi-User Web App** | A container per session, reached again by its ref |
 | **Code Review Bot** | A read-only workspace: write and execute tools are never offered |
@@ -89,6 +96,28 @@ pip install "pydantic-ai-backend[server]"
 # Reading what sandboxd sessions left behind
 pip install "pydantic-ai-backend[remote]"
 ```
+
+## Browser use and computer use preview
+
+Build the package locally before installing the new optional extras:
+
+```bash
+uv build --wheel --out-dir dist
+uv pip install --reinstall "dist/pydantic_ai_backend-0.2.42-py3-none-any.whl[browser,desktop,server,workspaces]"
+```
+
+This installs the wheel from this checkout; its metadata version alone does not identify the unreleased source. Record the wheel SHA-256 when comparing test runs.
+
+| API | What it owns | What closing means |
+| --- | --- | --- |
+| `SandboxdBrowser` | Managed Browser attachment to an existing sandboxd session | Disconnect preserves live tabs; explicit End retires its dedicated runtime |
+| `BrowserSession` | Private context in a vetted CDP service | Dispose this context; the caller owns the underlying browser/provider |
+| `SandboxDesktop` | Native screen/input adapter over an existing workspace | Detach; sandboxd/provider retains responsibility for the container |
+| `DaemonDesktop` | Connection to an operator-owned computer | Disconnect; never shut down the computer |
+
+Browser runtimes require an operator-configured egress proxy and private network isolation. CDP/session tokens belong only in trusted applications. A stopped container may retain files while losing unsaved forms, open windows and JavaScript memory.
+
+See [Browser environments](docs/browser.md), [Desktop environments](docs/desktop.md) and the [implementation/validation scope](docs/design-environments.md).
 
 ## Quick Start
 

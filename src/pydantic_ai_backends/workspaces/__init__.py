@@ -28,7 +28,11 @@ from pydantic_ai_backends.workspaces._kubernetes import (
     KubernetesWorkspace,
     KubernetesWorkspaceBackend,
 )
-from pydantic_ai_backends.workspaces._sandboxd import SandboxdWorkspace, SandboxdWorkspaceBackend
+from pydantic_ai_backends.workspaces._sandboxd import (
+    SandboxdSessionAccess,
+    SandboxdWorkspace,
+    SandboxdWorkspaceBackend,
+)
 from pydantic_ai_backends.workspaces._state import StateWorkspace, StateWorkspaceBackend
 
 __all__ = [
@@ -40,6 +44,7 @@ __all__ = [
     "FilesystemBinding",
     "KubernetesWorkspace",
     "KubernetesWorkspaceBackend",
+    "SandboxdSessionAccess",
     "SandboxdWorkspace",
     "SandboxdWorkspaceBackend",
     "StateWorkspace",

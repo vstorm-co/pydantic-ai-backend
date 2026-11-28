@@ -1,5 +1,5 @@
 site_name: Pydantic AI Backend
-site_description: Workspaces, console tools and permissions for Pydantic AI agents
+site_description: Sandbox, browser and desktop environments, workspaces and console tools for Pydantic AI agents
 site_url: https://vstorm-co.github.io/pydantic-ai-backend/
 repo_url: https://github.com/vstorm-co/pydantic-ai-backend
 repo_name: vstorm-co/pydantic-ai-backend
@@ -156,6 +156,8 @@ nav:
     - Permissions: concepts/permissions.md
     - Docker: concepts/docker.md
     - sandboxd: concepts/remote.md
+    - Browser environments: browser.md
+    - Desktop environments: desktop.md
     - Kubernetes: concepts/kubernetes.md
     - Daytona: concepts/daytona.md
   - Examples:
@@ -167,6 +169,8 @@ nav:
     - Multi-User App: examples/multi-user.md
     - CLI Agent: examples/cli-agent.md
   - API Reference:
+    - Browser: api/browser.md
+    - Desktop: api/desktop.md
     - api/index.md
     - Capability: api/capability.md
     - Workspaces: api/workspaces.md

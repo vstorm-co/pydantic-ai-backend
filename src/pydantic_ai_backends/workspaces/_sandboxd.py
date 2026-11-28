@@ -69,6 +69,18 @@ _GONE = frozenset({404, 410})
 
 
 @dataclass(frozen=True)
+class SandboxdSessionAccess:
+    """Private session-scoped access for trusted application integrations.
+
+    Never serialize this credential into a browser-viewer response. Obtaining it
+    does not create, attach, revive or touch a workspace.
+    """
+
+    session_id: str
+    token: str = field(repr=False)
+
+
+@dataclass(frozen=True)
 class _Session:
     """An open session: its id and the token scoped to it."""
 
@@ -377,6 +389,17 @@ class SandboxdWorkspaceBackend(
                 opened = await self._open()
                 self._session = opened
             return opened
+
+    def session_access(self) -> SandboxdSessionAccess:
+        """Return the already-opened session's limited credential, without I/O.
+
+        Explicitly open the workspace first. This method never falls back to the
+        service token and never opens a missing session merely to inspect it.
+        """
+        session = self._session
+        if session is None:
+            raise WorkspaceUnavailableError("Open the sandbox workspace before requesting access")
+        return SandboxdSessionAccess(session.session_id, session.token)
 
     async def working_dir(self) -> str:
         """The directory commands start in, as the sandbox resolves it."""

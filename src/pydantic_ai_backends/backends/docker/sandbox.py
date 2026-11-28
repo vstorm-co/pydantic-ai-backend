@@ -12,7 +12,7 @@ from pydantic_ai_backends._limits import MAX_RUN_OUTPUT_BYTES
 from pydantic_ai_backends.backends.docker._client import docker_client
 from pydantic_ai_backends.backends.docker._image import resolve_image
 from pydantic_ai_backends.backends.docker._stats import parse_usage
-from pydantic_ai_backends.protocol import SandboxUnavailableError
+from pydantic_ai_backends.protocol import SandboxProbeError, SandboxUnavailableError
 from pydantic_ai_backends.types import RuntimeConfig, SandboxUsage
 
 if TYPE_CHECKING:
@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from docker import DockerClient
     from docker.models.containers import Container
 
+    from pydantic_ai_backends.backends.docker._browser_bridge import BrowserChannel
     from pydantic_ai_backends.types import CommandOutcome
 
 ALIVE_CACHE_SECONDS = 30.0
@@ -433,6 +434,31 @@ class DockerSandbox:
         self._alive_checked_at = now
         return self._alive
 
+    def is_alive_fresh(self) -> bool:
+        """Probe the exact container without cache, wake or replacement.
+
+        Missing/stopped containers return False. A daemon/network failure raises
+        SandboxProbeError so a caller cannot confuse a temporary outage with loss.
+        """
+        from docker.errors import DockerException, NotFound
+
+        container = self._container
+        if container is None:
+            return False
+        try:
+            container.reload()
+        except NotFound:
+            alive = False
+        except (DockerException, OSError) as error:
+            raise SandboxProbeError(
+                "Docker could not confirm the original container's state"
+            ) from error
+        else:
+            alive = container.status == "running"
+        self._alive = alive
+        self._alive_checked_at = time.monotonic()
+        return alive
+
     def container_user(self) -> str | None:
         """The user the container runs as, as Docker reports it, or `None` before it exists.
 
@@ -564,6 +590,30 @@ class DockerSandbox:
         except SandboxUnavailableError:
             self._alive_checked_at = None
             raise
+
+    async def open_browser_channel(self) -> BrowserChannel:
+        """Attach only to this live container's loopback CDP, without publishing ports.
+
+        The runtime must include Chromium and websocket-client. This method never
+        creates or wakes a container and never renews its idle deadline.
+        """
+        import anyio.to_thread
+
+        from pydantic_ai_backends.backends.docker._browser_bridge import (
+            BrowserChannelError,
+            DockerBrowserChannel,
+        )
+
+        container = self._container
+        if container is None:
+            raise BrowserChannelError("The original browser container is no longer running")
+        container_id = container.id
+        api = container.client.api
+        if not isinstance(container_id, str):
+            raise BrowserChannelError("The original browser container has no identity")
+        if not await anyio.to_thread.run_sync(self.is_alive) or self._container is not container:
+            raise BrowserChannelError("The original browser container is no longer running")
+        return await DockerBrowserChannel.open(api, container_id)
 
     async def stop_command(self, run_id: str) -> None:
         """Stop a command :meth:`run_command` started, and everything it started.

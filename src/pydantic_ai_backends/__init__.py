@@ -26,7 +26,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from pydantic_ai_backends.backends.state import StateBackend
-from pydantic_ai_backends.protocol import CommandRunner, SandboxUnavailableError
+from pydantic_ai_backends.protocol import CommandRunner, SandboxProbeError, SandboxUnavailableError
 from pydantic_ai_backends.types import (
     CommandOutcome,
     FileData,
@@ -41,7 +41,9 @@ if TYPE_CHECKING:
     from pydantic_ai_backends.backends.docker.runtimes import get_runtime
     from pydantic_ai_backends.backends.docker.session import SandboxFactory
     from pydantic_ai_backends.backends.kubernetes import KubernetesPodSandbox
+    from pydantic_ai_backends.browser import BrowserSession, SandboxdBrowser, WebSocketCDP
     from pydantic_ai_backends.capability import ConsoleCapability
+    from pydantic_ai_backends.desktop import DaemonDesktop, SandboxDesktop
     from pydantic_ai_backends.hashline import (
         apply_hashline_edit,
         apply_hashline_edit_with_summary,
@@ -149,6 +151,8 @@ _LAZY_MODULES: dict[str, tuple[str, ...]] = {
     ),
     "pydantic_ai_backends.toolsets.descriptions": ("TOOL_TEXT", "Profile", "ToolText"),
     "pydantic_ai_backends.capability": ("ConsoleCapability",),
+    "pydantic_ai_backends.browser": ("BrowserSession", "SandboxdBrowser", "WebSocketCDP"),
+    "pydantic_ai_backends.desktop": ("DaemonDesktop", "SandboxDesktop"),
     "pydantic_ai_backends.backends.docker.sandbox": ("DockerSandbox",),
     "pydantic_ai_backends.backends.docker.session": ("SandboxFactory", "SessionManager"),
     "pydantic_ai_backends.backends.docker.runtimes": ("BUILTIN_RUNTIMES", "get_runtime"),
@@ -219,6 +223,11 @@ __all__ = [
     "CommandOutcome",
     "CommandRunner",
     "ConfinedWorkspace",
+    "BrowserSession",
+    "SandboxdBrowser",
+    "WebSocketCDP",
+    "DaemonDesktop",
+    "SandboxDesktop",
     "ConsoleCapability",
     "ConsoleToolset",
     "DaytonaWorkspace",
@@ -244,6 +253,7 @@ __all__ = [
     "Profile",
     "RuntimeConfig",
     "SandboxFactory",
+    "SandboxProbeError",
     "SandboxUnavailableError",
     "SandboxUsage",
     "SandboxdWorkspace",

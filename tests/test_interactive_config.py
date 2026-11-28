@@ -1,0 +1,530 @@
+"""Wire protocol between `sandboxd` and its clients.
+
+These models are the single source of truth for the HTTP contract: sessions,
+`/run` for a Pydantic AI workspace, the archive reads, the policy.
+
+Binary payloads travel base64-encoded (`content_b64`) because JSON cannot carry
+arbitrary bytes, and a workspace holds real files.
+"""
+
+from __future__ import annotations
+
+from typing import Annotated, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
+
+TOKEN_HEADER = "X-Sandbox-Token"
+"""Header carrying either the service token or a session's own token."""
+
+SESSION_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+"""Session ids appear in URLs and in on-disk workspace paths, so they are
+restricted to characters that cannot traverse a directory or confuse a path."""
+
+RUN_ID_PATTERN = r"^[0-9a-f]{32}$"
+"""A `/run` id: a uuid4 hex, which is also what keeps it safe in a file name."""
+
+TENANT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+"""Tenant labels are reported back in listings, so they carry the same
+restriction as session ids rather than being free text."""
+
+
+class RunRequest(BaseModel):
+    """Run one program, under the contract a Pydantic AI workspace needs.
+
+    The streams come back apart, a dead sandbox is reported as one rather than
+    as a command that failed, and a command whose caller gave up can be stopped.
+    """
+
+    argv: list[str] = Field(min_length=1)
+    """The program and its arguments, passed through literally. A shell command
+    is `["/bin/sh", "-c", "..."]`, spelled out by the client."""
+
+    env: dict[str, str] = Field(default_factory=dict)
+    """Variables layered over the sandbox's own environment."""
+
+    timeout_seconds: float | None = Field(default=None, gt=0)
+    """Deadline for the command. Clamped to the service's `execute_timeout`, and
+    that ceiling applies when this is `None`."""
+
+    run_id: str = Field(pattern=RUN_ID_PATTERN)
+    """Chosen by the client, so it can stop the run from another request when it
+    stops waiting for this one."""
+
+
+class RunResponse(BaseModel):
+    """How a `/run` command ended: finished, timed out, or over its output limit.
+
+    A non-zero `exit_code` is a result. `timed_out` and `output_limited` carry no
+    exit code and only the beginning of each stream, because the command was
+    stopped rather than allowed to finish.
+    """
+
+    stdout: str
+    stderr: str
+    exit_code: int | None = None
+    timed_out: bool = False
+    output_limited: bool = False
+    output_limit: int | None = None
+    """The ceiling an `output_limited` command crossed, in bytes."""
+
+
+class ReadRequest(BaseModel):
+    """Read a slice of a text file."""
+
+    path: str
+    offset: int = Field(default=0, ge=0)
+    """First line to return. Bounded because a negative offset would silently
+    slice from the end of the file rather than being rejected."""
+
+    limit: int = Field(default=2000, ge=1)
+
+
+class ReadResponse(BaseModel):
+    """Text content of the requested slice."""
+
+    content: str
+
+
+class ReadBytesRequest(BaseModel):
+    """Read a whole file as bytes."""
+
+    path: str
+
+
+class ReadBytesResponse(BaseModel):
+    """Raw file content, base64-encoded. Empty when the file is unreadable."""
+
+    content_b64: str
+
+
+class RealpathResponse(BaseModel):
+    """A path with every link in it resolved, in the sandbox's view."""
+
+    path: str
+
+
+class FilePathRequest(BaseModel):
+    """One path in a live session's work directory, for a native file operation."""
+
+    path: str
+
+
+NOT_NATIVE_STATUS = 409
+"""What a native file route answers for a path the sandbox has to resolve: a
+symlink, a special file, one outside the work directory. The client then takes
+the shell path for that one call."""
+
+
+class LsRequest(BaseModel):
+    """List one directory."""
+
+    path: str
+
+
+class FileEntry(BaseModel):
+    """One directory entry, mirroring `FileInfo`."""
+
+    name: str
+    path: str
+    is_dir: bool
+    size: int | None = None
+    modified_at: str | None = None
+    """ISO 8601, when the backend reports one. Defaults absent so a client and a
+    service on either side of this release keep understanding each other."""
+
+
+class TreeRequest(BaseModel):
+    """List a directory and the directories under it, breadth first."""
+
+    path: str = "."
+    max_depth: int = Field(default=6, ge=1, le=64)
+    """Levels listed: 1 is the directory alone, as `ls` does."""
+
+    max_entries: int = Field(default=2000, ge=1, le=100_000)
+
+
+class TreeResponse(BaseModel):
+    """What a tree listing found, and whether a bound stopped it."""
+
+    entries: list[FileEntry]
+    truncated: bool
+    """True when a directory was left unopened at `max_depth` or the listing
+    reached `max_entries` with more to list - a listing shorter than the
+    workspace that did not say so would be read as complete."""
+
+
+MAX_TREES = 100
+"""Workspaces one `trees` request may list."""
+
+
+class TreesRequest(BaseModel):
+    """List the same directory of several stored workspaces, in one request.
+
+    A file browser across a person's workspaces asked `tree` once per workspace:
+    a connection and a round trip each, which on a busy host was most of the
+    page's time.
+    """
+
+    sessions: list[Annotated[str, Field(pattern=SESSION_ID_PATTERN)]] = Field(
+        min_length=1, max_length=MAX_TREES
+    )
+    path: str = "."
+    max_depth: int = Field(default=6, ge=1, le=64)
+    max_entries: int = Field(default=2000, ge=1, le=100_000)
+    """Per workspace, as for `tree`."""
+
+
+class TreeResult(BaseModel):
+    """One workspace's answer in a `trees` response: its tree, or why there is none."""
+
+    session_id: str
+    tree: TreeResponse | None = None
+    error: str | None = None
+    status_code: int | None = None
+    """What `tree` would have answered for this workspace alone."""
+
+
+class TreesResponse(BaseModel):
+    results: list[TreeResult]
+    """One per requested session, in the order requested."""
+
+
+class FilesystemBinding(BaseModel):
+    """An application-authorized filesystem; never a host path or provider URL."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    token: SecretStr = Field(min_length=1, repr=False)
+
+
+class CreateSessionRequest(BaseModel):
+    """Open a sandbox session.
+
+    Deliberately carries no container settings. Image, mounts, network mode and
+    every resource ceiling come from the server's configuration, because a
+    process holding the Docker socket can start a privileged container that
+    mounts the host — a client that could name its own image or volumes would
+    own the machine.
+    """
+
+    session_id: str | None = Field(default=None, pattern=SESSION_ID_PATTERN)
+    filesystem_binding: FilesystemBinding | None = Field(default=None, repr=False)
+    runtime: str | None = None
+    """Alias of a server-allowed runtime. `None` selects the server default."""
+
+    tenant: str | None = Field(default=None, pattern=TENANT_PATTERN)
+    """Who this session is opened on behalf of, for the per-tenant ceiling.
+
+    Declared by the client rather than derived from `session_id`, so the service
+    imposes no naming convention on ids. Only a caller holding the service token
+    can open a session at all, so this is a capacity label from a trusted
+    application — not an authorization claim, and it grants nothing.
+    """
+
+    reuse: bool = False
+    """Attach to the session under `session_id` when one is already open.
+
+    Off by default, so an id collision is reported rather than silently sharing
+    somebody else's sandbox. Turn it on for a session that spans several runs —
+    one conversation, say — where the second run has to reach the files the
+    first one wrote. The runtime of an attached session is whatever it was
+    opened with; a `runtime` that disagrees is rejected rather than ignored.
+    """
+
+    attach: bool = False
+    """Only attach, never create: refuse with 404 when `session_id` names neither
+    an open session nor a workspace this service still holds.
+
+    What a client continuing earlier work needs. `reuse` alone opens a fresh,
+    empty session when the old one is gone, so the caller would carry on in an
+    empty directory believing its files were there. Implies `reuse`.
+    """
+
+
+class SessionEvent(BaseModel):
+    """One operation performed against a session.
+
+    Records what was asked for and how it went — never file contents or command
+    output, which would turn an audit trail into a data leak and grow without
+    bound.
+    """
+
+    seq: int
+    """Monotonic per-session sequence number, for incremental polling."""
+    at: float
+    op: str
+    """Operation name: `run` for a command, which is the one operation a session takes."""
+    target: str
+    """Command or path the operation addressed, truncated."""
+    ok: bool
+    detail: str = ""
+    """Short outcome summary, e.g. `exit 0` or `14 entries`."""
+    duration_ms: float = 0.0
+
+
+class SessionEvents(BaseModel):
+    """A slice of a session's activity log."""
+
+    events: list[SessionEvent] = Field(default_factory=list)
+    latest_seq: int = 0
+    """Highest sequence number the service holds; pass it back as `after`."""
+
+
+class SessionUsage(BaseModel):
+    """Point-in-time resource usage for one sandbox."""
+
+    memory_bytes: int | None = None
+    memory_limit_bytes: int | None = None
+    cpu_percent: float | None = None
+    pids: int | None = None
+
+
+class SessionInfo(BaseModel):
+    """Observable state of one session."""
+
+    session_id: str
+    runtime: str
+    tenant: str | None = None
+    """Whoever the session was opened for, when the client said."""
+    alive: bool
+    state: Literal["running", "hibernated"] = "running"
+    """Whether the session holds a sandbox, or was stopped to free a slot and is
+    waiting for its next request to wake it. A hibernated session is never
+    `alive`; it still has its token, its event log and its files."""
+    created_at: float
+    last_activity: float
+    idle_seconds: float
+    usage: SessionUsage | None = None
+
+
+class SessionCreated(BaseModel):
+    """A freshly opened session and the token scoped to it."""
+
+    session: SessionInfo
+    token: str
+    """Grants access to this session only. The service token also works."""
+
+
+class SessionList(BaseModel):
+    """Every open session, for monitoring."""
+
+    sessions: list[SessionInfo] = Field(default_factory=list)
+    limit: int | None = None
+    """Configured `max_sessions` — the ceiling on *resident* sandboxes."""
+    open_limit: int | None = None
+    """Configured `max_open_sessions`, or `None` when uncapped."""
+    tenant_limit: int | None = None
+    """Configured `max_sessions_per_tenant`, or `None` when uncapped."""
+
+
+class ServiceHealth(BaseModel):
+    """Liveness and capacity summary. Unauthenticated."""
+
+    status: str = "ok"
+    sessions: int = 0
+    """Sessions holding a sandbox right now."""
+    limit: int | None = None
+    open_sessions: int = 0
+    """Sessions that exist, resident and hibernated together."""
+    open_limit: int | None = None
+    runtimes: list[str] = Field(default_factory=list)
+
+
+class RuntimePolicy(BaseModel):
+    """One runtime a client may name, and what it gets.
+
+    Ceilings are the *effective* ones — the runtime's own where it names them,
+    the service defaults otherwise — because the number an operator needs is the
+    one actually in force, not the one before the override.
+    """
+
+    alias: str
+    """What a client puts in `CreateSessionRequest.runtime`."""
+    image: str
+    """The image, or what it is built from when nothing is built yet."""
+    description: str = ""
+    builds: bool = False
+    """Whether the first session on this runtime builds an image."""
+    mem_limit: str | None = None
+    memswap_limit: str | None = None
+    """Memory-plus-swap ceiling, or `None` when swap is pinned to `mem_limit`."""
+    cpus: float | None = None
+    cpu_shares: int | None = None
+    pids_limit: int | None = None
+    network_mode: str | None = None
+    oci_runtime: str | None = None
+    """Low-level runtime this one runs under, or `None` for the daemon's default."""
+
+
+class ServicePolicy(BaseModel):
+    """The ceilings and allowlist the service imposes on every sandbox.
+
+    Authenticated, because it describes the host's configuration — though it
+    holds nothing a caller with the service token is not already subject to.
+    Exists so an operator can see the limits actually in force rather than
+    inferring them from a config file.
+    """
+
+    runtimes: list[RuntimePolicy] = Field(default_factory=list)
+    """Every allowed runtime, with the ceilings it actually runs under."""
+    default_runtime: str = ""
+    max_sessions: int | None = None
+    """Ceiling on resident sandboxes."""
+    max_open_sessions: int | None = None
+    """Ceiling on sessions that exist, resident or hibernated."""
+    max_sessions_per_tenant: int | None = None
+    evict_idle_after: int | None = None
+    """Seconds after which an idle session may be hibernated to free a slot."""
+    mem_limit: str | None = None
+    memswap_limit: str | None = None
+    """Default memory-plus-swap ceiling, or `None` when swap is pinned to memory."""
+    cpus: float | None = None
+    cpu_shares: int | None = None
+    pids_limit: int | None = None
+    network_mode: str | None = None
+    oci_runtime: str | None = None
+    """Default low-level runtime, or `None` for whatever the daemon defaults to."""
+
+    work_dir: str = ""
+    interactive_environments: bool = False
+    """Whether this service supports explicitly managed Browser/Desktop attachments."""
+    interactive_idle_timeout: int = 900
+    interactive_max_lifetime: int = 3600
+    max_interactive_environments: int = 100
+    """Interactive admission ceilings; configured at service startup."""
+    idle_timeout: int = 0
+    execute_timeout: int = 0
+    max_read_bytes: int = 0
+    persist_containers: bool = False
+    """Whether a stopped sandbox keeps its filesystem for the next attach."""
+    sandbox_uid: int | None = None
+    """Uid built runtimes run as, or `None` when sandboxes run as root."""
+    workspace_ttl: int | None = None
+    """Seconds an unused workspace is kept before it is swept, or `None`."""
+    container_ttl: int | None = None
+    """Seconds a stopped container is kept before its build is reclaimed."""
+    tmpfs_size: str | None = None
+    """Size of the in-memory `/tmp` each sandbox gets, or `None` when it has none."""
+    prewarm: bool = False
+    """Whether the allowlist is pulled and built at startup rather than on demand."""
+    buildkit: bool = False
+    """Whether image builds use BuildKit, and so keep package caches between them."""
+    filesystem_mounts: bool = False
+    """Whether application-authorized live filesystems can be mounted on new sessions."""
+    filesystem_mount_path: Literal["/project"] | None = None
+    """Fixed mount location; absent on services without this opt-in feature."""
+    native_files: bool = False
+    """Whether a session's file operations are served off the host, not by its sandbox.
+
+    Defaults off, so a client talking to a service older than this falls back to
+    the shell path rather than calling routes that are not there."""
+    native_writes: bool = False
+    """Whether writes are served that way too, and not only reads."""
+    native_realpath: bool = False
+    """Whether `realpath` is answered off the host for a path with no link in it.
+
+    The console's path checks ask it before every read and write, so without it
+    each of those cost a `docker exec` of its own."""
+
+
+class RuntimeLimitsUpdate(BaseModel):
+    """New ceilings for one already-allowed runtime.
+
+    Ceilings only. There is no `image`, no `description` and no `builds`: what a
+    runtime *is* stays the daemon's, set from its environment and never from a
+    request. An operator adjusts what a runtime may consume; nobody adjusts what
+    it runs.
+
+    Every field is optional, and absent means "leave it alone" rather than
+    "clear it" — `None` is a meaningful value for most of these (it pins swap to
+    memory, or takes the daemon's default), so a model that could not tell absent
+    from null would wipe a ceiling every time somebody changed a different one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mem_limit: str | None = None
+    memswap_limit: str | None = None
+    cpus: float | None = Field(default=None, gt=0)
+    cpu_shares: int | None = Field(default=None, gt=0)
+    pids_limit: int | None = Field(default=None, gt=0)
+
+
+class PolicyUpdate(BaseModel):
+    """Ceilings and lifetimes an operator may change without a restart.
+
+    **Deliberately a narrow subset of `ServicePolicy`, and the omissions are the
+    point.** `CreateSessionRequest` carries no container settings because a
+    process holding the Docker socket can start a privileged container that
+    mounts the host — a client that could name its own image or volumes would own
+    the machine. That reasoning does not stop applying because the caller holds
+    the service token: in a multi-tenant deployment the token is held by an
+    application, per tenant, and an organization's administrator is not the
+    person who runs the host.
+
+    So what is writable here is resource ceilings and lifetimes — how much a
+    sandbox may consume and how long it may live. What is **not** writable is
+    anything that decides *isolation*:
+
+    - `runtimes` membership, because adding an alias means naming an image
+    - `network_mode`, because `host` is not a ceiling, it is an escape
+    - `oci_runtime`, for the same reason at a lower level
+    - `sandbox_uid`, because 0 is root
+    - `work_dir`, because it is where the workspace volume mounts and the archive
+      endpoints read
+    - `persist_containers`, `prewarm`, `buildkit` — startup shape, not ceilings
+
+    Those stay in the environment, where changing them is a deployment action
+    with a restart attached. `extra="forbid"`, so an attempt to send one is a 422
+    naming the field rather than a silently ignored key.
+
+    Absent means "leave it alone". Every field is optional for that reason: an
+    operator raising one ceiling must not have to restate the other twenty.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_runtime: str | None = None
+    """Must already be an allowed alias. Changing which of them is the default is
+    not the same as adding one."""
+
+    max_sessions: int | None = Field(default=None, ge=0)
+    max_open_sessions: int | None = Field(default=None, ge=0)
+    max_sessions_per_tenant: int | None = Field(default=None, ge=0)
+    evict_idle_after: int | None = Field(default=None, ge=0)
+    idle_timeout: int | None = Field(default=None, ge=0)
+    execute_timeout: int | None = Field(default=None, gt=0)
+    max_read_bytes: int | None = Field(default=None, gt=0)
+    workspace_ttl: int | None = Field(default=None, ge=0)
+    container_ttl: int | None = Field(default=None, ge=0)
+
+    mem_limit: str | None = None
+    memswap_limit: str | None = None
+    cpus: float | None = Field(default=None, gt=0)
+    cpu_shares: int | None = Field(default=None, gt=0)
+    pids_limit: int | None = Field(default=None, gt=0)
+    tmpfs_size: str | None = None
+
+    runtimes: dict[str, RuntimeLimitsUpdate] | None = None
+    """Per-alias ceilings, keyed by an alias the allowlist already holds. An
+    unknown one is refused rather than created, which is what keeps this from
+    being a way to name an image."""
+
+
+class ServiceIndex(BaseModel):
+    """What this service is and where to find its endpoints.
+
+    Served at `/` so that opening the base URL says something useful instead of
+    a bare 404. Unauthenticated, and deliberately free of any session detail.
+    """
+
+    service: str = "sandboxd"
+    health: ServiceHealth
+    docs_url: str = "/docs"
+    openapi_url: str = "/openapi.json"
+    ui_url: str | None = None
+    """Where the dashboard lives, or `None` when it is not enabled."""
+    endpoints: list[str] = Field(default_factory=list)
+    """Routed paths, derived from the app so the list cannot go stale."""

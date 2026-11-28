@@ -163,6 +163,27 @@ jobs:
       - name: Import every public name
         run: '"$RUNNER_TEMP/extras/bin/python" scripts/import_every_export.py'
 
+  interactive-extras:
+    name: Interactive extra (${{ matrix.extra }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        extra: [browser, desktop, server]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.4.0
+      - name: Install only the selected optional extra
+        env:
+          EXTRA: ${{ matrix.extra }}
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/interactive-extra"
+          uv pip install --python "$RUNNER_TEMP/interactive-extra/bin/python" ".[${EXTRA}]"
+      - name: Import the advertised native API without unrelated extras
+        env:
+          EXTRA: ${{ matrix.extra }}
+        run: '"$RUNNER_TEMP/interactive-extra/bin/python" scripts/import_interactive_extra.py "$EXTRA"'
+
   filesystem-exporter:
     name: Filesystem exporter
     runs-on: ubuntu-latest
