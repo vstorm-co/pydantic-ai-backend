@@ -170,7 +170,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.100.0"
+          toolchain: "1.100.1"
           components: rustfmt, clippy
       - name: Format, lint and test the locked exporter
         working-directory: projectfs
